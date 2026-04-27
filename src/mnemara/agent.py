@@ -23,9 +23,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
 
 from rich.console import Console
+
+# Streaming callback types — invoked during turn_async / turn when set.
+# on_token(text):  called each time a text delta arrives from the model.
+# on_tool_use(name, input):  called when the model issues a tool_use block.
+# on_tool_result(tool_use_id, content, is_error):  called when a tool returns.
+OnToken = Callable[[str], Optional[Awaitable[None]]]
+OnToolUse = Callable[[str, dict], Optional[Awaitable[None]]]
+OnToolResult = Callable[[str, Any, bool], Optional[Awaitable[None]]]
 
 from . import role as role_mod
 from . import tools as tools_mod
@@ -78,8 +86,37 @@ class AgentSession:
 
     # ------------------------------------------------------------------ public
 
-    def turn(self, user_text: str) -> dict[str, Any]:
-        """Run one user->assistant turn. Returns usage + eviction info."""
+    def turn(
+        self,
+        user_text: str,
+        on_token: OnToken | None = None,
+        on_tool_use: OnToolUse | None = None,
+        on_tool_result: OnToolResult | None = None,
+    ) -> dict[str, Any]:
+        """Run one user->assistant turn synchronously.
+
+        Wraps turn_async via asyncio.run for the bare REPL.
+        """
+        return asyncio.run(
+            self.turn_async(
+                user_text,
+                on_token=on_token,
+                on_tool_use=on_tool_use,
+                on_tool_result=on_tool_result,
+            )
+        )
+
+    async def turn_async(
+        self,
+        user_text: str,
+        on_token: OnToken | None = None,
+        on_tool_use: OnToolUse | None = None,
+        on_tool_result: OnToolResult | None = None,
+    ) -> dict[str, Any]:
+        """Async variant — drives one turn inside an existing event loop.
+
+        Used by the Textual TUI; the REPL uses turn() which wraps this.
+        """
         # Persist the user turn before contacting the model.
         user_blocks = [{"type": "text", "text": user_text}]
         self.store.append_turn("user", user_blocks)
@@ -93,7 +130,14 @@ class AgentSession:
 
         options = self._build_options(system_prompt)
 
-        result = asyncio.run(_run_turn(prompt, options, self.cfg.stream))
+        result = await _run_turn(
+            prompt,
+            options,
+            self.cfg.stream,
+            on_token=on_token,
+            on_tool_use=on_tool_use,
+            on_tool_result=on_tool_result,
+        )
 
         assistant_blocks = result["assistant_blocks"]
         total_in = result["tokens_in"]
@@ -241,11 +285,25 @@ def _flatten_blocks(blocks: Any) -> str:
 # -----------------------------------------------------------------------------
 
 
-async def _run_turn(prompt: str, options: "ClaudeAgentOptions", stream: bool) -> dict[str, Any]:
+async def _run_turn(
+    prompt: str,
+    options: "ClaudeAgentOptions",
+    stream: bool,
+    on_token: OnToken | None = None,
+    on_tool_use: OnToolUse | None = None,
+    on_tool_result: OnToolResult | None = None,
+) -> dict[str, Any]:
     assistant_blocks: list[dict] = []
     tokens_in = 0
     tokens_out = 0
     printed_any = False
+    # When any callback is wired the caller (TUI) owns presentation —
+    # suppress the default console rendering to avoid double-output.
+    callback_mode = any(c is not None for c in (on_token, on_tool_use, on_tool_result))
+
+    async def _maybe_await(result):
+        if asyncio.iscoroutine(result):
+            await result
 
     async def _prompt_stream():
         # The SDK requires an AsyncIterable prompt when can_use_tool is set
@@ -265,21 +323,36 @@ async def _run_turn(prompt: str, options: "ClaudeAgentOptions", stream: bool) ->
                 if bd is None:
                     continue
                 assistant_blocks.append(bd)
-                if stream and bd.get("type") == "text" and bd.get("text"):
-                    console.print(bd["text"], end="", soft_wrap=True, highlight=False)
-                    printed_any = True
+                if bd.get("type") == "text" and bd.get("text"):
+                    if on_token is not None:
+                        await _maybe_await(on_token(bd["text"]))
+                    elif stream and not callback_mode:
+                        console.print(bd["text"], end="", soft_wrap=True, highlight=False)
+                        printed_any = True
                 elif bd.get("type") == "tool_use":
                     name = bd.get("name", "?")
                     inp = bd.get("input") or {}
-                    console.print(f"\n[dim]> tool: {name}({_short(inp)})[/dim]")
+                    if on_tool_use is not None:
+                        await _maybe_await(on_tool_use(name, inp if isinstance(inp, dict) else {}))
+                    elif not callback_mode:
+                        console.print(f"\n[dim]> tool: {name}({_short(inp)})[/dim]")
                     log("tool_call", tool=name)
         elif isinstance(message, UserMessage):
             # tool_result blocks come back in a UserMessage. Surface failures
             # in debug log; the model already sees them via the SDK's loop.
             for block in (message.content or []):
                 bd = _block_to_dict(block)
-                if bd and bd.get("type") == "tool_result" and bd.get("is_error"):
-                    log("tool_result_error", content=str(bd.get("content"))[:200])
+                if bd and bd.get("type") == "tool_result":
+                    if bd.get("is_error"):
+                        log("tool_result_error", content=str(bd.get("content"))[:200])
+                    if on_tool_result is not None:
+                        await _maybe_await(
+                            on_tool_result(
+                                bd.get("tool_use_id", ""),
+                                bd.get("content"),
+                                bool(bd.get("is_error", False)),
+                            )
+                        )
         elif isinstance(message, ResultMessage):
             usage = message.usage or {}
             tokens_in = int(usage.get("input_tokens", 0) or 0) + int(

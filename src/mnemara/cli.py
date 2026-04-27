@@ -1,6 +1,7 @@
 """Click-based CLI entry points."""
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -48,11 +49,31 @@ def init_cmd(instance: str, role_doc: str | None) -> None:
 
 @main.command("run")
 @click.option("--instance", required=True)
-def run_cmd(instance: str) -> None:
-    """Open an interactive REPL for an instance."""
+@click.option("--no-tui", is_flag=True, help="Force the bare prompt-toolkit REPL.")
+def run_cmd(instance: str, no_tui: bool) -> None:
+    """Open the interactive chat panel for an instance.
+
+    Launches the Textual TUI by default; falls back to the bare REPL when
+    --no-tui is set, MNEMARA_NO_TUI=1, textual is not installed, or stdout
+    is not a TTY.
+    """
     if not paths.config_path(instance).exists():
         console.print(f"[red]No instance:[/red] {instance}")
         sys.exit(1)
+
+    force_repl = no_tui or os.environ.get("MNEMARA_NO_TUI") == "1"
+    if not force_repl:
+        try:
+            from . import tui as tui_mod
+        except ImportError as exc:
+            console.print(f"[yellow]textual unavailable ({exc}); using bare REPL.[/yellow]")
+            tui_mod = None  # type: ignore[assignment]
+        if tui_mod is not None:
+            launched = tui_mod.run(instance)
+            if launched:
+                return
+            console.print("[yellow]TUI not launched (no TTY?); falling back to REPL.[/yellow]")
+
     repl_mod.run(instance)
 
 

@@ -193,6 +193,73 @@ def paths_role(home, name: str, content: str):
     return p
 
 
+def test_tui_imports_and_instantiates(home):
+    """TUI module imports and the App class instantiates without crashing."""
+    from mnemara import config
+    config.init_instance("tui_t")
+    from mnemara import tui as tui_mod
+    assert tui_mod._TEXTUAL_AVAILABLE, "textual should import in dev environment"
+    app = tui_mod.MnemaraTUI("tui_t")
+    assert app.instance == "tui_t"
+    assert app.cfg.model
+    s = app._status_text()
+    assert "turns:" in s and "tokens:" in s
+    app.store.close()
+
+
+def test_on_token_callback_invoked(home, monkeypatch):
+    """Streaming on_token callback receives text deltas during turn_async."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+    from mnemara import agent as agent_mod
+
+    config.init_instance("cb_t")
+    cfg = config.load("cb_t")
+    cfg.stream = True
+    config.save("cb_t", cfg)
+
+    store = Store("cb_t")
+    perms = PermissionStore("cb_t")
+    runner = ToolRunner("cb_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    async def _maybe(cb, arg):
+        r = cb(arg)
+        if _asyncio.iscoroutine(r):
+            await r
+
+    async def _fake_run_turn(prompt, options, stream, on_token=None,
+                             on_tool_use=None, on_tool_result=None):
+        if on_token is not None:
+            await _maybe(on_token, "Hello, ")
+            await _maybe(on_token, "world!")
+        return {
+            "assistant_blocks": [{"type": "text", "text": "Hello, world!"}],
+            "tokens_in": 5,
+            "tokens_out": 7,
+        }
+
+    monkeypatch.setattr(agent_mod, "_run_turn", _fake_run_turn)
+
+    session = agent_mod.AgentSession(cfg, store, runner, client=None)
+
+    captured: list[str] = []
+
+    async def _go():
+        return await session.turn_async(
+            "hi", on_token=lambda t: captured.append(t)
+        )
+
+    usage = _asyncio.run(_go())
+    assert captured == ["Hello, ", "world!"]
+    assert usage["input_tokens"] == 5
+    rows = store.window()
+    assert [r["role"] for r in rows[-2:]] == ["user", "assistant"]
+    store.close()
+
+
 def test_cli_list_show_clear(home):
     from click.testing import CliRunner
     from mnemara.cli import main

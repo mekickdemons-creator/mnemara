@@ -42,7 +42,41 @@ mnemara role --instance majordomo --set ~/workspace/architect/roles/majordomo.md
 mnemara run --instance majordomo
 ```
 
-In the REPL, type to chat. Slash commands (see below) manipulate state.
+By default `mnemara run` opens the **Textual chat panel** (TUI). Pass
+`--no-tui` (or set `MNEMARA_NO_TUI=1`) to force the bare prompt-toolkit
+REPL — useful for scripting or non-TTY contexts.
+
+### Chat panel layout (v0.1.2)
+
+```
++------------------------------------------------------------+
+| mnemara: majordomo            model=opus-4-7  role=...     |   header
++------------------------------------------------------------+
+|                                                            |
+|  you: how do I check the lease timeout?                    |
+|  assistant: open architect/orchestrator.py and grep ...    |
+|  > tool: Read(file_path=architect/orchestrator.py)         |
+|    result: ...                                             |
+|                                                            |   chat log
++------------------------------------------------------------+
+| turns: 12/100 | tokens: 14K/200K | model: opus-4-7 | ...   |   status
++------------------------------------------------------------+
+| > _                                                        |   input
++------------------------------------------------------------+
+```
+
+Keybindings:
+
+| Key | Action |
+|---|---|
+| Enter | Send the message |
+| Ctrl+L | Clear the on-screen chat log (does NOT touch turns.sqlite) |
+| Ctrl+C | Quit |
+| `/help` | Slash-command list (same as the REPL) |
+
+Slash commands (`/role`, `/show`, `/clear`, `/swap`, `/note`, `/quit`,
+`/help`) are accepted in either UI. The `/note` command opens a small
+modal in the TUI when invoked without text.
 
 ## State layout
 
@@ -76,7 +110,7 @@ Everything for an instance lives under `~/.mnemara/<instance>/`:
 
 ```
 mnemara init --instance <name>            # create ~/.mnemara/<name>/, refuses to overwrite
-mnemara run --instance <name>             # open the REPL
+mnemara run --instance <name>             # open the chat panel (TUI; --no-tui for bare REPL)
 mnemara list                              # list instances
 mnemara show --instance <name> [-n N]     # print the rolling window (read-only)
 mnemara clear --instance <name>           # wipe the rolling window
@@ -152,6 +186,15 @@ Add an entry to `mcp_servers` in `config.json`:
 Mnemara passes this to the Claude Agent SDK's `mcp_servers` option. The SDK
 launches the stdio process and exposes its tools to the model under the
 `mcp__<name>__*` namespace; Mnemara automatically allow-lists those.
+
+### v0.1.2 — Textual chat panel
+
+`mnemara run` now defaults to a Textual TUI: header (instance/model/role),
+scrollable chat log with user/assistant/tool-use rendering, status bar
+(turns / tokens / model / evicted), and a single-line input box. Streaming
+tokens render live via new `on_token` / `on_tool_use` / `on_tool_result`
+callbacks on `AgentSession.turn_async()`. The bare prompt-toolkit REPL
+remains as the `--no-tui` / `MNEMARA_NO_TUI=1` fallback.
 
 ### Architecture note (v0.1.1)
 
