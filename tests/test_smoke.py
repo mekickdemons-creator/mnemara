@@ -117,6 +117,71 @@ def test_cli_init_idempotent(home):
     assert r2.exit_code != 0  # refuses to overwrite
 
 
+def test_agent_prompt_includes_role_window_and_input(home, monkeypatch):
+    """Verify the SDK call receives [system: role_doc, ...rolling_window, current_input].
+
+    We mock claude_agent_sdk.query to capture the prompt + options it was
+    called with, then inspect them.
+    """
+    from mnemara import config
+    from mnemara.config import Config
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+    from mnemara import agent as agent_mod
+
+    config.init_instance("agent_t")
+    cfg = config.load("agent_t")
+    role_path = paths_role(home, "role.md", "ROLE-DOC-MARKER")
+    cfg.role_doc_path = str(role_path)
+    cfg.stream = False
+    config.save("agent_t", cfg)
+
+    store = Store("agent_t")
+    store.append_turn("user", [{"type": "text", "text": "earlier-user"}])
+    store.append_turn("assistant", [{"type": "text", "text": "earlier-asst"}])
+
+    perms = PermissionStore("agent_t")
+    runner = ToolRunner("agent_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    captured: dict = {}
+
+    async def _fake_query(*, prompt, options, transport=None):
+        captured["prompt"] = prompt
+        captured["options"] = options
+        # Yield nothing — agent loop tolerates empty stream.
+        if False:
+            yield None
+        return
+
+    monkeypatch.setattr(agent_mod, "query", _fake_query)
+
+    session = agent_mod.AgentSession(cfg, store, runner, client=None)
+    session.turn("CURRENT-INPUT-MARKER")
+
+    prompt = captured["prompt"]
+    options = captured["options"]
+    # Role doc goes through as system_prompt.
+    assert "ROLE-DOC-MARKER" in options.system_prompt
+    # Rolling window is reflected in the prompt prefix.
+    assert "earlier-user" in prompt
+    assert "earlier-asst" in prompt
+    # Current user input is the live message.
+    assert "CURRENT-INPUT-MARKER" in prompt
+    # Current input ordered after the prior history.
+    assert prompt.index("earlier-user") < prompt.index("CURRENT-INPUT-MARKER")
+    # Built-in Claude Code tools are exposed.
+    assert "Bash" in options.allowed_tools
+    assert any("write_memory" in t for t in options.allowed_tools)
+    store.close()
+
+
+def paths_role(home, name: str, content: str):
+    p = home / name
+    p.write_text(content)
+    return p
+
+
 def test_cli_list_show_clear(home):
     from click.testing import CliRunner
     from mnemara.cli import main

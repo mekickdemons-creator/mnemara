@@ -17,8 +17,21 @@ cd ~/workspace/mnemara
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-export ANTHROPIC_API_KEY=sk-...
 ```
+
+### Auth
+
+Mnemara uses the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk-overview),
+which talks to your local `claude` CLI. It inherits your Claude Code
+subscription auth — no API key required. If you have not already authed:
+
+```bash
+claude auth login
+```
+
+`ANTHROPIC_API_KEY` is **not** required. If it is set in your environment
+the underlying `claude` CLI may use it (billed against API credits); leave
+it unset to bill against your subscription.
 
 ## Quick start
 
@@ -136,9 +149,22 @@ Add an entry to `mcp_servers` in `config.json`:
 ]
 ```
 
-Mnemara passes this to the SDK's `mcp_servers=` parameter. If the SDK build
-doesn't support it, Mnemara silently drops the parameter and continues with
-native tools only — a warning is logged to `debug.log`.
+Mnemara passes this to the Claude Agent SDK's `mcp_servers` option. The SDK
+launches the stdio process and exposes its tools to the model under the
+`mcp__<name>__*` namespace; Mnemara automatically allow-lists those.
+
+### Architecture note (v0.1.1)
+
+Mnemara now uses the **Claude Agent SDK** (`claude-agent-sdk`) rather than
+the raw Anthropic API SDK. The SDK is a higher-level wrapper around the
+`claude` CLI: it does not accept a fabricated `messages=[...]` list with
+synthetic assistant turns. Mnemara therefore serialises the rolling-window
+transcript into a prefix prepended to each turn's user prompt, with the
+role doc still pinned as `system_prompt`. Bash/Read/Edit/Write are
+delegated to Claude Code's built-in tools (the SDK runs them in `cwd`);
+WriteMemory is registered as an in-process SDK MCP tool. Permissions still
+flow through Mnemara's `permissions.py` policy via the SDK's
+`can_use_tool` callback.
 
 ## Where state lives
 
@@ -157,7 +183,8 @@ native tools only — a warning is logged to `debug.log`.
 
 ## Troubleshooting
 
-- **`anthropic.AuthenticationError`** — set `ANTHROPIC_API_KEY` in your env.
+- **Auth errors / "claude CLI not found"** — install Claude Code and run
+  `claude auth login`. Mnemara delegates auth entirely to the `claude` CLI.
 - **Role doc not loading** — Mnemara warns to stderr and uses an empty system
   prompt; the REPL stays alive. Check `debug.log` for the path that failed.
 - **MCP server crashes** — check `debug.log` and the server's own stderr; the

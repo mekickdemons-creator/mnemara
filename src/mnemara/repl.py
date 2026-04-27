@@ -53,14 +53,13 @@ def run(instance: str) -> None:
     log("repl_start", instance=instance, model=cfg.model)
 
     try:
-        from anthropic import Anthropic
+        import claude_agent_sdk  # noqa: F401
     except ImportError:
-        console.print("[red]anthropic SDK not installed. pip install anthropic[/red]")
+        console.print("[red]claude-agent-sdk not installed. pip install claude-agent-sdk[/red]")
         sys.exit(1)
-    client = Anthropic()
 
     runner = ToolRunner(instance, cfg, perms, permission_prompt)
-    session = AgentSession(cfg, store, runner, client)
+    session = AgentSession(cfg, store, runner, client=None)
 
     psession = _make_prompt(instance)
     console.print(f"[bold green]mnemara[/bold green] instance=[cyan]{instance}[/cyan] model=[cyan]{cfg.model}[/cyan] window={cfg.max_window_turns}")
