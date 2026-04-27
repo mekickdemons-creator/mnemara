@@ -418,6 +418,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     def on_unmount(self) -> None:
         try:
+            self.session.write_session_stats()
+        except Exception as e:
+            log("tui_stats_error", error=str(e))
+        try:
             self.store.close()
         except Exception:
             pass

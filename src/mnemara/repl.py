@@ -91,6 +91,10 @@ def run(instance: str) -> None:
             log("repl_error", error=str(e))
             console.print(f"[red]error:[/red] {e}")
 
+    try:
+        session.write_session_stats()
+    except Exception as e:  # pragma: no cover
+        log("repl_stats_error", error=str(e))
     store.close()
     log("repl_stop", instance=instance)
 
