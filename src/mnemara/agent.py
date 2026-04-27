@@ -247,7 +247,18 @@ async def _run_turn(prompt: str, options: "ClaudeAgentOptions", stream: bool) ->
     tokens_out = 0
     printed_any = False
 
-    async for message in query(prompt=prompt, options=options):
+    async def _prompt_stream():
+        # The SDK requires an AsyncIterable prompt when can_use_tool is set
+        # (it needs to keep the bidirectional channel open for permission
+        # callbacks). Yield a single user message and complete.
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": prompt},
+            "parent_tool_use_id": None,
+            "session_id": "default",
+        }
+
+    async for message in query(prompt=_prompt_stream(), options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 bd = _block_to_dict(block)

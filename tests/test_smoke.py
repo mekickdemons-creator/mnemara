@@ -163,13 +163,24 @@ def test_agent_prompt_includes_role_window_and_input(home, monkeypatch):
     options = captured["options"]
     # Role doc goes through as system_prompt.
     assert "ROLE-DOC-MARKER" in options.system_prompt
+    # Prompt is an AsyncIterable yielding user-message dicts (SDK requirement
+    # when can_use_tool is set). Drain it to inspect the payload.
+    import asyncio as _asyncio
+    async def _drain(gen):
+        out = []
+        async for m in gen:
+            out.append(m)
+        return out
+    msgs = _asyncio.run(_drain(prompt))
+    assert msgs, "prompt generator yielded nothing"
+    payload = msgs[0]["message"]["content"]
     # Rolling window is reflected in the prompt prefix.
-    assert "earlier-user" in prompt
-    assert "earlier-asst" in prompt
+    assert "earlier-user" in payload
+    assert "earlier-asst" in payload
     # Current user input is the live message.
-    assert "CURRENT-INPUT-MARKER" in prompt
+    assert "CURRENT-INPUT-MARKER" in payload
     # Current input ordered after the prior history.
-    assert prompt.index("earlier-user") < prompt.index("CURRENT-INPUT-MARKER")
+    assert payload.index("earlier-user") < payload.index("CURRENT-INPUT-MARKER")
     # Built-in Claude Code tools are exposed.
     assert "Bash" in options.allowed_tools
     assert any("write_memory" in t for t in options.allowed_tools)
