@@ -215,7 +215,7 @@ class ToolRunner:
     def _write_memory(self, params: dict[str, Any]) -> tuple[str, bool]:
         text = params["text"]
         category = params.get("category", "note")
-        write_memory(self.instance, text, category)
+        write_memory(self.instance, text, category, cfg=self.cfg)
         return ("Memory note appended.", False)
 
 
@@ -224,7 +224,12 @@ def write_memory(
     text: str,
     category: str = "note",
     payload: Optional[dict] = None,
+    cfg: Optional[Config] = None,
 ) -> Path:
+    """Append a memory note. With cfg provided, also performs consolidation:
+    auto-RAG-index, and if category starts with 'wiki/', also write to the
+    wiki layer at the slug after the prefix. Backend failures are swallowed
+    so the primary memory write always succeeds."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     d = paths.memory_dir(instance)
     d.mkdir(parents=True, exist_ok=True)
@@ -243,10 +248,36 @@ def write_memory(
             f"**applies_to:** {applies}\n\n"
             f"**confidence:** {conf}\n"
         )
+        rag_text = "\n".join(
+            x for x in (obs, ev, pred, applies) if x
+        ) or text
     else:
         block = f"\n## [{ts}] {category}\n\n{text}\n"
+        rag_text = text
     with f.open("a") as fh:
         fh.write(block)
+
+    if cfg is not None:
+        # wiki/ category routing
+        if category and category.startswith("wiki/"):
+            slug = category[len("wiki/"):]
+            try:
+                from . import wiki as wiki_mod
+                wiki_mod.write_page(instance, slug, rag_text, mode="replace")
+            except Exception as e:
+                log("memory_to_wiki_error", error=str(e))
+        # Auto RAG indexing
+        if getattr(cfg, "rag_auto_index_memory", True) and getattr(cfg, "rag_enabled", True):
+            try:
+                from . import rag as rag_mod
+                rag_mod.store_for(instance, cfg).index(
+                    rag_text,
+                    kind="memory",
+                    source_path=str(f),
+                    category=category or "",
+                )
+            except Exception as e:
+                log("memory_rag_index_error", error=str(e))
     return f
 
 

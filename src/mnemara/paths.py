@@ -44,6 +44,14 @@ def debug_log(name: str) -> Path:
     return instance_dir(name) / "debug.log"
 
 
+def wiki_dir(name: str) -> Path:
+    return instance_dir(name) / "wiki"
+
+
+def rag_index_dir(name: str) -> Path:
+    return instance_dir(name) / "index"
+
+
 def role_proposals_count(name: str) -> int:
     d = role_proposals_dir(name)
     if not d.exists():

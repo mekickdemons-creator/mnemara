@@ -39,6 +39,12 @@ class Config:
     stream: bool = True
     bash_timeout_seconds: int = 60
     file_tool_home_only: bool = True
+    # v0.2.1 — multi-backend memory
+    rag_enabled: bool = True
+    rag_embed_url: str = "http://localhost:11434/api/embeddings"
+    rag_embed_model: str = "nomic-embed-text"
+    rag_auto_index_memory: bool = True
+    rag_auto_index_wiki: bool = True
 
     @classmethod
     def default(cls) -> "Config":
@@ -52,6 +58,11 @@ class Config:
                 ToolPolicy(tool="InspectContext", mode="allow"),
                 ToolPolicy(tool="ProposeRoleAmendment", mode="allow"),
                 ToolPolicy(tool="LogChoice", mode="allow"),
+                ToolPolicy(tool="WikiRead", mode="allow"),
+                ToolPolicy(tool="WikiWrite", mode="allow"),
+                ToolPolicy(tool="WikiList", mode="allow"),
+                ToolPolicy(tool="RagIndex", mode="allow"),
+                ToolPolicy(tool="RagQuery", mode="allow"),
             ]
         )
 
@@ -73,6 +84,11 @@ class Config:
             stream=bool(d.get("stream", True)),
             bash_timeout_seconds=int(d.get("bash_timeout_seconds", 60)),
             file_tool_home_only=bool(d.get("file_tool_home_only", True)),
+            rag_enabled=bool(d.get("rag_enabled", True)),
+            rag_embed_url=str(d.get("rag_embed_url", "http://localhost:11434/api/embeddings")),
+            rag_embed_model=str(d.get("rag_embed_model", "nomic-embed-text")),
+            rag_auto_index_memory=bool(d.get("rag_auto_index_memory", True)),
+            rag_auto_index_wiki=bool(d.get("rag_auto_index_wiki", True)),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:
@@ -105,6 +121,8 @@ def init_instance(instance: str, role_doc_path: str = "") -> Path:
         raise FileExistsError(f"Instance already exists at {d}")
     d.mkdir(parents=True)
     paths.memory_dir(instance).mkdir(exist_ok=True)
+    paths.wiki_dir(instance).mkdir(exist_ok=True)
+    paths.rag_index_dir(instance).mkdir(exist_ok=True)
     cfg = Config.default()
     cfg.role_doc_path = role_doc_path
     save(instance, cfg)

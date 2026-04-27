@@ -75,6 +75,11 @@ _WRITE_MEMORY_TOOL = "mcp__mnemara_memory__write_memory"
 _INSPECT_CONTEXT_TOOL = "mcp__mnemara_memory__inspect_context"
 _PROPOSE_ROLE_AMENDMENT_TOOL = "mcp__mnemara_memory__propose_role_amendment"
 _LOG_CHOICE_TOOL = "mcp__mnemara_memory__log_choice"
+_WIKI_READ_TOOL = "mcp__mnemara_memory__wiki_read"
+_WIKI_WRITE_TOOL = "mcp__mnemara_memory__wiki_write"
+_WIKI_LIST_TOOL = "mcp__mnemara_memory__wiki_list"
+_RAG_INDEX_TOOL = "mcp__mnemara_memory__rag_index"
+_RAG_QUERY_TOOL = "mcp__mnemara_memory__rag_query"
 
 
 class AgentSession:
@@ -97,6 +102,9 @@ class AgentSession:
         self.memory_writes = 0
         self.role_proposals = 0
         self.choices_logged = 0
+        self.wiki_writes = 0
+        self.rag_indexes = 0
+        self.rag_queries = 0
         self.session_turns = 0
         self.session_tokens_in = 0
         self.session_tokens_out = 0
@@ -212,6 +220,9 @@ class AgentSession:
                 "memory_writes": self.memory_writes,
                 "role_proposals": self.role_proposals,
                 "choices_logged": self.choices_logged,
+                "wiki_writes": self.wiki_writes,
+                "rag_indexes": self.rag_indexes,
+                "rag_queries": self.rag_queries,
             }
             existing: dict[str, Any] = {}
             if f.exists():
@@ -233,6 +244,9 @@ class AgentSession:
                 "memory_writes": int(cum.get("memory_writes", 0) or 0) + self.memory_writes,
                 "role_proposals": int(cum.get("role_proposals", 0) or 0) + self.role_proposals,
                 "choices_logged": int(cum.get("choices_logged", 0) or 0) + self.choices_logged,
+                "wiki_writes": int(cum.get("wiki_writes", 0) or 0) + self.wiki_writes,
+                "rag_indexes": int(cum.get("rag_indexes", 0) or 0) + self.rag_indexes,
+                "rag_queries": int(cum.get("rag_queries", 0) or 0) + self.rag_queries,
                 "tools_called": cum_tools,
             }
             doc = {
@@ -278,8 +292,16 @@ class AgentSession:
                 args.get("text", "") or "",
                 args.get("category", "note") or "note",
                 payload=payload_dict,
+                cfg=session.cfg,
             )
             session.memory_writes += 1
+            cat = args.get("category", "") or ""
+            if cat.startswith("wiki/"):
+                session.wiki_writes += 1
+            if getattr(session.cfg, "rag_auto_index_memory", True) and getattr(
+                session.cfg, "rag_enabled", True
+            ):
+                session.rag_indexes += 1
             return {"content": [{"type": "text", "text": "Memory note appended."}]}
 
         @tool(
@@ -378,11 +400,132 @@ class AgentSession:
             session.choices_logged += 1
             return {"content": [{"type": "text", "text": "Choice logged."}]}
 
+        @tool(
+            "wiki_read",
+            "Read a wiki page by slash-allowed slug (e.g. 'replay_policy' or "
+            "'patterns/loader_traps'). Returns the page contents, or 'no such "
+            "page' if missing.",
+            {"path": str},
+        )
+        async def _wiki_read_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import wiki as wiki_mod
+            path = args.get("path", "") or ""
+            content = wiki_mod.read_page(session.runner.instance, path)
+            if content is None:
+                return {"content": [{"type": "text", "text": "no such page"}]}
+            return {"content": [{"type": "text", "text": content}]}
+
+        @tool(
+            "wiki_write",
+            "Write a wiki page. mode is 'replace' (default) or 'append'. "
+            "Plain markdown body; optional frontmatter is your responsibility. "
+            "Auto-indexed into RAG when rag_auto_index_wiki is enabled.",
+            {"path": str, "content": str, "mode": str},
+        )
+        async def _wiki_write_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import wiki as wiki_mod
+            path = args.get("path", "") or ""
+            content = args.get("content", "") or ""
+            mode = args.get("mode", "replace") or "replace"
+            if mode not in ("replace", "append"):
+                mode = "replace"
+            try:
+                f = wiki_mod.write_page(session.runner.instance, path, content, mode=mode)
+            except ValueError as e:
+                return {
+                    "content": [{"type": "text", "text": f"wiki_write error: {e}"}],
+                    "is_error": True,
+                }
+            session.wiki_writes += 1
+            if getattr(session.cfg, "rag_auto_index_wiki", True) and getattr(
+                session.cfg, "rag_enabled", True
+            ):
+                try:
+                    from . import rag as rag_mod
+                    rag_mod.store_for(session.runner.instance, session.cfg).index(
+                        content, kind="wiki", source_path=str(f), category=path,
+                    )
+                    session.rag_indexes += 1
+                except Exception as e:
+                    log("wiki_rag_index_error", error=str(e))
+            return {"content": [{"type": "text", "text": f"Wrote wiki page: {f}"}]}
+
+        @tool(
+            "wiki_list",
+            "List wiki pages under an optional prefix. Returns a JSON list of "
+            "{path, size_bytes, last_modified}.",
+            {"prefix": str},
+        )
+        async def _wiki_list_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import wiki as wiki_mod
+            prefix = args.get("prefix", "") or ""
+            entries = wiki_mod.list_pages(session.runner.instance, prefix)
+            return {
+                "content": [{"type": "text", "text": json.dumps(entries, indent=2)}]
+            }
+
+        @tool(
+            "rag_index",
+            "Embed and index arbitrary text into the RAG store. kind is one of "
+            "'manual' (default), 'memory', 'wiki'. Returns the new row id, or "
+            "an unavailable error if the embedding backend is down.",
+            {"text": str, "kind": str, "source_path": str, "category": str},
+        )
+        async def _rag_index_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import rag as rag_mod
+            text = args.get("text", "") or ""
+            kind = args.get("kind", "manual") or "manual"
+            source_path = args.get("source_path", "") or ""
+            category = args.get("category", "") or ""
+            res = rag_mod.store_for(session.runner.instance, session.cfg).index(
+                text, kind=kind, source_path=source_path, category=category
+            )
+            if res.get("ok"):
+                session.rag_indexes += 1
+                return {"content": [{"type": "text", "text": f"Indexed: {res['id']}"}]}
+            return {
+                "content": [{"type": "text", "text": res.get("error", "RAG unavailable")}],
+                "is_error": True,
+            }
+
+        @tool(
+            "rag_query",
+            "Top-k semantic search over the RAG store. kind is an optional "
+            "filter ('memory'|'wiki'|'manual'). Returns JSON results with "
+            "distance scores, or an unavailable error if the embedding "
+            "backend is down.",
+            {"question": str, "k": int, "kind": str},
+        )
+        async def _rag_query_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import rag as rag_mod
+            question = args.get("question", "") or ""
+            k = int(args.get("k") or 5)
+            kind = args.get("kind") or None
+            res = rag_mod.store_for(session.runner.instance, session.cfg).query(
+                question, k=k, kind=kind
+            )
+            if res.get("ok"):
+                session.rag_queries += 1
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(res["results"], indent=2)}
+                    ]
+                }
+            return {
+                "content": [{"type": "text", "text": res.get("error", "RAG unavailable")}],
+                "is_error": True,
+            }
+
         registered = [
             _write_memory_tool,
             _inspect_context_tool,
             _propose_role_amendment_tool,
             _log_choice_tool,
+            _wiki_read_tool,
+            _wiki_write_tool,
+            _wiki_list_tool,
+            _rag_index_tool,
+            _rag_query_tool,
         ]
         # Expose handlers by name for in-process testing / introspection.
         self._registered_tools = {
@@ -408,6 +551,11 @@ class AgentSession:
             _INSPECT_CONTEXT_TOOL,
             _PROPOSE_ROLE_AMENDMENT_TOOL,
             _LOG_CHOICE_TOOL,
+            _WIKI_READ_TOOL,
+            _WIKI_WRITE_TOOL,
+            _WIKI_LIST_TOOL,
+            _RAG_INDEX_TOOL,
+            _RAG_QUERY_TOOL,
         ]
         for s in self.cfg.mcp_servers:
             # Permit any tool exposed by configured MCP servers.
@@ -648,6 +796,16 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "ProposeRoleAmendment", ""
     if tool_name == _LOG_CHOICE_TOOL or tool_name.endswith("__log_choice"):
         return "LogChoice", ""
+    if tool_name == _WIKI_READ_TOOL or tool_name.endswith("__wiki_read"):
+        return "WikiRead", ""
+    if tool_name == _WIKI_WRITE_TOOL or tool_name.endswith("__wiki_write"):
+        return "WikiWrite", ""
+    if tool_name == _WIKI_LIST_TOOL or tool_name.endswith("__wiki_list"):
+        return "WikiList", ""
+    if tool_name == _RAG_INDEX_TOOL or tool_name.endswith("__rag_index"):
+        return "RagIndex", ""
+    if tool_name == _RAG_QUERY_TOOL or tool_name.endswith("__rag_query"):
+        return "RagQuery", ""
     return None, ""
 
 

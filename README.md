@@ -88,6 +88,8 @@ Everything for an instance lives under `~/.mnemara/<instance>/`:
 | `turns.sqlite` | The rolling-window store. One row per turn. |
 | `permissions.json` | Persisted "always allow" patterns per tool. |
 | `memory/YYYY-MM-DD.md` | Notes the agent or user have written via `WriteMemory` / `/note`. |
+| `wiki/<slug>.md` | Topic-keyed wiki pages (slash-allowed slugs). |
+| `index/` | LanceDB RAG index (embeddings of memory + wiki + manual entries). |
 | `debug.log` | Append-only JSONL log: errors, tool calls, eviction events. |
 | `.prompt_history` | REPL input history. |
 
@@ -186,6 +188,60 @@ Add an entry to `mcp_servers` in `config.json`:
 Mnemara passes this to the Claude Agent SDK's `mcp_servers` option. The SDK
 launches the stdio process and exposes its tools to the model under the
 `mcp__<name>__*` namespace; Mnemara automatically allow-lists those.
+
+### v0.2.1 — Multi-backend memory (wiki + RAG)
+
+Three memory backends now write together. The agent picks which surface to
+read from given the kind of recall it needs; observed retrieval patterns
+become the data Mnemara self-tunes against.
+
+**Memory file** (existing) — `memory/YYYY-MM-DD.md`. Append-only, chronological.
+
+**Wiki** — `wiki/<slug>.md`. Slash-allowed slugs (e.g. `replay_policy`,
+`patterns/loader_traps`). Plain markdown, optional frontmatter, no schema.
+
+```
+wiki_read(path)                          # returns body or "no such page"
+wiki_write(path, content, mode='replace')  # mode='replace'|'append'
+wiki_list(prefix='')                     # [{path, size_bytes, last_modified}]
+```
+
+**RAG** — `index/` (LanceDB), embeddings via Ollama `nomic-embed-text` (768-dim).
+
+```
+rag_index(text, kind='manual', source_path='', category='')
+rag_query(question, k=5, kind=None)
+```
+
+**Write-to-all consolidation:** every `write_memory` call also `rag_index`es
+the content (kind=memory). Every `wiki_write` also `rag_index`es it
+(kind=wiki). If `category` starts with `wiki/`, `write_memory` ALSO writes
+the body to `wiki/<rest>.md`. So `category='wiki/patterns/loader_traps'`
+fans out into the daily memory file, the wiki page, and the RAG index in
+one call.
+
+**Setup:**
+
+```bash
+ollama pull nomic-embed-text  # one-time; ~270MB
+# Ollama must be running on http://localhost:11434
+```
+
+If Ollama is unreachable or LanceDB import fails, RAG tools degrade
+gracefully — they return `"RAG backend unavailable: <reason>"` and the
+memory + wiki layers continue to work. RAG is lazy: nothing connects to
+Ollama or LanceDB until the first `rag_index` / `rag_query` call.
+
+**Config additions** (all backward-compatible — existing `config.json` files
+load with sensible defaults):
+
+| Field | Default | Purpose |
+|---|---|---|
+| `rag_enabled` | `true` | Off-switch for the entire RAG backend |
+| `rag_embed_url` | `http://localhost:11434/api/embeddings` | Ollama embeddings endpoint |
+| `rag_embed_model` | `nomic-embed-text` | Embedding model id |
+| `rag_auto_index_memory` | `true` | Auto-index every `write_memory` call |
+| `rag_auto_index_wiki` | `true` | Auto-index every `wiki_write` call |
 
 ### v0.1.2 — Textual chat panel
 
