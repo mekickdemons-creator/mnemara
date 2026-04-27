@@ -44,6 +44,13 @@ def debug_log(name: str) -> Path:
     return instance_dir(name) / "debug.log"
 
 
+def role_proposals_count(name: str) -> int:
+    d = role_proposals_dir(name)
+    if not d.exists():
+        return 0
+    return len(list(d.glob("*.md")))
+
+
 def list_instances() -> list[str]:
     r = root()
     if not r.exists():

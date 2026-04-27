@@ -279,6 +279,39 @@ def propose_role_amendment(
     return f
 
 
+def parse_proposal_file(path: "Path") -> tuple[str, str]:
+    """Return (severity, body_preview) from a proposal .md file.
+
+    Parses YAML-like frontmatter between leading/trailing '---' lines.
+    Defaults severity to 'unknown' on any parse failure. Preview is the
+    first 80 chars of the body (content after the closing '---').
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "unknown", ""
+    lines = text.splitlines()
+    severity = "unknown"
+    body_start = 0
+    in_front = False
+    for i, line in enumerate(lines):
+        if i == 0 and line.strip() == "---":
+            in_front = True
+            continue
+        if in_front:
+            if line.strip() == "---":
+                in_front = False
+                body_start = i + 1
+                break
+            if line.startswith("severity:"):
+                val = line.split(":", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    severity = val
+    body = " ".join(l.strip() for l in lines[body_start:] if l.strip())
+    preview = body[:80] + ("..." if len(body) > 80 else "")
+    return severity, preview
+
+
 def log_choice(
     instance: str,
     decision_type: str,

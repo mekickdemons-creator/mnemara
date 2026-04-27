@@ -44,7 +44,7 @@ from .config import Config
 from .logging_util import log, set_log_path
 from .permissions import PermissionStore
 from .store import Store
-from .tools import ToolRunner, write_memory
+from .tools import ToolRunner, parse_proposal_file, write_memory
 
 
 DEFAULT_CSS = """
@@ -237,11 +237,18 @@ class MnemaraTUI(App):  # type: ignore[misc]
         n_turns = len(rows)
         tin, tout = self.store.total_tokens()
         total = tin + tout
-        return (
+        base = (
             f"turns: {n_turns}/{self.cfg.max_window_turns} | "
             f"tokens: {total}/{self.cfg.max_window_tokens} ({tin} in / {tout} out) | "
             f"model: {self.cfg.model} | evicted: {self._evicted_total}"
         )
+        try:
+            n_prop = paths.role_proposals_count(self.instance)
+            if n_prop > 0:
+                base += f" | [yellow]📋 {n_prop} proposal{'s' if n_prop != 1 else ''}[/yellow]"
+        except Exception:
+            pass
+        return base
 
     def _refresh_status(self) -> None:
         self.query_one("#status", Static).update(self._status_text())
@@ -359,6 +366,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /clear           wipe the rolling window\n"
                 "  /swap <model>    switch model for this and future sessions\n"
                 "  /note [text]     append to today's memory file (modal if no text)\n"
+                "  /proposals       list pending role-amendment proposals\n"
                 "  /quit, /exit     exit"
             )
             return
@@ -406,6 +414,18 @@ class MnemaraTUI(App):  # type: ignore[misc]
                     chat.write(f"[green]appended to[/green] {p} [dim]({cat})[/dim]")
             return
 
+        if cmd == "/proposals":
+            prop_dir = paths.role_proposals_dir(self.instance)
+            if not prop_dir.exists() or not list(prop_dir.glob("*.md")):
+                chat.write("No pending proposals.")
+                return
+            files = sorted(prop_dir.glob("*.md"), reverse=True)
+            chat.write(f"[b]📋 {len(files)} pending proposal{'s' if len(files) != 1 else ''}:[/b]")
+            for f in files:
+                severity, preview = parse_proposal_file(f)
+                chat.write(f"  [[yellow]{severity}[/yellow]] {f.name} — {preview}")
+            return
+
         chat.write(f"[red]unknown command:[/red] {cmd}  (try /help)")
 
     # ---------------------------------------------------------------- actions
@@ -421,6 +441,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self.session.write_session_stats()
         except Exception as e:
             log("tui_stats_error", error=str(e))
+        try:
+            if self.session.role_proposals > 0:
+                n = self.session.role_proposals
+                p = paths.role_proposals_dir(self.instance)
+                print(
+                    f"📋 {n} role-amendment proposal(s) written this session. "
+                    f"Review at {p}"
+                )
+        except Exception:
+            pass
         try:
             self.store.close()
         except Exception:

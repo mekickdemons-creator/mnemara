@@ -16,7 +16,7 @@ from .config import Config
 from .logging_util import log, set_log_path
 from .permissions import PermissionStore
 from .store import Store
-from .tools import ToolRunner, write_memory
+from .tools import ToolRunner, parse_proposal_file, write_memory
 
 console = Console()
 
@@ -95,6 +95,16 @@ def run(instance: str) -> None:
         session.write_session_stats()
     except Exception as e:  # pragma: no cover
         log("repl_stats_error", error=str(e))
+    try:
+        if session.role_proposals > 0:
+            n = session.role_proposals
+            p = paths.role_proposals_dir(instance)
+            console.print(
+                f"📋 {n} role-amendment proposal(s) written this session. "
+                f"Review at {p}"
+            )
+    except Exception:
+        pass
     store.close()
     log("repl_stop", instance=instance)
 
@@ -119,6 +129,7 @@ def _handle_slash(line: str, instance: str, cfg: Config, store: Store) -> bool:
             "  /clear           wipe the rolling window (with confirm)\n"
             "  /swap <model>    switch model for this and future sessions\n"
             "  /note <text>     append to today's memory file\n"
+            "  /proposals       list pending role-amendment proposals\n"
             "  /quit, /exit     exit\n"
         )
         return True
@@ -184,5 +195,24 @@ def _handle_slash(line: str, instance: str, cfg: Config, store: Store) -> bool:
         console.print(f"[green]appended to[/green] {path}")
         return True
 
+    if cmd == "/proposals":
+        _cmd_proposals(instance)
+        return True
+
     console.print(f"[red]unknown command:[/red] {cmd}  (try /help)")
     return True
+
+
+def _cmd_proposals(instance: str) -> None:
+    prop_dir = paths.role_proposals_dir(instance)
+    if not prop_dir.exists():
+        console.print("No pending proposals.")
+        return
+    files = sorted(prop_dir.glob("*.md"), reverse=True)
+    if not files:
+        console.print("No pending proposals.")
+        return
+    console.print(f"[bold]📋 {len(files)} pending proposal{'s' if len(files) != 1 else ''}:[/bold]")
+    for f in files:
+        severity, preview = parse_proposal_file(f)
+        console.print(f"  [[yellow]{severity}[/yellow]] {f.name} — {preview}")

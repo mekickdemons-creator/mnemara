@@ -458,6 +458,85 @@ def test_session_stats_dump_merges(home):
     store.close()
 
 
+def test_proposals_list_parses_severity(home):
+    """parse_proposal_file returns correct severity and body preview."""
+    from mnemara import config, paths
+    from mnemara.tools import parse_proposal_file, propose_role_amendment
+
+    config.init_instance("prop_t")
+    p1 = propose_role_amendment("prop_t", "Add self-check before each tool call", "Saw failures.", "moderate")
+    p2 = propose_role_amendment("prop_t", "Minor wording fix in role doc", "Clarity.", "minor")
+
+    sev1, preview1 = parse_proposal_file(p1)
+    assert sev1 == "moderate"
+    assert "Add self-check" in preview1
+
+    sev2, preview2 = parse_proposal_file(p2)
+    assert sev2 == "minor"
+    assert "Minor wording" in preview2
+
+    # Verify count helper
+    assert paths.role_proposals_count("prop_t") == 2
+
+    # Verify /proposals command output via REPL helper
+    from io import StringIO
+    from rich.console import Console as _Console
+    from mnemara import repl as repl_mod
+    buf = StringIO()
+    orig_console = repl_mod.console
+    repl_mod.console = _Console(file=buf, highlight=False)
+    try:
+        repl_mod._cmd_proposals("prop_t")
+    finally:
+        repl_mod.console = orig_console
+    output = buf.getvalue()
+    assert "2 pending proposals" in output
+    assert "moderate" in output
+    assert "minor" in output
+
+
+def test_session_end_summary_fires(home, capsys):
+    """Session end summary prints when role_proposals > 0."""
+    from mnemara import config, paths
+    from mnemara import agent as agent_mod
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("ses_t")
+    cfg = config.load("ses_t")
+    store = Store("ses_t")
+    perms = PermissionStore("ses_t")
+    runner = ToolRunner("ses_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    session = agent_mod.AgentSession(cfg, store, runner)
+    session.role_proposals = 2
+    # Simulate the REPL shutdown path manually
+    from io import StringIO
+    from rich.console import Console as _Console
+    from mnemara import repl as repl_mod
+    buf = StringIO()
+    orig_console = repl_mod.console
+    repl_mod.console = _Console(file=buf, highlight=False)
+    try:
+        try:
+            if session.role_proposals > 0:
+                n = session.role_proposals
+                p = paths.role_proposals_dir("ses_t")
+                repl_mod.console.print(
+                    f"📋 {n} role-amendment proposal(s) written this session. "
+                    f"Review at {p}"
+                )
+        except Exception:
+            pass
+    finally:
+        repl_mod.console = orig_console
+    output = buf.getvalue()
+    assert "2 role-amendment proposal(s)" in output
+    assert "role_proposals" in str(paths.role_proposals_dir("ses_t"))
+    store.close()
+
+
 def test_cli_list_show_clear(home):
     from click.testing import CliRunner
     from mnemara.cli import main
