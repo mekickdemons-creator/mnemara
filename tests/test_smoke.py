@@ -23,7 +23,7 @@ def test_init_and_load(home):
     cfg = config.load("t1")
     assert cfg.role_doc_path == "/tmp/role.md"
     assert cfg.max_window_turns == 100
-    assert cfg.max_window_tokens == 800_000
+    assert cfg.max_window_tokens == 500_000
 
 
 def test_store_eviction(home):

@@ -10,7 +10,7 @@ from . import paths
 
 DEFAULT_MODEL = "claude-opus-4-7"
 DEFAULT_MAX_TURNS = 100
-DEFAULT_MAX_TOKENS = 800_000  # leaves ~200K headroom in Opus 1M context
+DEFAULT_MAX_TOKENS = 500_000  # conservative until usage tier increases; raise to ~800K when budget allows
 
 
 @dataclass
