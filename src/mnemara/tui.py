@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover
     _TEXTUAL_AVAILABLE = False
 
 from . import config as config_mod
+from . import inbox as inbox_mod
 from . import paths
 from .agent import AgentSession
 from .config import Config
@@ -248,6 +249,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 base += f" | [yellow]📋 {n_prop} proposal{'s' if n_prop != 1 else ''}[/yellow]"
         except Exception:
             pass
+        try:
+            db = getattr(self.cfg, "architect_db_path", "") or ""
+            peers = getattr(self.cfg, "peer_roles", ["theseus", "majordomo"])
+            if db:
+                n_inbox = inbox_mod.count_pending(db, peers, exclude_role=self.instance)
+                if n_inbox > 0:
+                    base += f" | [yellow]I {n_inbox} pending[/yellow]"
+        except Exception:
+            pass
         return base
 
     def _refresh_status(self) -> None:
@@ -367,6 +377,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /swap <model>    switch model for this and future sessions\n"
                 "  /note [text]     append to today's memory file (modal if no text)\n"
                 "  /proposals       list pending role-amendment proposals\n"
+                "  /inbox           list pending pings from peer panels\n"
                 "  /quit, /exit     exit"
             )
             return
@@ -424,6 +435,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
             for f in files:
                 severity, preview = parse_proposal_file(f)
                 chat.write(f"  [[yellow]{severity}[/yellow]] {f.name} — {preview}")
+            return
+
+        if cmd == "/inbox":
+            db = getattr(self.cfg, "architect_db_path", "") or ""
+            if not db:
+                chat.write("[dim]inbox: not configured (set architect_db_path in config)[/dim]")
+                return
+            peers = getattr(self.cfg, "peer_roles", ["theseus", "majordomo"])
+            pings = inbox_mod.peek_pending_pings(db, peers, exclude_role=self.instance)
+            chat.write(inbox_mod.format_inbox(pings))
             return
 
         chat.write(f"[red]unknown command:[/red] {cmd}  (try /help)")

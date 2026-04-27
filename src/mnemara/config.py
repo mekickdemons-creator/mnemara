@@ -45,6 +45,10 @@ class Config:
     rag_embed_model: str = "nomic-embed-text"
     rag_auto_index_memory: bool = True
     rag_auto_index_wiki: bool = True
+    # v0.2.1.1 — panel inbox
+    peer_roles: list[str] = field(default_factory=lambda: ["theseus", "majordomo"])
+    architect_db_path: str = ""  # empty = not configured; set to .../architect/muninn.db for Aethon
+    inbox_auto_surface: bool = True
 
     @classmethod
     def default(cls) -> "Config":
@@ -89,6 +93,9 @@ class Config:
             rag_embed_model=str(d.get("rag_embed_model", "nomic-embed-text")),
             rag_auto_index_memory=bool(d.get("rag_auto_index_memory", True)),
             rag_auto_index_wiki=bool(d.get("rag_auto_index_wiki", True)),
+            peer_roles=list(d.get("peer_roles", ["theseus", "majordomo"])),
+            architect_db_path=str(d.get("architect_db_path", "") or ""),
+            inbox_auto_surface=bool(d.get("inbox_auto_surface", True)),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:

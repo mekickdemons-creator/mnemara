@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from . import config as config_mod
+from . import inbox as inbox_mod
 from . import paths
 from .agent import AgentSession
 from .config import Config
@@ -130,6 +131,7 @@ def _handle_slash(line: str, instance: str, cfg: Config, store: Store) -> bool:
             "  /swap <model>    switch model for this and future sessions\n"
             "  /note <text>     append to today's memory file\n"
             "  /proposals       list pending role-amendment proposals\n"
+            "  /inbox           list pending pings from peer panels\n"
             "  /quit, /exit     exit\n"
         )
         return True
@@ -197,6 +199,16 @@ def _handle_slash(line: str, instance: str, cfg: Config, store: Store) -> bool:
 
     if cmd == "/proposals":
         _cmd_proposals(instance)
+        return True
+
+    if cmd == "/inbox":
+        db = getattr(cfg, "architect_db_path", "") or ""
+        if not db:
+            console.print("[dim]inbox: not configured (set architect_db_path in config)[/dim]")
+            return True
+        peers = getattr(cfg, "peer_roles", ["theseus", "majordomo"])
+        pings = inbox_mod.peek_pending_pings(db, peers, exclude_role=instance)
+        console.print(inbox_mod.format_inbox(pings))
         return True
 
     console.print(f"[red]unknown command:[/red] {cmd}  (try /help)")

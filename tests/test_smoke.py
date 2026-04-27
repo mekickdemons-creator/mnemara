@@ -552,3 +552,182 @@ def test_cli_list_show_clear(home):
     assert "hi" in r.output
     r = runner.invoke(main, ["clear", "--instance", "x1"])
     assert r.exit_code == 0
+
+
+# ------------------------------------------------------------------ inbox tests
+
+
+def test_inbox_peek_pending_pings_with_mocked_db(tmp_path):
+    """peek_pending_pings returns expected rows from a mocked sqlite db."""
+    import json
+    import sqlite3
+    from datetime import datetime, timezone
+    from mnemara.inbox import peek_pending_pings, count_pending
+
+    db_file = tmp_path / "muninn.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute("""
+        CREATE TABLE returns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            agent_role TEXT NOT NULL,
+            task_id TEXT,
+            submitted_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            processed_at TEXT,
+            completed_at TEXT
+        )
+    """)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO returns (session_id, agent_role, task_id, submitted_at, payload_json, status) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("s1", "theseus", "task-abc", now_iso,
+         json.dumps({"type": "directive", "subject": "proto-refresh", "body": "Drain pings on each tick."}),
+         "pending"),
+    )
+    conn.execute(
+        "INSERT INTO returns (session_id, agent_role, task_id, submitted_at, payload_json, status) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("s2", "theseus", "task-xyz", now_iso,
+         json.dumps({"type": "verdict", "body": "All good."}),
+         "processed"),  # not pending — should be excluded
+    )
+    conn.execute(
+        "INSERT INTO returns (session_id, agent_role, task_id, submitted_at, payload_json, status) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("s3", "majordomo", "task-def", now_iso,
+         json.dumps({"type": "ack"}),
+         "pending"),
+    )
+    conn.commit()
+    conn.close()
+
+    pings = peek_pending_pings(str(db_file), ["theseus", "majordomo"])
+    assert len(pings) == 2
+    roles = {p["agent_role"] for p in pings}
+    assert roles == {"theseus", "majordomo"}
+    theseus_ping = next(p for p in pings if p["agent_role"] == "theseus")
+    assert theseus_ping["task_id"] == "task-abc"
+    assert theseus_ping["payload_type"] == "directive"
+    assert theseus_ping["payload_subject"] == "proto-refresh"
+    assert "Drain pings" in theseus_ping["body_preview"]
+
+    # exclude_role removes that sender from results
+    pings_excl = peek_pending_pings(str(db_file), ["theseus", "majordomo"], exclude_role="theseus")
+    assert len(pings_excl) == 1
+    assert pings_excl[0]["agent_role"] == "majordomo"
+
+    # count_pending matches
+    assert count_pending(str(db_file), ["theseus", "majordomo"]) == 2
+    assert count_pending(str(db_file), ["theseus", "majordomo"], exclude_role="theseus") == 1
+
+
+def test_inbox_count_pending_absent_db_returns_zero(tmp_path):
+    """count_pending returns 0 gracefully when DB path doesn't exist."""
+    from mnemara.inbox import count_pending, peek_pending_pings
+
+    missing = str(tmp_path / "nonexistent.db")
+    assert count_pending(missing, ["theseus", "majordomo"]) == 0
+    assert peek_pending_pings(missing, ["theseus", "majordomo"]) == []
+    # Also gracefully handles None/empty path
+    assert count_pending(None, ["theseus", "majordomo"]) == 0
+    assert count_pending("", ["theseus", "majordomo"]) == 0
+
+
+def test_inbox_auto_surface_prepends_when_pings_present(home, monkeypatch):
+    """turn_async prepends inbox notice to user_text when pings are waiting."""
+    import asyncio as _asyncio
+    from mnemara import config, agent as agent_mod
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("inbox_t")
+    cfg = config.load("inbox_t")
+    cfg.inbox_auto_surface = True
+    cfg.architect_db_path = "/fake/muninn.db"
+    cfg.peer_roles = ["theseus"]
+    config.save("inbox_t", cfg)
+
+    store = Store("inbox_t")
+    perms = PermissionStore("inbox_t")
+    runner = ToolRunner("inbox_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    # _run_turn receives prompt as a plain string built by _build_prompt.
+    captured: dict = {}
+
+    async def _fake_run_turn(prompt, options, stream, on_token=None,
+                             on_tool_use=None, on_tool_result=None):
+        captured["prompt"] = prompt
+        return {
+            "assistant_blocks": [{"type": "text", "text": "ok"}],
+            "tokens_in": 3,
+            "tokens_out": 2,
+        }
+
+    monkeypatch.setattr(agent_mod, "_run_turn", _fake_run_turn)
+
+    fake_pings = [{"agent_role": "theseus", "task_id": "t1", "age": "2m ago",
+                   "payload_type": "directive", "payload_subject": "hey",
+                   "body_preview": "hello there", "id": 42, "submitted_at": ""}]
+    monkeypatch.setattr(agent_mod.inbox_mod, "peek_pending_pings", lambda *a, **kw: fake_pings)
+
+    session = agent_mod.AgentSession(cfg, store, runner)
+    _asyncio.run(session.turn_async("my actual message"))
+
+    assert "prompt" in captured
+    payload = captured["prompt"]
+    assert "INBOX:" in payload
+    assert "theseus" in payload
+    assert "next_return" in payload
+    assert "my actual message" in payload
+    store.close()
+
+
+def test_inbox_auto_surface_skipped_when_disabled(home, monkeypatch):
+    """turn_async does NOT prepend inbox notice when inbox_auto_surface=False."""
+    import asyncio as _asyncio
+    from mnemara import config, agent as agent_mod
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("inbox_off_t")
+    cfg = config.load("inbox_off_t")
+    cfg.inbox_auto_surface = False
+    cfg.architect_db_path = "/fake/muninn.db"
+    cfg.peer_roles = ["theseus"]
+    config.save("inbox_off_t", cfg)
+
+    store = Store("inbox_off_t")
+    perms = PermissionStore("inbox_off_t")
+    runner = ToolRunner("inbox_off_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    captured: dict = {}
+
+    async def _fake_run_turn(prompt, options, stream, on_token=None,
+                             on_tool_use=None, on_tool_result=None):
+        captured["prompt"] = prompt
+        return {
+            "assistant_blocks": [{"type": "text", "text": "ok"}],
+            "tokens_in": 3,
+            "tokens_out": 2,
+        }
+
+    monkeypatch.setattr(agent_mod, "_run_turn", _fake_run_turn)
+
+    fake_pings = [{"agent_role": "theseus", "task_id": "t1", "age": "2m ago",
+                   "payload_type": "directive", "payload_subject": "hey",
+                   "body_preview": "hello", "id": 42, "submitted_at": ""}]
+    monkeypatch.setattr(agent_mod.inbox_mod, "peek_pending_pings", lambda *a, **kw: fake_pings)
+
+    session = agent_mod.AgentSession(cfg, store, runner)
+    _asyncio.run(session.turn_async("my message"))
+
+    assert "prompt" in captured
+    payload = captured["prompt"]
+    assert "INBOX:" not in payload
+    assert "my message" in payload
+    store.close()
