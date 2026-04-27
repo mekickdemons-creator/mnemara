@@ -60,8 +60,11 @@ class Store:
         """Evict oldest turns until both caps are satisfied. Returns number deleted.
 
         max_turns: hard cap on row count.
-        max_tokens: optional cap on total token cost (sum of tokens_in + tokens_out
-            across all rows). If set, evict additional oldest rows until under cap.
+        max_tokens: optional cap on estimated stored context size in tokens.
+            Estimated as sum(LENGTH(content)) // 4 across all rows — the API's
+            tokens_in column compounds the entire prior window per call so
+            summing it would N-count the same content. The content-length /4
+            heuristic is rough but bounded and additive.
         """
         deleted = 0
         # First pass: enforce turn-count cap.
@@ -75,11 +78,11 @@ class Store:
             )
             self.conn.commit()
             deleted += to_delete
-        # Second pass: enforce token cap if configured.
+        # Second pass: enforce token cap (content-size estimate, not API counts).
         if max_tokens is not None and max_tokens > 0:
             while True:
                 cur = self.conn.execute(
-                    "SELECT COALESCE(SUM(COALESCE(tokens_in,0) + COALESCE(tokens_out,0)),0) FROM turns"
+                    "SELECT COALESCE(SUM(LENGTH(content)) / 4, 0) FROM turns"
                 )
                 total = int(cur.fetchone()[0])
                 if total <= max_tokens:
@@ -128,8 +131,15 @@ class Store:
         self.conn.commit()
 
     def total_tokens(self) -> tuple[int, int]:
+        """Return (estimated_stored_tokens, sum_output_tokens).
+
+        First value is the content-length-based estimate used for eviction —
+        roughly bytes/4 across all rows. This is what consumes context budget.
+        Second value is the cumulative API output_tokens (kept for stats; do
+        NOT use for eviction since it doesn't include input).
+        """
         cur = self.conn.execute(
-            "SELECT COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0) FROM turns"
+            "SELECT COALESCE(SUM(LENGTH(content)) / 4, 0), COALESCE(SUM(tokens_out),0) FROM turns"
         )
         a, b = cur.fetchone()
         return int(a), int(b)
