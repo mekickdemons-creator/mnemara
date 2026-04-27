@@ -10,7 +10,7 @@ from . import paths
 
 DEFAULT_MODEL = "claude-opus-4-7"
 DEFAULT_MAX_TURNS = 100
-DEFAULT_MAX_TOKENS = 500_000  # conservative until usage tier increases; raise to ~800K when budget allows
+DEFAULT_MAX_TOKENS = 500_000  # matches observed productive ceiling — natural compaction sets in around 600K, 500K leaves 100K safety buffer
 
 
 @dataclass
