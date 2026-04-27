@@ -49,6 +49,9 @@ class Config:
                 ToolPolicy(tool="Write", mode="ask"),
                 ToolPolicy(tool="Edit", mode="ask"),
                 ToolPolicy(tool="WriteMemory", mode="allow"),
+                ToolPolicy(tool="InspectContext", mode="allow"),
+                ToolPolicy(tool="ProposeRoleAmendment", mode="allow"),
+                ToolPolicy(tool="LogChoice", mode="allow"),
             ]
         )
 

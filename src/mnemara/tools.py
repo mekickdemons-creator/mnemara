@@ -1,11 +1,12 @@
 """Native tool implementations: Bash, Read, Edit, Write, WriteMemory."""
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from . import paths
 from .config import Config
@@ -218,13 +219,86 @@ class ToolRunner:
         return ("Memory note appended.", False)
 
 
-def write_memory(instance: str, text: str, category: str = "note") -> Path:
+def write_memory(
+    instance: str,
+    text: str,
+    category: str = "note",
+    payload: Optional[dict] = None,
+) -> Path:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     d = paths.memory_dir(instance)
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{today}.md"
     ts = datetime.now(timezone.utc).isoformat()
-    block = f"\n## [{ts}] {category}\n\n{text}\n"
+    if payload is not None:
+        obs = payload.get("observation", "")
+        ev = payload.get("evidence", "")
+        pred = payload.get("prediction", "")
+        applies = payload.get("applies_to", "")
+        conf = payload.get("confidence", "")
+        block = (
+            f"\n## [{ts}] observation\n\n{obs}\n\n"
+            f"**evidence:** {ev}\n\n"
+            f"**prediction:** {pred}\n\n"
+            f"**applies_to:** {applies}\n\n"
+            f"**confidence:** {conf}\n"
+        )
+    else:
+        block = f"\n## [{ts}] {category}\n\n{text}\n"
     with f.open("a") as fh:
         fh.write(block)
+    return f
+
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify(text: str, max_words: int = 8) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", text.lower())[:max_words]
+    slug = "-".join(words)
+    return slug or "proposal"
+
+
+def propose_role_amendment(
+    instance: str, text: str, rationale: str, severity: str
+) -> Path:
+    d = paths.role_proposals_dir(instance)
+    d.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    slug = _slugify(text)
+    f = d / f"{ts}_{slug}.md"
+    body = (
+        f"---\n"
+        f"date: {datetime.now(timezone.utc).isoformat()}\n"
+        f"severity: {severity}\n"
+        f"rationale: {json.dumps(rationale)}\n"
+        f"---\n\n"
+        f"{text}\n"
+    )
+    f.write_text(body)
+    return f
+
+
+def log_choice(
+    instance: str,
+    decision_type: str,
+    decision: str,
+    rationale: str,
+    context_summary: str = "",
+    turn_id: Optional[int] = None,
+    tokens_at_choice: Optional[int] = None,
+) -> Path:
+    f = paths.choices_path(instance)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "decision_type": decision_type,
+        "decision": decision,
+        "rationale": rationale,
+        "context_summary": context_summary,
+        "turn_id": turn_id,
+        "tokens_at_choice": tokens_at_choice,
+    }
+    with f.open("a") as fh:
+        fh.write(json.dumps(rec) + "\n")
     return f

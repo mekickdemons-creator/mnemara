@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from rich.console import Console
@@ -35,6 +37,7 @@ OnToken = Callable[[str], Optional[Awaitable[None]]]
 OnToolUse = Callable[[str, dict], Optional[Awaitable[None]]]
 OnToolResult = Callable[[str, Any, bool], Optional[Awaitable[None]]]
 
+from . import paths as paths_mod
 from . import role as role_mod
 from . import tools as tools_mod
 from .config import Config
@@ -67,8 +70,11 @@ console = Console()
 
 # Built-in Claude Code tool names we expose by default.
 _BUILTIN_TOOLS = ("Bash", "Read", "Write", "Edit")
-# MCP-prefixed name the SDK assigns to our in-process WriteMemory tool.
+# MCP-prefixed names the SDK assigns to our in-process tools.
 _WRITE_MEMORY_TOOL = "mcp__mnemara_memory__write_memory"
+_INSPECT_CONTEXT_TOOL = "mcp__mnemara_memory__inspect_context"
+_PROPOSE_ROLE_AMENDMENT_TOOL = "mcp__mnemara_memory__propose_role_amendment"
+_LOG_CHOICE_TOOL = "mcp__mnemara_memory__log_choice"
 
 
 class AgentSession:
@@ -83,6 +89,18 @@ class AgentSession:
         # `client` retained in the signature for backward compatibility with
         # repl.py callers; the SDK manages its own transport, so we ignore it.
         self.client = client
+        # Session-scoped counters (self-instrumentation, v0.2.0).
+        self.session_started_at = datetime.now(timezone.utc).isoformat()
+        self.session_ended_at: Optional[str] = None
+        self.evicted_this_session = 0
+        self.tools_called: dict[str, int] = {}
+        self.memory_writes = 0
+        self.role_proposals = 0
+        self.choices_logged = 0
+        self.session_turns = 0
+        self.session_tokens_in = 0
+        self.session_tokens_out = 0
+        self._stats_written = False
 
     # ------------------------------------------------------------------ public
 
@@ -153,28 +171,227 @@ class AgentSession:
         evicted = self.store.evict(self.cfg.max_window_turns, self.cfg.max_window_tokens)
         if evicted:
             log("eviction", deleted=evicted)
+
+        # Update session-scoped counters.
+        self.evicted_this_session += int(evicted or 0)
+        self.session_turns += 1
+        self.session_tokens_in += int(total_in or 0)
+        self.session_tokens_out += int(total_out or 0)
+        for blk in assistant_blocks or []:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                name = blk.get("name") or "?"
+                self.tools_called[name] = self.tools_called.get(name, 0) + 1
+
         return {"input_tokens": total_in, "output_tokens": total_out, "evicted": evicted}
+
+    def write_session_stats(self) -> Optional[Path]:
+        """Dump session counters to ~/.mnemara/<instance>/stats/YYYY-MM-DD.json.
+
+        Idempotent within a process — only writes once per AgentSession.
+        On error, logs and returns None; never raises (caller may invoke from
+        shutdown paths).
+        """
+        if self._stats_written:
+            return None
+        try:
+            instance = self.runner.instance
+            d = paths_mod.stats_dir(instance)
+            d.mkdir(parents=True, exist_ok=True)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            f = d / f"{today}.json"
+            ended_at = datetime.now(timezone.utc).isoformat()
+            self.session_ended_at = ended_at
+            session_summary = {
+                "started_at": self.session_started_at,
+                "ended_at": ended_at,
+                "turns": self.session_turns,
+                "evicted": self.evicted_this_session,
+                "tokens_in": self.session_tokens_in,
+                "tokens_out": self.session_tokens_out,
+                "tools_called": dict(self.tools_called),
+                "memory_writes": self.memory_writes,
+                "role_proposals": self.role_proposals,
+                "choices_logged": self.choices_logged,
+            }
+            existing: dict[str, Any] = {}
+            if f.exists():
+                try:
+                    existing = json.loads(f.read_text())
+                except (ValueError, OSError):
+                    existing = {}
+            sessions = list(existing.get("sessions", []))
+            sessions.append(session_summary)
+            cum = existing.get("cumulative", {}) or {}
+            cum_tools = dict(cum.get("tools_called", {}) or {})
+            for k, v in self.tools_called.items():
+                cum_tools[k] = cum_tools.get(k, 0) + int(v)
+            cumulative = {
+                "turns": int(cum.get("turns", 0) or 0) + self.session_turns,
+                "tokens_in": int(cum.get("tokens_in", 0) or 0) + self.session_tokens_in,
+                "tokens_out": int(cum.get("tokens_out", 0) or 0) + self.session_tokens_out,
+                "evicted": int(cum.get("evicted", 0) or 0) + self.evicted_this_session,
+                "memory_writes": int(cum.get("memory_writes", 0) or 0) + self.memory_writes,
+                "role_proposals": int(cum.get("role_proposals", 0) or 0) + self.role_proposals,
+                "choices_logged": int(cum.get("choices_logged", 0) or 0) + self.choices_logged,
+                "tools_called": cum_tools,
+            }
+            doc = {
+                "date": today,
+                "instance": instance,
+                "sessions": sessions,
+                "cumulative": cumulative,
+            }
+            f.write_text(json.dumps(doc, indent=2) + "\n")
+            self._stats_written = True
+            return f
+        except Exception as e:  # pragma: no cover
+            log("session_stats_error", error=str(e))
+            return None
 
     # ------------------------------------------------------------------ internal
 
     def _build_options(self, system_prompt: str) -> "ClaudeAgentOptions":
-        # In-process WriteMemory tool, exposed as an SDK MCP server.
+        session = self
+
+        # In-process WriteMemory tool — supports legacy text+category and
+        # structured payload mode (JSON-encoded `payload` field).
         @tool(
             "write_memory",
             "Append a timestamped note to the instance's memory file. "
-            "Use to record insights that should survive rolling-window eviction.",
-            {"text": str, "category": str},
+            "Pass either text+category, OR a JSON-encoded `payload` with "
+            "{observation, evidence, prediction, applies_to, confidence} "
+            "for a structured stanza.",
+            {"text": str, "category": str, "payload": str},
         )
         async def _write_memory_tool(args: dict[str, Any]) -> dict[str, Any]:
+            payload_raw = args.get("payload")
+            payload_dict: Optional[dict[str, Any]] = None
+            if payload_raw:
+                try:
+                    parsed = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
+                    if isinstance(parsed, dict):
+                        payload_dict = parsed
+                except (ValueError, TypeError):
+                    payload_dict = None
             tools_mod.write_memory(
-                self.runner.instance,
-                args["text"],
+                session.runner.instance,
+                args.get("text", "") or "",
                 args.get("category", "note") or "note",
+                payload=payload_dict,
             )
+            session.memory_writes += 1
             return {"content": [{"type": "text", "text": "Memory note appended."}]}
 
+        @tool(
+            "inspect_context",
+            "Report Mnemara's view of the current session: turn count, token "
+            "totals, eviction count, role doc info, configured MCP servers, "
+            "and tool permission summary. Returns a JSON dict.",
+            {},
+        )
+        async def _inspect_context_tool(_args: dict[str, Any]) -> dict[str, Any]:
+            cfg = session.cfg
+            tin, tout = session.store.total_tokens()
+            n_turns = len(session.store.window())
+            total = tin + tout
+            role_size = 0
+            try:
+                if cfg.role_doc_path:
+                    p = Path(cfg.role_doc_path).expanduser()
+                    if p.exists():
+                        role_size = p.stat().st_size
+            except Exception:
+                role_size = 0
+            info = {
+                "instance": session.runner.instance,
+                "model": cfg.model,
+                "role_doc_path": cfg.role_doc_path,
+                "max_window_turns": cfg.max_window_turns,
+                "max_window_tokens": cfg.max_window_tokens,
+                "current_turn_count": n_turns,
+                "total_input_tokens": tin,
+                "total_output_tokens": tout,
+                "total_tokens": total,
+                "tokens_remaining": max(0, cfg.max_window_tokens - total),
+                "evicted_this_session": session.evicted_this_session,
+                "role_doc_size_bytes": role_size,
+                "mcp_servers": ["mnemara_memory"] + [s.name for s in cfg.mcp_servers],
+                "allowed_tools_summary": [
+                    {"tool": t.tool, "mode": t.mode} for t in cfg.allowed_tools
+                ],
+            }
+            return {
+                "content": [
+                    {"type": "text", "text": json.dumps(info, indent=2)}
+                ]
+            }
+
+        @tool(
+            "propose_role_amendment",
+            "Append a role-amendment proposal as a markdown file under the "
+            "instance's role_proposals/ directory. severity is one of "
+            "minor|moderate|major.",
+            {"text": str, "rationale": str, "severity": str},
+        )
+        async def _propose_role_amendment_tool(args: dict[str, Any]) -> dict[str, Any]:
+            severity = args.get("severity", "minor") or "minor"
+            if severity not in ("minor", "moderate", "major"):
+                severity = "minor"
+            p = tools_mod.propose_role_amendment(
+                session.runner.instance,
+                args.get("text", "") or "",
+                args.get("rationale", "") or "",
+                severity,
+            )
+            session.role_proposals += 1
+            return {
+                "content": [
+                    {"type": "text", "text": f"Role amendment proposal written to {p}"}
+                ]
+            }
+
+        @tool(
+            "log_choice",
+            "Append a JSONL line to choices.jsonl recording a decision the "
+            "agent made — decision_type, decision, rationale, and an optional "
+            "context_summary. Used for self-observation.",
+            {
+                "decision_type": str,
+                "decision": str,
+                "rationale": str,
+                "context_summary": str,
+            },
+        )
+        async def _log_choice_tool(args: dict[str, Any]) -> dict[str, Any]:
+            rows = session.store.window()
+            turn_id = rows[-1]["id"] if rows else None
+            tin, tout = session.store.total_tokens()
+            tools_mod.log_choice(
+                session.runner.instance,
+                args.get("decision_type", "") or "",
+                args.get("decision", "") or "",
+                args.get("rationale", "") or "",
+                args.get("context_summary", "") or "",
+                turn_id=turn_id,
+                tokens_at_choice=tin + tout,
+            )
+            session.choices_logged += 1
+            return {"content": [{"type": "text", "text": "Choice logged."}]}
+
+        registered = [
+            _write_memory_tool,
+            _inspect_context_tool,
+            _propose_role_amendment_tool,
+            _log_choice_tool,
+        ]
+        # Expose handlers by name for in-process testing / introspection.
+        self._registered_tools = {
+            getattr(t, "name", None) or "?": getattr(t, "handler", None)
+            for t in registered
+        }
         memory_server = create_sdk_mcp_server(
-            name="mnemara_memory", tools=[_write_memory_tool]
+            name="mnemara_memory",
+            tools=registered,
         )
 
         mcp_servers: dict[str, Any] = {"mnemara_memory": memory_server}
@@ -186,7 +403,12 @@ class AgentSession:
                 "env": dict(s.env),
             }
 
-        allowed_tools = list(_BUILTIN_TOOLS) + [_WRITE_MEMORY_TOOL]
+        allowed_tools = list(_BUILTIN_TOOLS) + [
+            _WRITE_MEMORY_TOOL,
+            _INSPECT_CONTEXT_TOOL,
+            _PROPOSE_ROLE_AMENDMENT_TOOL,
+            _LOG_CHOICE_TOOL,
+        ]
         for s in self.cfg.mcp_servers:
             # Permit any tool exposed by configured MCP servers.
             allowed_tools.append(f"mcp__{s.name}__*")
@@ -420,6 +642,12 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "Edit", str(tool_input.get("file_path") or tool_input.get("path") or "")
     if tool_name == _WRITE_MEMORY_TOOL or tool_name.endswith("__write_memory"):
         return "WriteMemory", ""
+    if tool_name == _INSPECT_CONTEXT_TOOL or tool_name.endswith("__inspect_context"):
+        return "InspectContext", ""
+    if tool_name == _PROPOSE_ROLE_AMENDMENT_TOOL or tool_name.endswith("__propose_role_amendment"):
+        return "ProposeRoleAmendment", ""
+    if tool_name == _LOG_CHOICE_TOOL or tool_name.endswith("__log_choice"):
+        return "LogChoice", ""
     return None, ""
 
 

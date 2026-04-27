@@ -28,6 +28,18 @@ def memory_dir(name: str) -> Path:
     return instance_dir(name) / "memory"
 
 
+def role_proposals_dir(name: str) -> Path:
+    return instance_dir(name) / "role_proposals"
+
+
+def choices_path(name: str) -> Path:
+    return instance_dir(name) / "choices.jsonl"
+
+
+def stats_dir(name: str) -> Path:
+    return instance_dir(name) / "stats"
+
+
 def debug_log(name: str) -> Path:
     return instance_dir(name) / "debug.log"
 
