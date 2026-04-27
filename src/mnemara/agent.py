@@ -81,6 +81,12 @@ _WIKI_WRITE_TOOL = "mcp__mnemara_memory__wiki_write"
 _WIKI_LIST_TOOL = "mcp__mnemara_memory__wiki_list"
 _RAG_INDEX_TOOL = "mcp__mnemara_memory__rag_index"
 _RAG_QUERY_TOOL = "mcp__mnemara_memory__rag_query"
+_GRAPH_ADD_NODE_TOOL = "mcp__mnemara_memory__graph_add_node"
+_GRAPH_ADD_EDGE_TOOL = "mcp__mnemara_memory__graph_add_edge"
+_GRAPH_QUERY_TOOL = "mcp__mnemara_memory__graph_query"
+_GRAPH_NEIGHBORS_TOOL = "mcp__mnemara_memory__graph_neighbors"
+_GRAPH_MATCH_TOOL = "mcp__mnemara_memory__graph_match"
+_GRAPH_SHORTEST_PATH_TOOL = "mcp__mnemara_memory__graph_shortest_path"
 
 
 class AgentSession:
@@ -106,6 +112,10 @@ class AgentSession:
         self.wiki_writes = 0
         self.rag_indexes = 0
         self.rag_queries = 0
+        self.graph_nodes_added = 0
+        self.graph_edges_added = 0
+        self.graph_queries = 0
+        self.replay_runs = 0
         self.session_turns = 0
         self.session_tokens_in = 0
         self.session_tokens_out = 0
@@ -468,6 +478,14 @@ class AgentSession:
                     session.rag_indexes += 1
                 except Exception as e:
                     log("wiki_rag_index_error", error=str(e))
+            if getattr(session.cfg, "graph_enabled", True):
+                try:
+                    from . import graph as graph_mod
+                    graph_mod.auto_edges_from_wiki(
+                        session.runner.instance, session.cfg, path, content
+                    )
+                except Exception as e:
+                    log("wiki_graph_edge_error", error=str(e))
             return {"content": [{"type": "text", "text": f"Wrote wiki page: {f}"}]}
 
         @tool(
@@ -536,6 +554,163 @@ class AgentSession:
                 "is_error": True,
             }
 
+        @tool(
+            "graph_add_node",
+            "Add a node to the property graph. label is a free string "
+            "('entity', 'wiki_page', etc.). properties_json is a JSON-encoded "
+            "object of arbitrary attributes. Returns the new node id, or an "
+            "error if the graph backend is unavailable.",
+            {"label": str, "properties_json": str},
+        )
+        async def _graph_add_node_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import graph as graph_mod
+            label = args.get("label", "") or ""
+            raw = args.get("properties_json", "") or ""
+            try:
+                props = json.loads(raw) if raw else {}
+                if not isinstance(props, dict):
+                    props = {}
+            except (ValueError, TypeError):
+                props = {}
+            res = graph_mod.store_for(session.runner.instance, session.cfg).add_node(
+                label, props
+            )
+            if res.get("ok"):
+                session.graph_nodes_added += 1
+                return {"content": [{"type": "text", "text": f"Added node: {res['id']}"}]}
+            return {
+                "content": [{"type": "text", "text": res.get("error", "graph unavailable")}],
+                "is_error": True,
+            }
+
+        @tool(
+            "graph_add_edge",
+            "Add a directed edge between two existing nodes. relationship is a "
+            "free string. properties_json is a JSON-encoded object. Returns "
+            "the new edge id, or an error.",
+            {"from_id": str, "to_id": str, "relationship": str, "properties_json": str},
+        )
+        async def _graph_add_edge_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import graph as graph_mod
+            raw = args.get("properties_json", "") or ""
+            try:
+                props = json.loads(raw) if raw else {}
+                if not isinstance(props, dict):
+                    props = {}
+            except (ValueError, TypeError):
+                props = {}
+            res = graph_mod.store_for(session.runner.instance, session.cfg).add_edge(
+                args.get("from_id", "") or "",
+                args.get("to_id", "") or "",
+                args.get("relationship", "") or "",
+                props,
+            )
+            if res.get("ok"):
+                session.graph_edges_added += 1
+                return {"content": [{"type": "text", "text": f"Added edge: {res['id']}"}]}
+            return {
+                "content": [{"type": "text", "text": res.get("error", "graph unavailable")}],
+                "is_error": True,
+            }
+
+        @tool(
+            "graph_query",
+            "Run an arbitrary Cypher query against the graph. Returns rows as "
+            "a JSON list of dicts. Errors return an unavailable message.",
+            {"cypher": str},
+        )
+        async def _graph_query_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import graph as graph_mod
+            res = graph_mod.store_for(session.runner.instance, session.cfg).query(
+                args.get("cypher", "") or ""
+            )
+            if res.get("ok"):
+                session.graph_queries += 1
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(res.get("rows", []), indent=2, default=str)}
+                    ]
+                }
+            return {
+                "content": [{"type": "text", "text": res.get("error", "graph unavailable")}],
+                "is_error": True,
+            }
+
+        @tool(
+            "graph_neighbors",
+            "Return adjacent nodes within a given depth (1..5). Returns a JSON "
+            "list of {id, label, properties}.",
+            {"node_id": str, "depth": int},
+        )
+        async def _graph_neighbors_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import graph as graph_mod
+            res = graph_mod.store_for(session.runner.instance, session.cfg).neighbors(
+                args.get("node_id", "") or "", int(args.get("depth") or 1)
+            )
+            if res.get("ok"):
+                session.graph_queries += 1
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(res.get("neighbors", []), indent=2, default=str)}
+                    ]
+                }
+            return {
+                "content": [{"type": "text", "text": res.get("error", "graph unavailable")}],
+                "is_error": True,
+            }
+
+        @tool(
+            "graph_match",
+            "Convenience match: pattern_json is {label, properties_subset} where "
+            "properties_subset is a dict of key/value substring filters. Returns "
+            "matching nodes.",
+            {"pattern_json": str},
+        )
+        async def _graph_match_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import graph as graph_mod
+            raw = args.get("pattern_json", "") or "{}"
+            try:
+                pattern = json.loads(raw)
+                if not isinstance(pattern, dict):
+                    pattern = {}
+            except (ValueError, TypeError):
+                pattern = {}
+            res = graph_mod.store_for(session.runner.instance, session.cfg).match(pattern)
+            if res.get("ok"):
+                session.graph_queries += 1
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(res.get("matches", []), indent=2, default=str)}
+                    ]
+                }
+            return {
+                "content": [{"type": "text", "text": res.get("error", "graph unavailable")}],
+                "is_error": True,
+            }
+
+        @tool(
+            "graph_shortest_path",
+            "Find shortest path between two nodes (undirected, max depth 6). "
+            "Returns the list of node ids on the path, or an empty list.",
+            {"from_id": str, "to_id": str},
+        )
+        async def _graph_shortest_path_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import graph as graph_mod
+            res = graph_mod.store_for(
+                session.runner.instance, session.cfg
+            ).shortest_path(
+                args.get("from_id", "") or "", args.get("to_id", "") or ""
+            )
+            if res.get("ok"):
+                session.graph_queries += 1
+                return {
+                    "content": [{"type": "text", "text": json.dumps(res.get("path", []))}]
+                }
+            return {
+                "content": [{"type": "text", "text": res.get("error", "graph unavailable")}],
+                "is_error": True,
+            }
+
         registered = [
             _write_memory_tool,
             _inspect_context_tool,
@@ -546,6 +721,12 @@ class AgentSession:
             _wiki_list_tool,
             _rag_index_tool,
             _rag_query_tool,
+            _graph_add_node_tool,
+            _graph_add_edge_tool,
+            _graph_query_tool,
+            _graph_neighbors_tool,
+            _graph_match_tool,
+            _graph_shortest_path_tool,
         ]
         # Expose handlers by name for in-process testing / introspection.
         self._registered_tools = {
@@ -576,6 +757,12 @@ class AgentSession:
             _WIKI_LIST_TOOL,
             _RAG_INDEX_TOOL,
             _RAG_QUERY_TOOL,
+            _GRAPH_ADD_NODE_TOOL,
+            _GRAPH_ADD_EDGE_TOOL,
+            _GRAPH_QUERY_TOOL,
+            _GRAPH_NEIGHBORS_TOOL,
+            _GRAPH_MATCH_TOOL,
+            _GRAPH_SHORTEST_PATH_TOOL,
         ]
         for s in self.cfg.mcp_servers:
             # Permit any tool exposed by configured MCP servers.
@@ -826,6 +1013,18 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "RagIndex", ""
     if tool_name == _RAG_QUERY_TOOL or tool_name.endswith("__rag_query"):
         return "RagQuery", ""
+    if tool_name == _GRAPH_ADD_NODE_TOOL or tool_name.endswith("__graph_add_node"):
+        return "GraphAddNode", ""
+    if tool_name == _GRAPH_ADD_EDGE_TOOL or tool_name.endswith("__graph_add_edge"):
+        return "GraphAddEdge", ""
+    if tool_name == _GRAPH_QUERY_TOOL or tool_name.endswith("__graph_query"):
+        return "GraphQuery", ""
+    if tool_name == _GRAPH_NEIGHBORS_TOOL or tool_name.endswith("__graph_neighbors"):
+        return "GraphNeighbors", ""
+    if tool_name == _GRAPH_MATCH_TOOL or tool_name.endswith("__graph_match"):
+        return "GraphMatch", ""
+    if tool_name == _GRAPH_SHORTEST_PATH_TOOL or tool_name.endswith("__graph_shortest_path"):
+        return "GraphShortestPath", ""
     return None, ""
 
 

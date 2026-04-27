@@ -49,6 +49,11 @@ class Config:
     peer_roles: list[str] = field(default_factory=lambda: ["theseus", "majordomo"])
     architect_db_path: str = ""  # empty = not configured; set to .../architect/muninn.db for Aethon
     inbox_auto_surface: bool = True
+    # v0.3 — graph backend + sleep/replay
+    graph_enabled: bool = True
+    replay_default_days: int = 7
+    replay_default_threshold: int = 3
+    replay_policy_path: str = ""  # empty = use default at <instance>/wiki/replay_policy.md
 
     @classmethod
     def default(cls) -> "Config":
@@ -67,6 +72,12 @@ class Config:
                 ToolPolicy(tool="WikiList", mode="allow"),
                 ToolPolicy(tool="RagIndex", mode="allow"),
                 ToolPolicy(tool="RagQuery", mode="allow"),
+                ToolPolicy(tool="GraphAddNode", mode="allow"),
+                ToolPolicy(tool="GraphAddEdge", mode="allow"),
+                ToolPolicy(tool="GraphQuery", mode="allow"),
+                ToolPolicy(tool="GraphNeighbors", mode="allow"),
+                ToolPolicy(tool="GraphMatch", mode="allow"),
+                ToolPolicy(tool="GraphShortestPath", mode="allow"),
             ]
         )
 
@@ -96,6 +107,10 @@ class Config:
             peer_roles=list(d.get("peer_roles", ["theseus", "majordomo"])),
             architect_db_path=str(d.get("architect_db_path", "") or ""),
             inbox_auto_surface=bool(d.get("inbox_auto_surface", True)),
+            graph_enabled=bool(d.get("graph_enabled", True)),
+            replay_default_days=int(d.get("replay_default_days", 7)),
+            replay_default_threshold=int(d.get("replay_default_threshold", 3)),
+            replay_policy_path=str(d.get("replay_policy_path", "") or ""),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:

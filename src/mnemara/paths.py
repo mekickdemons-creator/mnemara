@@ -52,6 +52,22 @@ def rag_index_dir(name: str) -> Path:
     return instance_dir(name) / "index"
 
 
+def graph_dir(name: str) -> Path:
+    return instance_dir(name) / "graph"
+
+
+def sleep_dir(name: str) -> Path:
+    return instance_dir(name) / "sleep"
+
+
+def wiki_proposals_dir(name: str) -> Path:
+    return instance_dir(name) / "wiki_proposals"
+
+
+def memory_archive_dir(name: str) -> Path:
+    return instance_dir(name) / "memory" / "archive"
+
+
 def role_proposals_count(name: str) -> int:
     d = role_proposals_dir(name)
     if not d.exists():

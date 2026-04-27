@@ -90,6 +90,11 @@ Everything for an instance lives under `~/.mnemara/<instance>/`:
 | `memory/YYYY-MM-DD.md` | Notes the agent or user have written via `WriteMemory` / `/note`. |
 | `wiki/<slug>.md` | Topic-keyed wiki pages (slash-allowed slugs). |
 | `index/` | LanceDB RAG index (embeddings of memory + wiki + manual entries). |
+| `graph/` | Kuzu property graph (entities, wiki pages, topic tags, edges). |
+| `wiki_proposals/<slug>.md` | Replay-drafted wiki promotions awaiting agent review. |
+| `sleep/YYYY-MM-DD.md` | Sleep digests written by the replay primitive. |
+| `memory/archive/` | Near-duplicate memory atoms archived (never deleted) by replay. |
+| `role_proposals/` | Role-amendment proposals — written by `propose_role_amendment` or replay. |
 | `debug.log` | Append-only JSONL log: errors, tool calls, eviction events. |
 | `.prompt_history` | REPL input history. |
 
@@ -119,6 +124,7 @@ mnemara clear --instance <name>           # wipe the rolling window
 mnemara delete --instance <name> --force  # nuke ~/.mnemara/<name>/
 mnemara role --instance <name> --set PATH # set role_doc_path
 mnemara note --instance <name> TEXT...    # append a memory note from the shell
+mnemara replay --instance <name> [--days N] [--threshold N] [--apply]  # consolidation pass
 ```
 
 ## Slash commands (in REPL)
@@ -188,6 +194,64 @@ Add an entry to `mcp_servers` in `config.json`:
 Mnemara passes this to the Claude Agent SDK's `mcp_servers` option. The SDK
 launches the stdio process and exposes its tools to the model under the
 `mcp__<name>__*` namespace; Mnemara automatically allow-lists those.
+
+### v0.3 — Graph backend (kuzu) + sleep/replay primitive
+
+Two co-evolving features land together. The graph captures relational
+structure between memories and entities; replay exploits that structure on
+each consolidation pass.
+
+**Graph backend** — `graph/` directory holding a [Kuzu](https://kuzudb.com/)
+property graph. Two tables: `Node(id, label, properties JSON, created_at)`
+and `Edge(FROM Node TO Node, id, relationship, properties JSON, created_at)`.
+Six tools registered:
+
+```
+graph_add_node(label, properties_json) -> id
+graph_add_edge(from_id, to_id, relationship, properties_json) -> id
+graph_query(cypher) -> rows
+graph_neighbors(node_id, depth=1) -> adjacent nodes
+graph_match(pattern_json) -> nodes matching {label, properties_subset}
+graph_shortest_path(from_id, to_id) -> list of node ids
+```
+
+Auto-edge hooks fire on every `write_memory` (with structured
+`applies_to`) and `wiki_write` (frontmatter `tags:`). All wrapped in
+try/except — graph failure never fails the primary write.
+
+Lazy: kuzu is not opened until the first graph tool call. If kuzu is
+absent or the DB is corrupt, every tool returns
+`{"ok": false, "error": "Graph backend unavailable: …"}` and the rest of
+the system keeps working. Off-switch: `graph_enabled: false` in config.
+
+**Sleep / replay primitive** — `mnemara replay --instance <name>`. Seven
+phases:
+
+1. Load atoms from `memory/*.md` over the last `--days` (default 7).
+2. Cluster atoms via RAG similarity. Atoms within distance 0.35 cluster;
+   `--threshold` (default 3) sets the minimum count to count as a pattern.
+3. Augment patterns with graph structure — frequently-co-occurring entities
+   from `applies_to` edges; causal phrasing in member text.
+4. For patterns not already covered by an existing wiki page, draft a
+   proposal at `wiki_proposals/<slug>.md` (frontmatter: `source_count`,
+   `member_atom_ids`, `drafted_at`, `status: proposed`).
+5. Archive near-duplicate atoms (distance < 0.10) into `memory/archive/`
+   — preserved verbatim with a header pointing at the canonical atom.
+   **Never deletes.**
+6. When `self_observation` atoms cluster, draft a role-amendment proposal
+   at `role_proposals/<ts>_replay-<slug>.md`.
+7. Write a sleep digest at `sleep/YYYY-MM-DD.md` with counts and pointers.
+
+Default behavior is dry-run (prints planned actions but writes nothing).
+Pass `--apply` to actually write proposals, archive duplicates, and emit
+the digest.
+
+**Policy doc** — `wiki/replay_policy.md` (the agent's, written by the
+agent over time) is read for `threshold:` / `days:` overrides. Mnemara
+ships only the primitive; the policy is the agent's.
+
+After a replay completes, the next `mnemara run` prints a one-line summary
+of the most recent digest at session start.
 
 ### v0.2.1 — Multi-backend memory (wiki + RAG)
 

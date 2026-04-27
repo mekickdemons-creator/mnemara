@@ -248,8 +248,13 @@ def write_memory(
             f"**applies_to:** {applies}\n\n"
             f"**confidence:** {conf}\n"
         )
+        applies_str = (
+            ", ".join(str(x) for x in applies)
+            if isinstance(applies, list)
+            else str(applies or "")
+        )
         rag_text = "\n".join(
-            x for x in (obs, ev, pred, applies) if x
+            x for x in (str(obs), str(ev), str(pred), applies_str) if x
         ) or text
     else:
         block = f"\n## [{ts}] {category}\n\n{text}\n"
@@ -278,6 +283,15 @@ def write_memory(
                 )
             except Exception as e:
                 log("memory_rag_index_error", error=str(e))
+        # Auto graph edges from structured payload
+        if getattr(cfg, "graph_enabled", True):
+            try:
+                from . import graph as graph_mod
+                graph_mod.auto_edges_from_memory(
+                    instance, cfg, rag_text, payload, str(f)
+                )
+            except Exception as e:
+                log("memory_graph_edge_error", error=str(e))
     return f
 
 

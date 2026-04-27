@@ -61,6 +61,14 @@ def run_cmd(instance: str, no_tui: bool) -> None:
         console.print(f"[red]No instance:[/red] {instance}")
         sys.exit(1)
 
+    try:
+        from . import replay as replay_mod
+        summary = replay_mod.last_replay_summary(instance)
+        if summary:
+            console.print(f"[dim]{summary}[/dim]")
+    except Exception:
+        pass
+
     force_repl = no_tui or os.environ.get("MNEMARA_NO_TUI") == "1"
     if not force_repl:
         try:
@@ -155,6 +163,45 @@ def role_cmd(instance: str, role_path: str) -> None:
     cfg.role_doc_path = str(Path(role_path).expanduser())
     config_mod.save(instance, cfg)
     console.print(f"[green]role doc set to[/green] {cfg.role_doc_path}")
+
+
+@main.command("replay")
+@click.option("--instance", required=True)
+@click.option("--days", default=None, type=int, help="Days of memory to scan (overrides config/policy).")
+@click.option("--threshold", default=None, type=int, help="Min cluster size to count as a recurring pattern.")
+@click.option("--apply", "apply_mode", is_flag=True, default=False, help="Write proposals/archives. Default is dry-run.")
+@click.option("--dry-run", "dry_run", is_flag=True, default=False, help="Explicit dry-run (default).")
+def replay_cmd(instance: str, days: int | None, threshold: int | None, apply_mode: bool, dry_run: bool) -> None:
+    """Run the consolidation pass over recent memory atoms."""
+    if not paths.config_path(instance).exists():
+        console.print(f"[red]No instance:[/red] {instance}")
+        sys.exit(1)
+    if apply_mode and dry_run:
+        console.print("[red]--apply and --dry-run are mutually exclusive[/red]")
+        sys.exit(1)
+    cfg = config_mod.load(instance)
+    from . import replay as replay_mod
+    out = replay_mod.run_replay(
+        instance, days=days, threshold=threshold, apply=apply_mode, cfg=cfg
+    )
+    console.print(
+        f"[cyan]replay[/cyan] mode={'apply' if apply_mode else 'dry-run'} "
+        f"days={out['days']} threshold={out['threshold']}"
+    )
+    console.print(
+        f"  atoms_loaded:        {out['atoms_loaded']}\n"
+        f"  patterns_identified: {out['patterns']}\n"
+        f"  wiki_proposals:      {len(out['proposals'])}\n"
+        f"  duplicates_archived: {len(out['archived'])}\n"
+        f"  role_amendments:     {len(out['role_amendments'])}\n"
+        f"  digest:              {out['digest_path']}"
+    )
+    if out["proposals"]:
+        console.print("\n[dim]proposals:[/dim]")
+        for p in out["proposals"][:5]:
+            console.print(f"  {p}")
+    if not apply_mode:
+        console.print("\n[yellow]dry-run — pass --apply to write files[/yellow]")
 
 
 @main.command("note")
