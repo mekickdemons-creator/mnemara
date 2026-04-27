@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mnemara"
+version = "0.1.0"
+description = "Controlled rolling-context conversation runtime for Claude orchestrators"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Aethon Poiesis"}]
+dependencies = [
+    "anthropic>=0.39.0",
+    "click>=8.1",
+    "prompt-toolkit>=3.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+mnemara = "mnemara.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--noconftest"
