@@ -363,6 +363,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
         finally:
             self._busy = False
             self._refresh_status()
+            try:
+                self.query_one("#userinput", Input).focus()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------ slash cmds
 
