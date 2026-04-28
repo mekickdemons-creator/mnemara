@@ -797,6 +797,7 @@ class AgentSession:
             permission_mode="bypassPermissions",
             include_partial_messages=cfg.stream,
             setting_sources=[],
+            stderr=lambda line: log("sdk_stderr", line=line),
         )
 
 

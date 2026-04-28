@@ -77,7 +77,6 @@ Screen {
 #userinput {
     height: 3;
     min-height: 3;
-    dock: bottom;
     border: round #4d6fa3;
     background: #11151e;
     color: #ffffff;
@@ -231,44 +230,38 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self.title = f"mnemara: {self.instance}"
         self.sub_title = f"model={self.cfg.model}  role={role}"
         yield Header(show_clock=False)
-        with Vertical():
-            yield RichLog(
-                id="chatlog",
-                wrap=True,
-                markup=True,
-                highlight=False,
-                auto_scroll=True,
-            )
-            yield Static(self._status_text(), id="status")
-            yield Input(
-                placeholder="message  (Enter to send, /help for commands, Ctrl+C to quit)",
-                id="userinput",
-            )
+        yield RichLog(
+            id="chatlog",
+            wrap=True,
+            markup=True,
+            highlight=False,
+            auto_scroll=True,
+        )
+        yield Static(self._status_text(), id="status")
+        yield Input(
+            placeholder="message  (Enter to send, /help for commands, Ctrl+C to quit)",
+            id="userinput",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
         log("tui_start", instance=self.instance, model=self.cfg.model)
-        self._render_history()
-        self._focus_input_after_refresh()
-        self._spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        self._spinner_idx = 0
-        self.set_interval(0.1, self._tick_spinner)
-
-    def _tick_spinner(self) -> None:
-        if not self._busy:
-            return
-        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+        # Disable Textual mouse capture so native terminal text selection works
+        # by default (click-and-drag to select, copy via terminal). Textual's
+        # driver enables mouse tracking on start (and re-enables after SIGCONT
+        # / iTerm workaround), so we both write the disable sequence AND stub
+        # out the driver's _enable_mouse_support to keep it disabled.
         try:
-            ch = self._spinner_frames[self._spinner_idx]
-            tail = (
-                f"  [streaming {self._stream_chars} chars]"
-                if self._stream_chars else "  thinking..."
-            )
-            self.query_one("#status", Static).update(
-                self._status_text() + f"  [yellow]{ch}[/yellow]" + tail
-            )
+            drv = self._driver
+            if drv is not None:
+                drv.write(self._MOUSE_DISABLE)
+                drv.flush()
+                if hasattr(drv, "_enable_mouse_support"):
+                    drv._enable_mouse_support = lambda: None  # type: ignore[method-assign]
         except Exception:
             pass
+        self._render_history()
+        self._focus_input_after_refresh()
 
     def _focus_input_after_refresh(self) -> None:
         """Schedule input focus after the next paint.
@@ -389,17 +382,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._stream_chars = 0
 
         async def on_token(t: str) -> None:
-            # RichLog has no "update last line" affordance, so we buffer the
-            # streamed text and flush the complete assistant message once the
-            # turn finishes. The status bar shows live progress.
+            # Buffer streamed text; flush the complete message once the turn
+            # finishes. Don't call widget.update() per-token — that floods the
+            # Textual render queue and races with resize events, which was the
+            # source of the input-box duplication during streaming + resize.
             self._stream_buffer += t
             self._stream_chars += len(t)
-            try:
-                self.query_one("#status", Static).update(
-                    self._status_text() + f"  [streaming {self._stream_chars} chars]"
-                )
-            except Exception:
-                pass
 
         async def on_tool_use(name: str, inp: dict) -> None:
             chat.write(f"[b magenta]> tool:[/b magenta] [magenta]{name}[/magenta]({_short(inp)})")
@@ -546,6 +534,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._chat().scroll_page_down()
         except Exception:
             pass
+
+    # ANSI sequence to fully disable mouse tracking — sent on mount so native
+    # terminal text selection (click-and-drag to copy) works without a toggle.
+    # Disable ALL mouse modes (1000 basic, 1002 button-event, 1003 any-event,
+    # 1005 UTF-8 ext, 1006 SGR ext, 1015 urxvt ext); leaving any active causes
+    # the terminal to send mouse-report bytes that crash Textual's UTF-8 input
+    # decoder (mode 1000 in particular emits raw high bytes during drag).
+    _MOUSE_DISABLE = (
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
+    )
 
     _paste_unavailable_warned: bool = False
 

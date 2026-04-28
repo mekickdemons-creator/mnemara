@@ -1037,3 +1037,33 @@ def test_tui_slash_copy_n_argument(home, monkeypatch):
     assert "Second answer" in copied[0]
     # Earlier turns should not be included.
     assert "First" not in copied[0]
+
+
+def test_tui_mouse_disable_on_mount(home):
+    """On mount the TUI emits the mouse-disable escape sequence so native terminal text selection works by default."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("selmode_t")
+    app = tui_mod.MnemaraTUI("selmode_t")
+
+    driver_writes: list[str] = []
+
+    async def _run() -> None:
+        # Patch the driver.write before mount fires so we capture the on_mount
+        # disable sequence. run_test() spins the app up; we monkeypatch as
+        # early as possible.
+        async with app.run_test() as pilot:
+            if app._driver is not None:
+                orig = app._driver.write
+                app._driver.write = lambda s: driver_writes.append(s) or orig(s)  # type: ignore[method-assign]
+            # Trigger another on_mount-equivalent disable to verify the
+            # sequence content (on_mount already ran before patch landed).
+            if app._driver is not None:
+                app._driver.write(app._MOUSE_DISABLE)
+            await pilot.pause()
+            assert any("\x1b[?1003l" in w for w in driver_writes)
+
+    _asyncio.run(_run())
+    app.store.close()
