@@ -261,7 +261,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
         return base
 
     def _refresh_status(self) -> None:
-        self.query_one("#status", Static).update(self._status_text())
+        try:
+            self.query_one("#status", Static).update(self._status_text())
+        except Exception:
+            pass
 
     def _render_history(self) -> None:
         log_widget = self._chat()
@@ -302,6 +305,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
     # ----------------------------------------------------------------- events
 
     async def on_input_submitted(self, event: "Input.Submitted") -> None:
+        if event.input.id != "userinput":
+            return
         text = (event.value or "").strip()
         if not text or self._busy:
             return
@@ -328,9 +333,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
             # turn finishes. The status bar shows live progress.
             self._stream_buffer += t
             self._stream_chars += len(t)
-            self.query_one("#status", Static).update(
-                self._status_text() + f"  [streaming {self._stream_chars} chars]"
-            )
+            try:
+                self.query_one("#status", Static).update(
+                    self._status_text() + f"  [streaming {self._stream_chars} chars]"
+                )
+            except Exception:
+                pass
 
         async def on_tool_use(name: str, inp: dict) -> None:
             chat.write(f"[b magenta]> tool:[/b magenta] [magenta]{name}[/magenta]({_short(inp)})")

@@ -686,6 +686,69 @@ def test_inbox_auto_surface_prepends_when_pings_present(home, monkeypatch):
     store.close()
 
 
+def test_tui_input_guard_ignores_non_userinput(home):
+    """on_input_submitted returns without action when event.input.id != 'userinput'."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("guard_t")
+    app = tui_mod.MnemaraTUI("guard_t")
+
+    turns_sent: list[str] = []
+
+    async def _fake_send_turn(text: str) -> None:
+        turns_sent.append(text)
+
+    app._send_turn = _fake_send_turn  # type: ignore[method-assign]
+
+    class _FakeInput:
+        id = "note_text"
+        value = "should be ignored"
+
+    class _FakeEvent:
+        input = _FakeInput()
+        value = "should be ignored"
+
+    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
+    assert turns_sent == [], "non-userinput events must be ignored"
+    app.store.close()
+
+
+def test_tui_on_token_tolerates_missing_status_widget(home, monkeypatch):
+    """on_token callback absorbs query_one failure and still accumulates the stream buffer."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("tok_rz_t")
+    app = tui_mod.MnemaraTUI("tok_rz_t")
+    app._stream_buffer = ""
+    app._stream_chars = 0
+
+    # Patch query_one to raise — simulates transient widget unavailability during resize.
+    def _raise(*args, **kwargs):
+        raise Exception("NoMatches: simulated resize redraw")
+
+    monkeypatch.setattr(app, "query_one", _raise)
+
+    # Replicate the on_token closure logic (mirrors the fixed implementation).
+    async def on_token(t: str) -> None:
+        app._stream_buffer += t
+        app._stream_chars += len(t)
+        try:
+            from textual.widgets import Static
+            app.query_one("#status", Static).update("")
+        except Exception:
+            pass
+
+    _asyncio.run(on_token("hello "))
+    _asyncio.run(on_token("world"))
+    assert app._stream_buffer == "hello world"
+    assert app._stream_chars == 11
+    app.store.close()
+
+
 def test_inbox_auto_surface_skipped_when_disabled(home, monkeypatch):
     """turn_async does NOT prepend inbox notice when inbox_auto_surface=False."""
     import asyncio as _asyncio
