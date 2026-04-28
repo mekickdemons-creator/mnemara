@@ -189,6 +189,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         Binding("ctrl+l", "clear_log", "Clear log"),
         Binding("ctrl+i", "focus_input", "Focus input", priority=True, show=False),
         Binding("escape", "focus_input", "Focus input", show=False),
+        Binding("ctrl+v", "paste", "Paste", priority=True, show=False),
         Binding("pageup", "scroll_log_up", "Scroll up", show=False),
         Binding("pagedown", "scroll_log_down", "Scroll down", show=False),
     ]
@@ -533,6 +534,33 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._chat().scroll_page_down()
         except Exception:
             pass
+
+    _paste_unavailable_warned: bool = False
+
+    def action_paste(self) -> None:
+        """Insert clipboard text at the cursor of the focused Input widget."""
+        try:
+            import pyperclip  # type: ignore[import]
+            paste_text: str = pyperclip.paste()
+        except Exception as exc:
+            log("tui_paste_unavailable", error=str(exc))
+            if not MnemaraTUI._paste_unavailable_warned:
+                MnemaraTUI._paste_unavailable_warned = True
+                self._chat().write(
+                    "[dim][paste unavailable: install pyperclip or set up clipboard backend][/dim]"
+                )
+            return
+
+        if not paste_text:
+            return
+
+        focused = self.focused
+        if not isinstance(focused, Input):
+            return
+
+        cur = focused.cursor_position
+        focused.value = focused.value[:cur] + paste_text + focused.value[cur:]
+        focused.cursor_position = cur + len(paste_text)
 
     async def action_quit(self) -> None:
         self.exit()

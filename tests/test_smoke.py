@@ -923,3 +923,40 @@ def test_tui_pilot_richlog_scroll_actions(home):
 
     _asyncio.run(_run())
     app.store.close()
+
+
+def test_tui_pilot_action_paste(home, monkeypatch):
+    """action_paste inserts clipboard text at the cursor of the focused Input."""
+    import asyncio as _asyncio
+    import sys
+    import types
+    from mnemara import config
+    from mnemara import tui as tui_mod
+    from textual.widgets import Input
+
+    config.init_instance("pilot_paste_t")
+
+    # Provide a fake pyperclip returning a known string.
+    fake_pyperclip = types.ModuleType("pyperclip")
+    fake_pyperclip.paste = lambda: "pasted_text"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pyperclip", fake_pyperclip)
+
+    app = tui_mod.MnemaraTUI("pilot_paste_t")
+    # Reset the one-per-session warning flag between test runs.
+    tui_mod.MnemaraTUI._paste_unavailable_warned = False
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#userinput", Input)
+            inp.focus()
+            inp.value = "before_"
+            inp.cursor_position = len(inp.value)
+            await pilot.pause()
+            app.action_paste()
+            await pilot.pause()
+            assert inp.value == "before_pasted_text"
+            assert inp.cursor_position == len("before_pasted_text")
+
+    _asyncio.run(_run())
+    app.store.close()
