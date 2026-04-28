@@ -960,3 +960,80 @@ def test_tui_pilot_action_paste(home, monkeypatch):
 
     _asyncio.run(_run())
     app.store.close()
+
+
+def test_tui_action_copy_last_writes_to_clipboard(home, monkeypatch):
+    """action_copy_last copies the most recent assistant response via pyperclip."""
+    import asyncio as _asyncio
+    import sys
+    import types
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("copy_last_t")
+
+    copied: list[str] = []
+    fake_pyperclip = types.ModuleType("pyperclip")
+    fake_pyperclip.copy = lambda text: copied.append(text)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pyperclip", fake_pyperclip)
+
+    app = tui_mod.MnemaraTUI("copy_last_t")
+    tui_mod.MnemaraTUI._copy_unavailable_warned = False
+
+    # Seed the store with one user turn and one assistant turn.
+    app.store.append_turn("user", "Hello")
+    app.store.append_turn("assistant", "Hi there, I am the assistant.")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_copy_last()
+            await pilot.pause()
+
+    _asyncio.run(_run())
+    app.store.close()
+
+    assert len(copied) == 1
+    assert copied[0] == "Hi there, I am the assistant."
+
+
+def test_tui_slash_copy_n_argument(home, monkeypatch):
+    """/copy N copies the last N window rows as role-prefixed text."""
+    import asyncio as _asyncio
+    import sys
+    import types
+    from mnemara import config
+    from mnemara import tui as tui_mod
+    from textual.widgets import RichLog
+
+    config.init_instance("copy_n_t")
+
+    copied: list[str] = []
+    fake_pyperclip = types.ModuleType("pyperclip")
+    fake_pyperclip.copy = lambda text: copied.append(text)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pyperclip", fake_pyperclip)
+
+    app = tui_mod.MnemaraTUI("copy_n_t")
+    tui_mod.MnemaraTUI._copy_unavailable_warned = False
+
+    app.store.append_turn("user", "First question")
+    app.store.append_turn("assistant", "First answer")
+    app.store.append_turn("user", "Second question")
+    app.store.append_turn("assistant", "Second answer")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            chat = app.query_one("#chatlog", RichLog)
+            await app._slash_copy("2", chat)
+            await pilot.pause()
+
+    _asyncio.run(_run())
+    app.store.close()
+
+    assert len(copied) == 1
+    # Last 2 rows are the second user turn and second assistant turn.
+    assert "Second question" in copied[0]
+    assert "Second answer" in copied[0]
+    # Earlier turns should not be included.
+    assert "First" not in copied[0]

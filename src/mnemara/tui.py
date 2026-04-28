@@ -190,6 +190,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         Binding("ctrl+i", "focus_input", "Focus input", priority=True, show=False),
         Binding("escape", "focus_input", "Focus input", show=False),
         Binding("ctrl+v", "paste", "Paste", priority=True, show=False),
+        Binding("ctrl+y", "copy_last", "Copy last response", priority=True, show=False),
         Binding("pageup", "scroll_log_up", "Scroll up", show=False),
         Binding("pagedown", "scroll_log_down", "Scroll down", show=False),
     ]
@@ -221,6 +222,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._stream_buffer = ""
         self._stream_chars = 0
         self._evicted_total = 0
+        self._copy_flash: str = ""
 
     # ------------------------------------------------------------- composition
 
@@ -315,6 +317,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                     base += f" | [yellow]I {n_inbox} pending[/yellow]"
         except Exception:
             pass
+        if self._copy_flash:
+            base += f" | [green]{self._copy_flash}[/green]"
         return base
 
     def _refresh_status(self) -> None:
@@ -444,7 +448,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /note [text]     append to today's memory file (modal if no text)\n"
                 "  /proposals       list pending role-amendment proposals\n"
                 "  /inbox           list pending pings from peer panels\n"
-                "  /quit, /exit     exit"
+                "  /copy [all|N]    copy to clipboard: last response (default), all turns, or last N turns\n"
+                "  /quit, /exit     exit\n"
+                "[b]Key bindings:[/b]\n"
+                "  Ctrl+Y           copy last assistant response to clipboard\n"
+                "  Ctrl+V           paste from clipboard into input"
             )
             return
 
@@ -501,6 +509,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             for f in files:
                 severity, preview = parse_proposal_file(f)
                 chat.write(f"  [[yellow]{severity}[/yellow]] {f.name} — {preview}")
+            return
+
+        if cmd == "/copy":
+            await self._slash_copy(arg.strip(), chat)
             return
 
         if cmd == "/inbox":
@@ -562,6 +574,94 @@ class MnemaraTUI(App):  # type: ignore[misc]
         focused.value = focused.value[:cur] + paste_text + focused.value[cur:]
         focused.cursor_position = cur + len(paste_text)
 
+    _copy_unavailable_warned: bool = False
+
+    def _extract_last_assistant(self) -> str:
+        """Return the text of the most recent assistant turn, or ''."""
+        rows = self.store.window()
+        for row in reversed(rows):
+            if row.get("role") == "assistant":
+                return _flatten_assistant_content(row["content"])
+        return ""
+
+    def _extract_window_as_text(self, last_n: int | None = None) -> str:
+        """Return the conversation window (or last N rows) as plain text."""
+        rows = self.store.window()
+        if last_n is not None:
+            rows = rows[-last_n:]
+        lines: list[str] = []
+        for row in rows:
+            role = row.get("role", "?")
+            if role == "user":
+                lines.append(f"you: {_flatten_text_blocks(row['content'])}")
+            elif role == "assistant":
+                lines.append(f"assistant: {_flatten_assistant_content(row['content'])}")
+        return "\n\n".join(lines)
+
+    def _copy_to_clipboard(self, text: str) -> bool:
+        """Copy text to system clipboard via pyperclip. Returns True on success."""
+        try:
+            import pyperclip  # type: ignore[import]
+            pyperclip.copy(text)
+            return True
+        except Exception as exc:
+            log("tui_copy_unavailable", error=str(exc))
+            if not MnemaraTUI._copy_unavailable_warned:
+                MnemaraTUI._copy_unavailable_warned = True
+                self._chat().write(
+                    "[dim][copy unavailable: install pyperclip or set up clipboard backend][/dim]"
+                )
+            return False
+
+    def _flash_copy(self, n_chars: int) -> None:
+        """Show a brief 'copied N chars' indicator in the status bar for 2s."""
+        self._copy_flash = f"copied {n_chars} chars"
+        self._refresh_status()
+        self.set_timer(2.0, self._clear_copy_flash)
+
+    def _clear_copy_flash(self) -> None:
+        self._copy_flash = ""
+        self._refresh_status()
+
+    def action_copy_last(self) -> None:
+        """Ctrl+Y — copy the last assistant response to the system clipboard."""
+        text = self._extract_last_assistant()
+        if not text:
+            self._chat().write("[dim](no assistant response to copy)[/dim]")
+            return
+        if self._copy_to_clipboard(text):
+            self._flash_copy(len(text))
+
+    async def _slash_copy(self, arg: str, chat: "RichLog") -> None:
+        """/copy [all|N] — copy turns to clipboard."""
+        if not arg or arg == "last":
+            text = self._extract_last_assistant()
+            if not text:
+                chat.write("[dim](no assistant response to copy)[/dim]")
+                return
+        elif arg == "all":
+            text = self._extract_window_as_text()
+            if not text:
+                chat.write("[dim](window is empty)[/dim]")
+                return
+        else:
+            try:
+                n = int(arg)
+                if n <= 0:
+                    raise ValueError
+            except ValueError:
+                chat.write(f"[red]usage: /copy [all|N]  (N must be a positive integer)[/red]")
+                return
+            rows = self.store.window()
+            n = min(n, len(rows))
+            text = self._extract_window_as_text(last_n=n)
+            if not text:
+                chat.write("[dim](window is empty)[/dim]")
+                return
+
+        if self._copy_to_clipboard(text):
+            self._flash_copy(len(text))
+
     async def action_quit(self) -> None:
         self.exit()
 
@@ -617,6 +717,21 @@ def _flatten_text_blocks(content: Any) -> str:
         if isinstance(b, dict) and b.get("type") == "text":
             parts.append(b.get("text", ""))
     return "\n".join(p for p in parts if p)
+
+
+def _flatten_assistant_content(content: Any) -> str:
+    """Extract plain text from an assistant content value (str or list-of-blocks)."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts = []
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "text":
+            text = b.get("text", "")
+            if text:
+                parts.append(text)
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------- entry point
