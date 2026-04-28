@@ -405,8 +405,10 @@ class AgentSession:
         @tool(
             "log_choice",
             "Append a JSONL line to choices.jsonl recording a decision the "
-            "agent made — decision_type, decision, rationale, and an optional "
-            "context_summary. Used for self-observation.",
+            "agent made — decision_type, decision, rationale, context_summary "
+            "(pass empty string '' if no situational context to capture). "
+            "Used for self-observation. All four fields are required by the "
+            "tool schema; use empty strings for any you don't have.",
             {
                 "decision_type": str,
                 "decision": str,
