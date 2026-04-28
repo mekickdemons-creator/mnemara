@@ -218,6 +218,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         self._busy = False
         self._stream_buffer = ""
+        self._stream_chars = 0
         self._evicted_total = 0
 
     # ------------------------------------------------------------- composition
@@ -246,6 +247,25 @@ class MnemaraTUI(App):  # type: ignore[misc]
         log("tui_start", instance=self.instance, model=self.cfg.model)
         self._render_history()
         self._focus_input_after_refresh()
+        self._spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._spinner_idx = 0
+        self.set_interval(0.1, self._tick_spinner)
+
+    def _tick_spinner(self) -> None:
+        if not self._busy:
+            return
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+        try:
+            ch = self._spinner_frames[self._spinner_idx]
+            tail = (
+                f"  [streaming {self._stream_chars} chars]"
+                if self._stream_chars else "  thinking..."
+            )
+            self.query_one("#status", Static).update(
+                self._status_text() + f"  [yellow]{ch}[/yellow]" + tail
+            )
+        except Exception:
+            pass
 
     def _focus_input_after_refresh(self) -> None:
         """Schedule input focus after the next paint.
