@@ -794,3 +794,132 @@ def test_inbox_auto_surface_skipped_when_disabled(home, monkeypatch):
     assert "INBOX:" not in payload
     assert "my message" in payload
     store.close()
+
+
+# ---------------------------------------------------------- Pilot-based TUI tests
+
+
+def test_tui_pilot_focus_returns_after_turn(home, monkeypatch):
+    """After a streaming turn completes, focus settles back on #userinput.
+
+    Pilot-based; covers the call_after_refresh focus path.
+    """
+    import asyncio as _asyncio
+    from mnemara import config, agent as agent_mod
+    from mnemara import tui as tui_mod
+    from textual.widgets import Input
+
+    config.init_instance("pilot_focus_t")
+
+    async def _fake_turn_async(self, text, on_token=None, on_tool_use=None,
+                               on_tool_result=None):
+        if on_token:
+            for chunk in ("hel", "lo ", "world"):
+                await on_token(chunk)
+        return {"tokens_in": 1, "tokens_out": 1, "evicted": 0}
+
+    monkeypatch.setattr(agent_mod.AgentSession, "turn_async", _fake_turn_async)
+
+    app = tui_mod.MnemaraTUI("pilot_focus_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#userinput", Input)
+            assert inp.has_focus, "input should have focus on mount"
+            inp.value = "hello"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            inp2 = app.query_one("#userinput", Input)
+            assert inp2.has_focus, "input must regain focus after turn"
+            inp2.value = "second"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.query_one("#userinput", Input).has_focus
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_tui_pilot_input_visible_height(home):
+    """#userinput renders with non-zero height even when chatlog is full."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+    from textual.widgets import Input, RichLog
+
+    config.init_instance("pilot_height_t")
+    app = tui_mod.MnemaraTUI("pilot_height_t")
+
+    async def _run() -> None:
+        async with app.run_test(size=(120, 30)) as pilot:
+            chat = app.query_one("#chatlog", RichLog)
+            for i in range(200):
+                chat.write(f"[b green]assistant:[/b green] line {i}")
+            await pilot.pause()
+            inp = app.query_one("#userinput", Input)
+            # outer_size = border + content + border; widget reserves 3 rows total
+            assert inp.outer_size.height >= 3, f"input collapsed: {inp.outer_size}"
+            assert inp.region.y + inp.region.height <= app.size.height
+            assert inp.size.width > 0
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_tui_pilot_focus_input_action(home):
+    """ctrl+i / escape binding refocuses input as escape hatch."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+    from textual.widgets import Input, RichLog
+
+    config.init_instance("pilot_action_t")
+    app = tui_mod.MnemaraTUI("pilot_action_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            chat = app.query_one("#chatlog", RichLog)
+            chat.focus()
+            await pilot.pause()
+            assert not app.query_one("#userinput", Input).has_focus
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause()
+            assert app.query_one("#userinput", Input).has_focus
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_tui_pilot_richlog_scroll_actions(home):
+    """PageUp/PageDown bindings drive the chatlog scroll position."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+    from textual.widgets import RichLog
+
+    config.init_instance("pilot_scroll_t")
+    app = tui_mod.MnemaraTUI("pilot_scroll_t")
+
+    async def _run() -> None:
+        async with app.run_test(size=(120, 30)) as pilot:
+            chat = app.query_one("#chatlog", RichLog)
+            for i in range(200):
+                chat.write(f"line {i}")
+            await pilot.pause()
+            bottom_y = chat.scroll_y
+            await pilot.press("pageup")
+            await pilot.pause()
+            await pilot.pause()
+            up_y = chat.scroll_y
+            assert up_y < bottom_y, f"pageup did not scroll: {bottom_y} -> {up_y}"
+            await pilot.press("pagedown")
+            await pilot.pause()
+            await pilot.pause()
+            assert chat.scroll_y > up_y
+
+    _asyncio.run(_run())
+    app.store.close()

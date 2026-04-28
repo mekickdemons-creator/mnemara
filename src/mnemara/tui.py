@@ -56,9 +56,15 @@ Screen {
 
 #chatlog {
     height: 1fr;
+    min-height: 5;
     border: round #3a4256;
     background: #1a1f2b;
     padding: 1 2;
+    scrollbar-background: #1a1f2b;
+    scrollbar-color: #4d6fa3;
+    scrollbar-color-hover: #6f9ad9;
+    scrollbar-color-active: #8fb6e6;
+    scrollbar-size-vertical: 1;
 }
 
 #status {
@@ -69,6 +75,9 @@ Screen {
 }
 
 #userinput {
+    height: 3;
+    min-height: 3;
+    dock: bottom;
     border: round #4d6fa3;
     background: #11151e;
     color: #ffffff;
@@ -178,6 +187,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("ctrl+l", "clear_log", "Clear log"),
+        Binding("ctrl+i", "focus_input", "Focus input", priority=True, show=False),
+        Binding("escape", "focus_input", "Focus input", show=False),
+        Binding("pageup", "scroll_log_up", "Scroll up", show=False),
+        Binding("pagedown", "scroll_log_down", "Scroll down", show=False),
     ]
 
     def __init__(self, instance: str) -> None:
@@ -215,7 +228,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self.sub_title = f"model={self.cfg.model}  role={role}"
         yield Header(show_clock=False)
         with Vertical():
-            yield RichLog(id="chatlog", wrap=True, markup=True, highlight=False)
+            yield RichLog(
+                id="chatlog",
+                wrap=True,
+                markup=True,
+                highlight=False,
+                auto_scroll=True,
+            )
             yield Static(self._status_text(), id="status")
             yield Input(
                 placeholder="message  (Enter to send, /help for commands, Ctrl+C to quit)",
@@ -226,7 +245,24 @@ class MnemaraTUI(App):  # type: ignore[misc]
     def on_mount(self) -> None:
         log("tui_start", instance=self.instance, model=self.cfg.model)
         self._render_history()
-        self.query_one("#userinput", Input).focus()
+        self._focus_input_after_refresh()
+
+    def _focus_input_after_refresh(self) -> None:
+        """Schedule input focus after the next paint.
+
+        Calling .focus() inline can race redraws — Textual may settle focus
+        elsewhere on the next paint (e.g. when RichLog grows during streaming).
+        call_after_refresh defers until the screen has settled.
+        """
+        def _do_focus() -> None:
+            try:
+                self.query_one("#userinput", Input).focus()
+            except Exception:
+                pass
+        try:
+            self.call_after_refresh(_do_focus)
+        except Exception:
+            _do_focus()
 
     # -------------------------------------------------------------- rendering
 
@@ -363,10 +399,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         finally:
             self._busy = False
             self._refresh_status()
-            try:
-                self.query_one("#userinput", Input).focus()
-            except Exception:
-                pass
+            self._focus_input_after_refresh()
 
     # ------------------------------------------------------------ slash cmds
 
@@ -465,6 +498,21 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     def action_clear_log(self) -> None:
         self._chat().clear()
+
+    def action_focus_input(self) -> None:
+        self._focus_input_after_refresh()
+
+    def action_scroll_log_up(self) -> None:
+        try:
+            self._chat().scroll_page_up()
+        except Exception:
+            pass
+
+    def action_scroll_log_down(self) -> None:
+        try:
+            self._chat().scroll_page_down()
+        except Exception:
+            pass
 
     async def action_quit(self) -> None:
         self.exit()
