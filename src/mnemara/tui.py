@@ -60,11 +60,17 @@ Screen {
     border: round #3a4256;
     background: #1a1f2b;
     padding: 1 2;
+    /* Always reserve the scrollbar gutter so the bar is visible at startup
+       (not only after content overflows) — gives a consistent click target. */
+    overflow-y: scroll;
     scrollbar-background: #1a1f2b;
+    scrollbar-background-hover: #1a1f2b;
+    scrollbar-background-active: #1a1f2b;
     scrollbar-color: #4d6fa3;
     scrollbar-color-hover: #6f9ad9;
     scrollbar-color-active: #8fb6e6;
-    scrollbar-size-vertical: 1;
+    /* Two-cell-wide bar so it's easier to grab with the mouse. */
+    scrollbar-size-vertical: 2;
 }
 
 #status {
@@ -246,18 +252,44 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     def on_mount(self) -> None:
         log("tui_start", instance=self.instance, model=self.cfg.model)
-        # Disable Textual mouse capture so native terminal text selection works
-        # by default (click-and-drag to select, copy via terminal). Textual's
-        # driver enables mouse tracking on start (and re-enables after SIGCONT
-        # / iTerm workaround), so we both write the disable sequence AND stub
-        # out the driver's _enable_mouse_support to keep it disabled.
+        # Replace Textual's mouse-enable sequence with one that uses only
+        # safe modes. Textual's default enables 1000 (basic click) +
+        # 1003 (any-event motion: chatty + battery drain) + 1015 (urxvt
+        # encoding: emits raw high bytes when coords > 223, crashes the
+        # input UTF-8 decoder on wide terminals) + 1006 (SGR safe).
+        #
+        # We replace it with: 1000 (click) + 1002 (button-event drag,
+        # needed for scrollbar drag interaction) + 1006 (SGR safe). No
+        # 1003 (motion noise) and crucially no 1015 (the byte-0xd5
+        # crasher).
+        #
+        # Trade-off: native click-and-drag text selection no longer works
+        # without modifier — most terminals honor shift+drag to bypass
+        # mouse capture and use native selection (iTerm2, Terminal.app,
+        # GNOME Terminal, kitty, Windows Terminal, Alacritty all support
+        # this). Mouse-wheel scrolling and scrollbar interaction now work.
         try:
             drv = self._driver
             if drv is not None:
-                drv.write(self._MOUSE_DISABLE)
+                # Disable any unsafe modes that may have been enabled by
+                # Textual's driver before we got here.
+                drv.write(self._MOUSE_DISABLE_UNSAFE)
+                # Enable our safe set immediately.
+                drv.write(self._MOUSE_ENABLE_SAFE)
                 drv.flush()
+                # Replace the driver's enabler so the SIGCONT / iTerm
+                # workaround (linux_driver.py:288) re-enables with our
+                # safe sequence instead of Textual's default.
                 if hasattr(drv, "_enable_mouse_support"):
-                    drv._enable_mouse_support = lambda: None  # type: ignore[method-assign]
+                    drv_ref = drv
+                    def _safe_reenable() -> None:
+                        try:
+                            drv_ref.write(self._MOUSE_DISABLE_UNSAFE)
+                            drv_ref.write(self._MOUSE_ENABLE_SAFE)
+                            drv_ref.flush()
+                        except Exception:
+                            pass
+                    drv._enable_mouse_support = _safe_reenable  # type: ignore[method-assign]
         except Exception:
             pass
         self._render_history()
@@ -535,15 +567,19 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             pass
 
-    # ANSI sequence to fully disable mouse tracking — sent on mount so native
-    # terminal text selection (click-and-drag to copy) works without a toggle.
-    # Disable ALL mouse modes (1000 basic, 1002 button-event, 1003 any-event,
-    # 1005 UTF-8 ext, 1006 SGR ext, 1015 urxvt ext); leaving any active causes
-    # the terminal to send mouse-report bytes that crash Textual's UTF-8 input
-    # decoder (mode 1000 in particular emits raw high bytes during drag).
-    _MOUSE_DISABLE = (
-        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
-    )
+    # ANSI mouse sequences. Only the *unsafe* modes are disabled — we keep
+    # mouse tracking on so the scrollbar and mouse-wheel work, but use
+    # encoding modes that don't crash Textual's UTF-8 input decoder.
+    #
+    # Disabled: 1003 (any-event motion: chatty + battery drain),
+    #           1005 (UTF-8 ext encoding: high bytes break decoder),
+    #           1015 (urxvt encoding: high bytes break decoder when
+    #                 terminal width > 223 chars; the original 0xd5 crash).
+    _MOUSE_DISABLE_UNSAFE = "\x1b[?1003l\x1b[?1005l\x1b[?1015l"
+    # Enabled: 1000 (basic click tracking),
+    #          1002 (button-event motion: needed for scrollbar drag),
+    #          1006 (SGR ext encoding: text-only chars, decoder-safe).
+    _MOUSE_ENABLE_SAFE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
 
     _paste_unavailable_warned: bool = False
 

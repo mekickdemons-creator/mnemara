@@ -1039,8 +1039,13 @@ def test_tui_slash_copy_n_argument(home, monkeypatch):
     assert "First" not in copied[0]
 
 
-def test_tui_mouse_disable_on_mount(home):
-    """On mount the TUI emits the mouse-disable escape sequence so native terminal text selection works by default."""
+def test_tui_mouse_safe_modes_on_mount(home):
+    """On mount the TUI swaps Textual's default mouse mode set for a safe one.
+
+    Disables 1003 (any-event motion: chatty) and 1015 (urxvt encoding: unsafe
+    on wide terminals) while keeping 1000+1002+1006 enabled so the scrollbar
+    and mouse-wheel work without crashing the input UTF-8 decoder.
+    """
     import asyncio as _asyncio
     from mnemara import config
     from mnemara import tui as tui_mod
@@ -1051,19 +1056,23 @@ def test_tui_mouse_disable_on_mount(home):
     driver_writes: list[str] = []
 
     async def _run() -> None:
-        # Patch the driver.write before mount fires so we capture the on_mount
-        # disable sequence. run_test() spins the app up; we monkeypatch as
-        # early as possible.
         async with app.run_test() as pilot:
             if app._driver is not None:
                 orig = app._driver.write
                 app._driver.write = lambda s: driver_writes.append(s) or orig(s)  # type: ignore[method-assign]
-            # Trigger another on_mount-equivalent disable to verify the
-            # sequence content (on_mount already ran before patch landed).
-            if app._driver is not None:
-                app._driver.write(app._MOUSE_DISABLE)
+                # Re-trigger the safe sequence (on_mount already ran before the
+                # patch landed) so we can inspect the bytes.
+                app._driver.write(app._MOUSE_DISABLE_UNSAFE)
+                app._driver.write(app._MOUSE_ENABLE_SAFE)
             await pilot.pause()
-            assert any("\x1b[?1003l" in w for w in driver_writes)
+            disables = "".join(w for w in driver_writes)
+            # Unsafe modes disabled.
+            assert "\x1b[?1003l" in disables, "should disable any-event motion"
+            assert "\x1b[?1015l" in disables, "should disable urxvt encoding (unsafe on wide terms)"
+            # Safe modes enabled.
+            assert "\x1b[?1000h" in disables, "should enable basic click tracking"
+            assert "\x1b[?1002h" in disables, "should enable button-event drag (scrollbar)"
+            assert "\x1b[?1006h" in disables, "should enable SGR encoding (decoder-safe)"
 
     _asyncio.run(_run())
     app.store.close()
