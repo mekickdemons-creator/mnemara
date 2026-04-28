@@ -897,6 +897,14 @@ async def _run_turn(
         }
 
     async for message in query(prompt=_prompt_stream(), options=options):
+        # Explicitly yield control to the event loop on every SDK message.
+        # The SDK's async iterator can deliver buffered messages back-to-back
+        # without internally awaiting on I/O — when tokens arrive in bursts,
+        # the loop body runs synchronously and starves concurrent tasks
+        # (Textual Input keypress handler, resize events, spinner timer).
+        # asyncio.sleep(0) is the standard way to let the scheduler dispatch
+        # other ready tasks before continuing.
+        await asyncio.sleep(0)
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 bd = _block_to_dict(block)

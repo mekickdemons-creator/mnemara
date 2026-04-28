@@ -1076,3 +1076,162 @@ def test_tui_mouse_safe_modes_on_mount(home):
 
     _asyncio.run(_run())
     app.store.close()
+
+
+def test_tui_spinner_ticks_when_busy(home):
+    """Spinner index advances while _busy=True and resets on busy->idle edge.
+
+    Validates the timer callback contract without depending on real-time
+    scheduling: we directly invoke _tick_spinner the way Textual's interval
+    timer would, and assert the state transitions.
+    """
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("spinner_t")
+    app = tui_mod.MnemaraTUI("spinner_t")
+    app._cached_status_static = "turns: 0/100 | tokens: 0/500000"
+
+    # Idle -> tick should not advance frame.
+    app._busy = False
+    app._spinner_idx = 0
+    app._tick_spinner()
+    assert app._spinner_idx == 0
+
+    # Busy -> tick advances frame and marks _spinner_was_busy.
+    app._busy = True
+    app._tick_spinner()
+    assert app._spinner_idx == 1
+    assert app._spinner_was_busy is True
+    app._tick_spinner()
+    assert app._spinner_idx == 2
+
+    # Busy -> idle transition: next tick clears spinner state once.
+    app._busy = False
+    app._tick_spinner()
+    assert app._spinner_idx == 0
+    assert app._spinner_was_busy is False
+
+    # Subsequent idle ticks remain no-ops.
+    app._tick_spinner()
+    assert app._spinner_idx == 0
+
+    app.store.close()
+
+
+def test_tui_render_status_widget_omits_spinner_when_idle(home):
+    """_render_status_widget includes spinner glyph only when _busy.
+
+    Smoke-checks the rendered text shape — busy state prefixes one of the
+    braille frames; idle state shows just the cached static portion.
+    """
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+    from textual.widgets import Static
+
+    config.init_instance("spinner_render_t")
+    app = tui_mod.MnemaraTUI("spinner_render_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            status = app.query_one("#status", Static)
+
+            # Idle render: no spinner frame.
+            app._busy = False
+            app._cached_status_static = "STATIC_PART"
+            app._render_status_widget()
+            await pilot.pause()
+            text = str(status.content)
+            assert "STATIC_PART" in text
+            for f in app._SPINNER_FRAMES:
+                assert f not in text, f"idle render leaked spinner frame {f!r}"
+
+            # Busy render: spinner frame prepended.
+            app._busy = True
+            app._spinner_idx = 3  # frame index 3 is "⠸"
+            app._render_status_widget()
+            await pilot.pause()
+            text = str(status.content)
+            assert app._SPINNER_FRAMES[3] in text, f"busy render missing spinner frame: {text!r}"
+            assert "STATIC_PART" in text
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_run_turn_yields_event_loop_between_messages(home, monkeypatch):
+    """_run_turn must yield to the event loop between SDK messages.
+
+    The streaming hot path was starving concurrent tasks (Textual Input
+    keypress dispatch, resize handlers, spinner timer) when SDK messages
+    arrived in tight bursts. We verify the fix by running a concurrent
+    sentinel coroutine and asserting it gets scheduled at least once
+    DURING the message stream — not just before/after.
+    """
+    import asyncio as _asyncio
+    from mnemara import agent as agent_mod
+    from claude_agent_sdk import AssistantMessage, TextBlock, ResultMessage
+
+    sentinel_ticks: list[int] = []
+    messages_processed: list[int] = []
+
+    # Build a fake query() async generator that yields many AssistantMessages
+    # back-to-back without any internal awaits — simulates the SDK delivering
+    # buffered tokens in a burst.
+    async def _fake_query(*, prompt, options):
+        for i in range(20):
+            messages_processed.append(i)
+            msg = AssistantMessage(content=[TextBlock(text=f"chunk{i}")], model="test")
+            yield msg
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            total_cost_usd=0.0,
+            usage={"input_tokens": 1, "output_tokens": 1},
+            result=None,
+        )
+
+    monkeypatch.setattr(agent_mod, "query", _fake_query)
+
+    async def _sentinel() -> None:
+        # Tick whenever we get scheduled. If _run_turn yields properly,
+        # we'll record several ticks while messages are being processed.
+        for _ in range(50):
+            sentinel_ticks.append(len(messages_processed))
+            await _asyncio.sleep(0)
+
+    async def _go() -> None:
+        # Schedule sentinel concurrently with _run_turn.
+        sentinel_task = _asyncio.create_task(_sentinel())
+        result = await agent_mod._run_turn(
+            "hi",
+            options=None,  # not used by fake_query
+            stream=True,
+            on_token=None,
+            on_tool_use=None,
+            on_tool_result=None,
+        )
+        sentinel_task.cancel()
+        try:
+            await sentinel_task
+        except _asyncio.CancelledError:
+            pass
+        assert result["assistant_blocks"]
+
+    _asyncio.run(_go())
+
+    # Sentinel should have observed the messages_processed counter advancing
+    # mid-stream — i.e. at least two distinct mid-stream values, not just
+    # 0 (before) and 20 (after).
+    distinct = sorted(set(sentinel_ticks))
+    mid_stream = [v for v in distinct if 0 < v < 20]
+    assert len(mid_stream) >= 2, (
+        f"sentinel saw no mid-stream scheduling — _run_turn isn't yielding "
+        f"to the event loop. distinct ticks: {distinct}"
+    )
