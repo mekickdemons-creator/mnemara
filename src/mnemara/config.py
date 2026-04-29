@@ -78,6 +78,7 @@ class Config:
                 ToolPolicy(tool="GraphNeighbors", mode="allow"),
                 ToolPolicy(tool="GraphMatch", mode="allow"),
                 ToolPolicy(tool="GraphShortestPath", mode="allow"),
+                ToolPolicy(tool="TuneWindow", mode="allow"),
             ]
         )
 

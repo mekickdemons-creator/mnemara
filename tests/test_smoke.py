@@ -1235,3 +1235,170 @@ def test_run_turn_yields_event_loop_between_messages(home, monkeypatch):
         f"sentinel saw no mid-stream scheduling — _run_turn isn't yielding "
         f"to the event loop. distinct ticks: {distinct}"
     )
+
+
+def test_parse_size_handles_suffixes_and_underscores():
+    """tui._parse_size accepts plain ints, k/m suffixes, and underscores/commas."""
+    from mnemara.tui import _parse_size
+    import pytest as _pytest
+
+    assert _parse_size("500") == 500
+    assert _parse_size("500k") == 500_000
+    assert _parse_size("500K") == 500_000
+    assert _parse_size("1m") == 1_000_000
+    assert _parse_size("1M") == 1_000_000
+    assert _parse_size("1_000_000") == 1_000_000
+    assert _parse_size("1,000,000") == 1_000_000
+    assert _parse_size("  100k  ") == 100_000
+    with _pytest.raises(ValueError):
+        _parse_size("")
+    with _pytest.raises(ValueError):
+        _parse_size("abc")
+    with _pytest.raises(ValueError):
+        _parse_size("1.5m")  # no float support
+    with _pytest.raises(ValueError):
+        _parse_size("k")
+
+
+def test_slash_turns_and_tokens_persist_and_temp(home):
+    """/turns N persists by default; /turns N --temp does not."""
+    import asyncio as _asyncio
+    import json as _json
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+    from mnemara import paths
+
+    config_mod.init_instance("tune_t")
+    cfg_path = paths.config_path("tune_t")
+    app = tui_mod.MnemaraTUI("tune_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            chat = app._chat()
+            # Persist path
+            await app._handle_slash("/turns 250")
+            await pilot.pause()
+            assert app.cfg.max_window_turns == 250
+            saved = _json.load(cfg_path.open())
+            assert saved["max_window_turns"] == 250
+
+            # Temp path
+            await app._handle_slash("/turns 999 --temp")
+            await pilot.pause()
+            assert app.cfg.max_window_turns == 999
+            saved = _json.load(cfg_path.open())
+            assert saved["max_window_turns"] == 250  # disk untouched
+
+            # Tokens with k suffix + persist
+            await app._handle_slash("/tokens 750k")
+            await pilot.pause()
+            assert app.cfg.max_window_tokens == 750_000
+            saved = _json.load(cfg_path.open())
+            assert saved["max_window_tokens"] == 750_000
+
+            # Tokens with m suffix + temp
+            await app._handle_slash("/tokens 2m --temp")
+            await pilot.pause()
+            assert app.cfg.max_window_tokens == 2_000_000
+            saved = _json.load(cfg_path.open())
+            assert saved["max_window_tokens"] == 750_000  # disk untouched
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_slash_turns_rejects_out_of_bounds(home):
+    """/turns 0 and /turns 99999 reject; /tokens 100 and /tokens 99999999 reject."""
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    config_mod.init_instance("tune_bounds_t")
+    app = tui_mod.MnemaraTUI("tune_bounds_t")
+    starting_turns = app.cfg.max_window_turns
+    starting_tokens = app.cfg.max_window_tokens
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._handle_slash("/turns 0")
+            await app._handle_slash("/turns 100000")
+            await app._handle_slash("/turns abc")
+            assert app.cfg.max_window_turns == starting_turns
+
+            await app._handle_slash("/tokens 100")
+            await app._handle_slash("/tokens 100m")
+            await app._handle_slash("/tokens xyz")
+            assert app.cfg.max_window_tokens == starting_tokens
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_tune_window_tool_persists_to_config(home):
+    """The agent-side tune_window tool persists by default and respects -1 sentinel.
+
+    Calls the tool handler directly (synchronous: no SDK roundtrip) and asserts
+    config.json reflects the change.
+    """
+    import asyncio as _asyncio
+    import json as _json
+    from mnemara import config as config_mod
+    from mnemara import paths
+    from mnemara.agent import AgentSession
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    from mnemara.permissions import PermissionStore
+
+    config_mod.init_instance("agent_tune_t")
+    cfg = config_mod.load("agent_tune_t")
+    cfg_path = paths.config_path("agent_tune_t")
+    store = Store("agent_tune_t")
+    perms = PermissionStore("agent_tune_t")
+    runner = ToolRunner("agent_tune_t", cfg, perms, lambda t, x: "allow")
+    session = AgentSession(cfg, store, runner)
+    # Force the tool registration path to run (it's lazy in _build_options).
+    try:
+        session._build_options("test system prompt")
+    except Exception:
+        # _build_options may fail on test environment for unrelated reasons
+        # (e.g. no ANTHROPIC creds); that's fine — registration runs first.
+        pass
+    handler = session._registered_tools.get("tune_window")
+    assert handler is not None, f"tune_window not registered; got {list(session._registered_tools)}"
+
+    async def _go():
+        # Bump turns + tokens, persist=true (default).
+        out = await handler({"max_turns": 333, "max_tokens": 444_000, "persist": "true"})
+        text_block = out["content"][0]["text"]
+        assert "max_window_turns" in text_block
+        assert cfg.max_window_turns == 333
+        assert cfg.max_window_tokens == 444_000
+        saved = _json.load(cfg_path.open())
+        assert saved["max_window_turns"] == 333
+        assert saved["max_window_tokens"] == 444_000
+
+        # -1 sentinels: leave alone.
+        out = await handler({"max_turns": 555, "max_tokens": -1, "persist": "true"})
+        assert cfg.max_window_turns == 555
+        assert cfg.max_window_tokens == 444_000
+
+        # persist=false: in-memory only.
+        out = await handler({"max_turns": -1, "max_tokens": 999_000, "persist": "false"})
+        assert cfg.max_window_tokens == 999_000
+        saved = _json.load(cfg_path.open())
+        assert saved["max_window_tokens"] == 444_000  # unchanged on disk
+
+        # Out-of-bounds: rejected, no-op.
+        out = await handler({"max_turns": 99999, "max_tokens": -1, "persist": "true"})
+        assert cfg.max_window_turns == 555  # unchanged
+        assert out.get("is_error") is True
+
+        # Both sentinels: error no-op.
+        out = await handler({"max_turns": -1, "max_tokens": -1, "persist": "true"})
+        assert out.get("is_error") is True
+
+    _asyncio.run(_go())
+    store.close()

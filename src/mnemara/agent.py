@@ -87,6 +87,7 @@ _GRAPH_QUERY_TOOL = "mcp__mnemara_memory__graph_query"
 _GRAPH_NEIGHBORS_TOOL = "mcp__mnemara_memory__graph_neighbors"
 _GRAPH_MATCH_TOOL = "mcp__mnemara_memory__graph_match"
 _GRAPH_SHORTEST_PATH_TOOL = "mcp__mnemara_memory__graph_shortest_path"
+_TUNE_WINDOW_TOOL = "mcp__mnemara_memory__tune_window"
 
 
 class AgentSession:
@@ -713,6 +714,91 @@ class AgentSession:
                 "is_error": True,
             }
 
+        @tool(
+            "tune_window",
+            "Adjust this instance's rolling-context caps. Pass max_turns "
+            "and/or max_tokens (use -1 to leave a field unchanged). "
+            "Persists to config.json unless persist='false'. Bounds: "
+            "turns in [1, 10000]; tokens in [1000, 10000000]. Returns "
+            "the new effective values. Use this when you've judged the "
+            "current cap is wrong for the work at hand — e.g. a deep "
+            "investigation needs more tokens, or a fast iteration loop "
+            "wants tighter turns.",
+            {"max_turns": int, "max_tokens": int, "persist": str},
+        )
+        async def _tune_window_tool(args: dict[str, Any]) -> dict[str, Any]:
+            from . import config as config_mod
+
+            cfg = session.cfg
+            mt = args.get("max_turns", -1)
+            mtk = args.get("max_tokens", -1)
+            persist_raw = (args.get("persist", "true") or "true").lower()
+            persist = persist_raw not in ("false", "0", "no", "temp", "--temp")
+            try:
+                mt_i = int(mt) if mt is not None else -1
+            except (TypeError, ValueError):
+                mt_i = -1
+            try:
+                mtk_i = int(mtk) if mtk is not None else -1
+            except (TypeError, ValueError):
+                mtk_i = -1
+            changes: list[str] = []
+            errors: list[str] = []
+            if mt_i != -1:
+                if 1 <= mt_i <= 10000:
+                    old = cfg.max_window_turns
+                    cfg.max_window_turns = mt_i
+                    changes.append(f"max_window_turns: {old} -> {mt_i}")
+                else:
+                    errors.append(
+                        f"max_turns {mt_i} out of bounds [1, 10000]"
+                    )
+            if mtk_i != -1:
+                if 1000 <= mtk_i <= 10_000_000:
+                    old = cfg.max_window_tokens
+                    cfg.max_window_tokens = mtk_i
+                    changes.append(f"max_window_tokens: {old} -> {mtk_i}")
+                else:
+                    errors.append(
+                        f"max_tokens {mtk_i} out of bounds [1000, 10000000]"
+                    )
+            if not changes and not errors:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "no-op: pass max_turns or max_tokens "
+                                "(use -1 to leave unchanged)"
+                            ),
+                        }
+                    ],
+                    "is_error": True,
+                }
+            persist_note = ""
+            if changes and persist:
+                try:
+                    config_mod.save(session.runner.instance, cfg)
+                    persist_note = " (persisted to config.json)"
+                except Exception as exc:
+                    persist_note = f" (persist failed: {exc})"
+            elif changes:
+                persist_note = " (in-memory only)"
+            payload = {
+                "changes": changes,
+                "errors": errors,
+                "effective": {
+                    "max_window_turns": cfg.max_window_turns,
+                    "max_window_tokens": cfg.max_window_tokens,
+                },
+                "persisted": persist and not errors and bool(changes),
+            }
+            text = json.dumps(payload, indent=2) + persist_note
+            return {
+                "content": [{"type": "text", "text": text}],
+                "is_error": bool(errors) and not changes,
+            }
+
         registered = [
             _write_memory_tool,
             _inspect_context_tool,
@@ -729,6 +815,7 @@ class AgentSession:
             _graph_neighbors_tool,
             _graph_match_tool,
             _graph_shortest_path_tool,
+            _tune_window_tool,
         ]
         # Expose handlers by name for in-process testing / introspection.
         self._registered_tools = {
@@ -765,6 +852,7 @@ class AgentSession:
             _GRAPH_NEIGHBORS_TOOL,
             _GRAPH_MATCH_TOOL,
             _GRAPH_SHORTEST_PATH_TOOL,
+            _TUNE_WINDOW_TOOL,
         ]
         for s in self.cfg.mcp_servers:
             # Permit any tool exposed by configured MCP servers.
@@ -1036,6 +1124,8 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "GraphMatch", ""
     if tool_name == _GRAPH_SHORTEST_PATH_TOOL or tool_name.endswith("__graph_shortest_path"):
         return "GraphShortestPath", ""
+    if tool_name == _TUNE_WINDOW_TOOL or tool_name.endswith("__tune_window"):
+        return "TuneWindow", ""
     return None, ""
 
 

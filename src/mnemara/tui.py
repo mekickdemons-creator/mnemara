@@ -48,6 +48,30 @@ from .store import Store
 from .tools import ToolRunner, parse_proposal_file, write_memory
 
 
+def _parse_size(s: str) -> int:
+    """Parse a human-readable integer size: '500', '500k', '1m', '1_000_000'.
+
+    Used by /turns and /tokens. Returns the parsed int. Raises ValueError on
+    malformed input. Suffixes are case-insensitive: k=1_000, m=1_000_000.
+    Underscores in the digit portion are ignored (Python literal style).
+    """
+    if not s:
+        raise ValueError("empty value")
+    raw = s.strip().lower().replace("_", "").replace(",", "")
+    if not raw:
+        raise ValueError("empty value")
+    mult = 1
+    if raw.endswith("k"):
+        mult = 1_000
+        raw = raw[:-1]
+    elif raw.endswith("m"):
+        mult = 1_000_000
+        raw = raw[:-1]
+    if not raw or not raw.lstrip("-").isdigit():
+        raise ValueError("not a number")
+    return int(raw) * mult
+
+
 DEFAULT_CSS = """
 Screen {
     background: #1d2330;
@@ -544,6 +568,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /proposals       list pending role-amendment proposals\n"
                 "  /inbox           list pending pings from peer panels\n"
                 "  /copy [all|N]    copy to clipboard: last response (default), all turns, or last N turns\n"
+                "  /window          print current max_window_turns and max_window_tokens\n"
+                "  /turns N [--temp]   set max_window_turns (persists unless --temp)\n"
+                "  /tokens N [--temp]  set max_window_tokens (accepts 500k, 1m, 1000000; persists unless --temp)\n"
                 "  /quit, /exit     exit\n"
                 "[b]Key bindings:[/b]\n"
                 "  Ctrl+Y           copy last assistant response to clipboard\n"
@@ -618,6 +645,25 @@ class MnemaraTUI(App):  # type: ignore[misc]
             peers = getattr(self.cfg, "peer_roles", ["theseus", "majordomo"])
             pings = inbox_mod.peek_pending_pings(db, peers, exclude_role=self.instance)
             chat.write(inbox_mod.format_inbox(pings))
+            return
+
+        if cmd == "/window":
+            tin, tout = self.store.total_tokens()
+            n_turns = len(self.store.window())
+            chat.write(
+                f"[b]window caps[/b]\n"
+                f"  turns:   {n_turns} / {self.cfg.max_window_turns}\n"
+                f"  tokens:  {tin + tout} / {self.cfg.max_window_tokens} "
+                f"({tin} in / {tout} out)"
+            )
+            return
+
+        if cmd == "/turns":
+            await self._slash_set_window(arg, chat, field="turns")
+            return
+
+        if cmd == "/tokens":
+            await self._slash_set_window(arg, chat, field="tokens")
             return
 
         chat.write(f"[red]unknown command:[/red] {cmd}  (try /help)")
@@ -740,6 +786,63 @@ class MnemaraTUI(App):  # type: ignore[misc]
             return
         if self._copy_to_clipboard(text):
             self._flash_copy(len(text))
+
+    async def _slash_set_window(
+        self, arg: str, chat: "RichLog", *, field: str
+    ) -> None:
+        """/turns N [--temp] and /tokens N [--temp] handler.
+
+        field='turns'  -> mutates cfg.max_window_turns  (bounds [1, 10000])
+        field='tokens' -> mutates cfg.max_window_tokens (bounds [1000, 10_000_000];
+                          accepts shorthand like '500k' / '1m')
+
+        Persists to config.json by default. Pass --temp as second arg for
+        in-memory only (revert on restart).
+        """
+        parts = arg.split()
+        if not parts:
+            chat.write(
+                f"[red]usage: /{field} N [--temp]  "
+                f"(N is a positive integer"
+                f"{'; tokens accepts 500k, 1m, etc.' if field == 'tokens' else ''}"
+                f")[/red]"
+            )
+            return
+        raw = parts[0]
+        temp = len(parts) > 1 and parts[1].lower() in ("--temp", "-t", "temp")
+        try:
+            n = _parse_size(raw)
+        except ValueError as e:
+            chat.write(f"[red]invalid value '{raw}': {e}[/red]")
+            return
+        if field == "turns":
+            if not 1 <= n <= 10000:
+                chat.write("[red]turns must be between 1 and 10000[/red]")
+                return
+            old = self.cfg.max_window_turns
+            self.cfg.max_window_turns = n
+            label = "turns"
+        else:
+            if not 1000 <= n <= 10_000_000:
+                chat.write(
+                    "[red]tokens must be between 1000 and 10000000 (10M)[/red]"
+                )
+                return
+            old = self.cfg.max_window_tokens
+            self.cfg.max_window_tokens = n
+            label = "tokens"
+        if not temp:
+            try:
+                config_mod.save(self.instance, self.cfg)
+                persist_note = "(persisted to config.json)"
+            except Exception as exc:
+                persist_note = f"[red](persist failed: {exc})[/red]"
+        else:
+            persist_note = "(in-memory only — reverts on restart)"
+        chat.write(
+            f"[green]{label}: {old} → {n}[/green]  [dim]{persist_note}[/dim]"
+        )
+        self._refresh_status()
 
     async def _slash_copy(self, arg: str, chat: "RichLog") -> None:
         """/copy [all|N] — copy turns to clipboard."""
