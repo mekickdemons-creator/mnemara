@@ -79,6 +79,10 @@ class Config:
                 ToolPolicy(tool="GraphMatch", mode="allow"),
                 ToolPolicy(tool="GraphShortestPath", mode="allow"),
                 ToolPolicy(tool="TuneWindow", mode="allow"),
+                ToolPolicy(tool="EvictLast", mode="allow"),
+                ToolPolicy(tool="EvictIds", mode="allow"),
+                ToolPolicy(tool="MarkSegment", mode="allow"),
+                ToolPolicy(tool="EvictSince", mode="allow"),
             ]
         )
 

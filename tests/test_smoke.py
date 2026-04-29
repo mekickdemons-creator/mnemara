@@ -1402,3 +1402,311 @@ def test_tune_window_tool_persists_to_config(home):
 
     _asyncio.run(_go())
     store.close()
+
+
+# ---------------------------------------------------------------- eviction
+
+
+def test_store_evict_last_drops_most_recent_rows(home):
+    """Store.evict_last(n) removes exactly n most-recent rows when available."""
+    from mnemara.store import Store
+
+    store = Store("evict_last_t")
+    for i in range(5):
+        store.append_turn("user", [{"type": "text", "text": f"msg{i}"}])
+    assert len(store.window()) == 5
+    deleted = store.evict_last(2)
+    assert deleted == 2
+    rows = store.window()
+    assert len(rows) == 3
+    # Confirm the most-recent (highest id) rows went; the surviving rows
+    # are the first three appended.
+    texts = [r["content"][0]["text"] for r in rows]
+    assert texts == ["msg0", "msg1", "msg2"]
+
+    # Asking for more than available deletes what's there.
+    deleted = store.evict_last(99)
+    assert deleted == 3
+    assert store.window() == []
+
+    # Zero / negative is a no-op.
+    deleted = store.evict_last(0)
+    assert deleted == 0
+    deleted = store.evict_last(-1)
+    assert deleted == 0
+    store.close()
+
+
+def test_store_evict_ids_targets_specific_rows(home):
+    """Store.evict_ids deletes only the requested ids; unknown ids ignored."""
+    from mnemara.store import Store
+
+    store = Store("evict_ids_t")
+    ids = [
+        store.append_turn("user", [{"type": "text", "text": f"m{i}"}]) for i in range(5)
+    ]
+    # Drop the middle three.
+    deleted = store.evict_ids([ids[1], ids[2], ids[3]])
+    assert deleted == 3
+    rows = store.window()
+    assert len(rows) == 2
+    assert [r["id"] for r in rows] == [ids[0], ids[4]]
+
+    # Unknown ids ignored; deleted reflects actual matches.
+    deleted = store.evict_ids([99999, 88888])
+    assert deleted == 0
+
+    # Mixed known + unknown returns only the known count.
+    deleted = store.evict_ids([ids[0], 99999])
+    assert deleted == 1
+    assert [r["id"] for r in store.window()] == [ids[4]]
+
+    # Empty input is a no-op.
+    deleted = store.evict_ids([])
+    assert deleted == 0
+    store.close()
+
+
+def test_store_mark_segment_and_evict_since(home):
+    """mark_segment inserts a marker row; evict_since drops marker + everything after."""
+    from mnemara.store import Store
+
+    store = Store("mark_evict_t")
+    store.append_turn("user", [{"type": "text", "text": "before-detour"}])
+    mid = store.mark_segment("checkpoint")
+    store.append_turn("assistant", [{"type": "text", "text": "during-detour-1"}])
+    store.append_turn("user", [{"type": "text", "text": "during-detour-2"}])
+    store.append_turn("assistant", [{"type": "text", "text": "during-detour-3"}])
+
+    # The marker shows up in window() (visible to producer/agent) but NOT
+    # in messages_for_api() (model never sees it).
+    rows = store.window()
+    assert any(r["role"] == "marker" and r["id"] == mid for r in rows)
+    api_msgs = store.messages_for_api()
+    assert all(m["role"] in ("user", "assistant") for m in api_msgs)
+    assert len(api_msgs) == 4  # 1 user before + 3 turns after marker
+
+    # list_markers exposes the marker by name.
+    marks = store.list_markers()
+    assert len(marks) == 1
+    assert marks[0]["name"] == "checkpoint"
+    assert marks[0]["id"] == mid
+
+    # evict_since drops the marker + 3 rows after it = 4 deletions.
+    deleted = store.evict_since("checkpoint")
+    assert deleted == 4
+    rows = store.window()
+    assert len(rows) == 1
+    assert rows[0]["content"][0]["text"] == "before-detour"
+
+    # Unknown marker name returns 0 (no-op).
+    deleted = store.evict_since("nonexistent")
+    assert deleted == 0
+    store.close()
+
+
+def test_store_evict_since_picks_most_recent_when_name_repeats(home):
+    """If a marker name appears twice, evict_since uses the more recent one."""
+    from mnemara.store import Store
+
+    store = Store("dup_marker_t")
+    store.append_turn("user", [{"type": "text", "text": "before-first"}])
+    first_mark = store.mark_segment("ckpt")
+    store.append_turn("user", [{"type": "text", "text": "between"}])
+    second_mark = store.mark_segment("ckpt")
+    store.append_turn("user", [{"type": "text", "text": "after-second"}])
+
+    # evict_since('ckpt') should drop the second marker + the row after it,
+    # leaving the first marker and everything before the second intact.
+    deleted = store.evict_since("ckpt")
+    assert deleted == 2
+    rows = store.window()
+    ids = [r["id"] for r in rows]
+    assert second_mark not in ids
+    assert first_mark in ids
+    # Three rows survive: original user, first marker, between user
+    assert len(rows) == 3
+    store.close()
+
+
+def test_messages_for_api_filters_marker_rows(home):
+    """messages_for_api never emits role='marker' rows."""
+    from mnemara.store import Store
+
+    store = Store("api_filter_t")
+    store.append_turn("user", [{"type": "text", "text": "u1"}])
+    store.mark_segment("only-visible-internally")
+    store.append_turn("assistant", [{"type": "text", "text": "a1"}])
+
+    msgs = store.messages_for_api()
+    assert len(msgs) == 2
+    roles = {m["role"] for m in msgs}
+    assert roles == {"user", "assistant"}
+    assert "marker" not in roles
+    # Window still shows the marker (so the agent can target it).
+    win_roles = [r["role"] for r in store.window()]
+    assert "marker" in win_roles
+    store.close()
+
+
+def test_slash_evict_and_mark_command_dispatch(home):
+    """/mark, /marks, /evict last|ids|since dispatch through the TUI handler."""
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    config_mod.init_instance("slash_evict_t")
+    app = tui_mod.MnemaraTUI("slash_evict_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Seed the store with five rows.
+            for i in range(5):
+                app.store.append_turn("user", [{"type": "text", "text": f"m{i}"}])
+
+            # /mark and /marks
+            await app._handle_slash("/mark checkpoint-a")
+            await pilot.pause()
+            marks = app.store.list_markers()
+            assert len(marks) == 1
+            assert marks[0]["name"] == "checkpoint-a"
+
+            # /evict last 1 should drop the marker (it was the most recent row).
+            await app._handle_slash("/evict last 1")
+            await pilot.pause()
+            assert app.store.list_markers() == []
+            assert len(app.store.window()) == 5  # five user turns intact
+
+            # Re-mark and evict_since
+            await app._handle_slash("/mark checkpoint-b")
+            await pilot.pause()
+            for i in range(3):
+                app.store.append_turn("assistant", [{"type": "text", "text": f"r{i}"}])
+            assert len(app.store.window()) == 5 + 1 + 3  # 5 user + marker + 3 assistant
+
+            await app._handle_slash("/evict since checkpoint-b")
+            await pilot.pause()
+            # Marker + 3 assistant rows dropped; 5 original user turns survive.
+            rows = app.store.window()
+            assert len(rows) == 5
+            assert all(r["role"] == "user" for r in rows)
+
+            # /evict ids targeting two of the survivors
+            ids_to_drop = [r["id"] for r in rows[:2]]
+            await app._handle_slash(f"/evict ids {ids_to_drop[0]},{ids_to_drop[1]}")
+            await pilot.pause()
+            assert len(app.store.window()) == 3
+
+            # Bad input is a no-op (errors logged to chat, not raised).
+            await app._handle_slash("/evict last abc")
+            await pilot.pause()
+            assert len(app.store.window()) == 3
+            await app._handle_slash("/evict since does-not-exist")
+            await pilot.pause()
+            assert len(app.store.window()) == 3
+            await app._handle_slash("/evict bogus-mode")
+            await pilot.pause()
+            assert len(app.store.window()) == 3
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_agent_eviction_tools_persist_to_store(home):
+    """Agent-side evict_last / evict_ids / mark_segment / evict_since tools.
+
+    Invokes the registered tool handlers directly (bypassing the SDK
+    roundtrip) and asserts the underlying store reflects each operation.
+    """
+    import asyncio as _asyncio
+    import json as _json
+    from mnemara import config as config_mod
+    from mnemara import paths
+    from mnemara.agent import AgentSession
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config_mod.init_instance("agent_evict_t")
+    cfg = config_mod.load("agent_evict_t")
+    store = Store("agent_evict_t")
+    perms = PermissionStore("agent_evict_t")
+    runner = ToolRunner("agent_evict_t", cfg, perms, lambda t, x: "allow")
+    session = AgentSession(cfg, store, runner)
+    try:
+        session._build_options("test system prompt")
+    except Exception:
+        # SDK env may not be fully constructable in tests; registration
+        # runs first, that's all we need.
+        pass
+
+    handlers = session._registered_tools
+    for name in ("evict_last", "evict_ids", "mark_segment", "evict_since"):
+        assert name in handlers, f"{name} not registered; got {list(handlers)}"
+
+    async def _go() -> None:
+        # Seed with five rows.
+        ids = [
+            store.append_turn("user", [{"type": "text", "text": f"m{i}"}])
+            for i in range(5)
+        ]
+
+        # mark_segment
+        out = await handlers["mark_segment"]({"name": "tangent"})
+        payload = _json.loads(out["content"][0]["text"])
+        assert payload["name"] == "tangent"
+        assert isinstance(payload["marker_id"], int)
+
+        # Add three rows after the marker.
+        for i in range(3):
+            store.append_turn("assistant", [{"type": "text", "text": f"r{i}"}])
+
+        # evict_since drops marker + 3 = 4 rows
+        out = await handlers["evict_since"]({"marker": "tangent"})
+        payload = _json.loads(out["content"][0]["text"])
+        assert payload["deleted"] == 4
+        assert payload["matched"] is True
+        assert len(store.window()) == 5
+
+        # evict_last 2
+        out = await handlers["evict_last"]({"n": 2})
+        payload = _json.loads(out["content"][0]["text"])
+        assert payload["deleted"] == 2
+        assert len(store.window()) == 3
+
+        # evict_ids both csv and json shapes
+        survivors = [r["id"] for r in store.window()]
+        out = await handlers["evict_ids"]({"ids": f"{survivors[0]},{survivors[1]}"})
+        payload = _json.loads(out["content"][0]["text"])
+        assert payload["deleted"] == 2
+        assert len(store.window()) == 1
+
+        out = await handlers["evict_ids"]({"ids": f"[{store.window()[0]['id']}]"})
+        payload = _json.loads(out["content"][0]["text"])
+        assert payload["deleted"] == 1
+        assert store.window() == []
+
+        # Error paths
+        out = await handlers["evict_last"]({"n": 0})
+        assert out.get("is_error") is True
+        out = await handlers["evict_last"]({"n": "abc"})
+        assert out.get("is_error") is True
+        out = await handlers["evict_ids"]({"ids": ""})
+        assert out.get("is_error") is True
+        out = await handlers["evict_ids"]({"ids": "not,a,number"})
+        assert out.get("is_error") is True
+        out = await handlers["mark_segment"]({"name": ""})
+        assert out.get("is_error") is True
+        out = await handlers["evict_since"]({"marker": ""})
+        assert out.get("is_error") is True
+
+        # evict_since with unknown marker is a non-error 0-delete (matched=False)
+        out = await handlers["evict_since"]({"marker": "nonexistent"})
+        payload = _json.loads(out["content"][0]["text"])
+        assert payload["deleted"] == 0
+        assert payload["matched"] is False
+        assert out.get("is_error") is not True
+
+    _asyncio.run(_go())
+    store.close()

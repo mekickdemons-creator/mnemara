@@ -571,6 +571,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /window          print current max_window_turns and max_window_tokens\n"
                 "  /turns N [--temp]   set max_window_turns (persists unless --temp)\n"
                 "  /tokens N [--temp]  set max_window_tokens (accepts 500k, 1m, 1000000; persists unless --temp)\n"
+                "  /show ids        print rolling window with row ids (target evict)\n"
+                "  /mark <name>     insert a named segment marker at this point\n"
+                "  /marks           list all segment markers in the window\n"
+                "  /evict last N           drop the N most-recent rows\n"
+                "  /evict ids 4,7,9        drop specific rows by id (see /show ids)\n"
+                "  /evict since <name>     drop the named marker and everything after it\n"
                 "  /quit, /exit     exit\n"
                 "[b]Key bindings:[/b]\n"
                 "  Ctrl+Y           copy last assistant response to clipboard\n"
@@ -589,7 +595,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             return
 
         if cmd == "/show":
-            self._render_history()
+            if arg.strip() == "ids":
+                self._slash_show_ids(chat)
+            else:
+                self._render_history()
             return
 
         if cmd == "/clear":
@@ -664,6 +673,18 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd == "/tokens":
             await self._slash_set_window(arg, chat, field="tokens")
+            return
+
+        if cmd == "/marks":
+            self._slash_marks(chat)
+            return
+
+        if cmd == "/mark":
+            self._slash_mark(arg, chat)
+            return
+
+        if cmd == "/evict":
+            self._slash_evict(arg, chat)
             return
 
         chat.write(f"[red]unknown command:[/red] {cmd}  (try /help)")
@@ -843,6 +864,119 @@ class MnemaraTUI(App):  # type: ignore[misc]
             f"[green]{label}: {old} → {n}[/green]  [dim]{persist_note}[/dim]"
         )
         self._refresh_status()
+
+    def _slash_show_ids(self, chat: "RichLog") -> None:
+        """`/show ids` — print the rolling window with row ids prepended.
+
+        Useful before targeting `/evict ids ...` so the producer can see
+        exactly which rows hold which content. Marker rows get a
+        distinct prefix so they're easy to spot.
+        """
+        rows = self.store.window()
+        if not rows:
+            chat.write("[dim](empty window)[/dim]")
+            return
+        chat.write("[b]rolling window (id | role | preview):[/b]")
+        for row in rows:
+            rid = row["id"]
+            role = row["role"]
+            content = row["content"]
+            if role == "marker":
+                # content is the marker name (json-encoded scalar)
+                name = content if isinstance(content, str) else str(content)
+                chat.write(
+                    f"  [dim]#{rid}[/dim] [yellow]⚑ marker[/yellow] [b]{name}[/b]"
+                )
+                continue
+            # User/assistant rows: short preview of the content
+            text = _flatten_text_blocks(content) if role == "user" else _flatten_assistant_content(content)
+            preview = text.replace("\n", " ").strip()
+            if len(preview) > 100:
+                preview = preview[:97] + "..."
+            color = "cyan" if role == "user" else "green"
+            chat.write(f"  [dim]#{rid}[/dim] [{color}]{role:>9}[/{color}]  {preview}")
+
+    def _slash_marks(self, chat: "RichLog") -> None:
+        """`/marks` — list every segment marker in the current window."""
+        marks = self.store.list_markers()
+        if not marks:
+            chat.write("[dim]no segment markers in window[/dim]")
+            return
+        chat.write(f"[b]⚑ {len(marks)} segment marker{'s' if len(marks) != 1 else ''}:[/b]")
+        for m in marks:
+            chat.write(f"  [dim]#{m['id']}[/dim] [b yellow]{m['name']}[/b yellow]  [dim]{m['ts']}[/dim]")
+
+    def _slash_mark(self, arg: str, chat: "RichLog") -> None:
+        """`/mark <name>` — insert a segment marker at the current tail."""
+        name = arg.strip()
+        if not name:
+            chat.write("[red]usage: /mark <name>  (use a short token like 'pre-aethon-detour')[/red]")
+            return
+        try:
+            mid = self.store.mark_segment(name)
+        except Exception as exc:
+            chat.write(f"[red]marker insert failed: {exc}[/red]")
+            return
+        chat.write(f"[green]⚑ marker '{name}' inserted at #{mid}[/green]")
+        self._refresh_status()
+
+    def _slash_evict(self, arg: str, chat: "RichLog") -> None:
+        """`/evict last N` | `/evict ids 4,7,9` | `/evict since <name>`."""
+        parts = arg.split(None, 1)
+        if not parts:
+            chat.write(
+                "[red]usage:[/red]\n"
+                "  /evict last N            drop the N most-recent rows\n"
+                "  /evict ids 4,7,9         drop specific rows by id\n"
+                "  /evict since <name>      drop named marker + everything after"
+            )
+            return
+        sub = parts[0].lower()
+        rest = parts[1] if len(parts) > 1 else ""
+        if sub == "last":
+            try:
+                n = int(rest.strip())
+            except ValueError:
+                chat.write("[red]usage: /evict last N  (N must be a positive integer)[/red]")
+                return
+            if n <= 0:
+                chat.write("[red]N must be > 0[/red]")
+                return
+            deleted = self.store.evict_last(n)
+            chat.write(f"[green]evicted {deleted} row{'s' if deleted != 1 else ''}[/green]")
+            self._refresh_status()
+            return
+        if sub == "ids":
+            try:
+                ids = [int(x.strip()) for x in rest.replace(",", " ").split() if x.strip()]
+            except ValueError:
+                chat.write("[red]usage: /evict ids 4,7,9  (comma- or space-separated row ids)[/red]")
+                return
+            if not ids:
+                chat.write("[red]no ids provided[/red]")
+                return
+            deleted = self.store.evict_ids(ids)
+            chat.write(
+                f"[green]evicted {deleted}/{len(ids)} row{'s' if len(ids) != 1 else ''}[/green]"
+                + (f"  [dim](missing: {len(ids) - deleted})[/dim]" if deleted != len(ids) else "")
+            )
+            self._refresh_status()
+            return
+        if sub == "since":
+            name = rest.strip()
+            if not name:
+                chat.write("[red]usage: /evict since <name>[/red]")
+                return
+            deleted = self.store.evict_since(name)
+            if deleted == 0:
+                chat.write(f"[yellow]no marker named '{name}' — use /marks to list[/yellow]")
+            else:
+                chat.write(
+                    f"[green]evicted {deleted} row{'s' if deleted != 1 else ''} from marker '{name}' onward[/green]"
+                )
+                self._refresh_status()
+            return
+        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since)[/red]")
 
     async def _slash_copy(self, arg: str, chat: "RichLog") -> None:
         """/copy [all|N] — copy turns to clipboard."""

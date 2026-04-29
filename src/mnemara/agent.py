@@ -88,6 +88,10 @@ _GRAPH_NEIGHBORS_TOOL = "mcp__mnemara_memory__graph_neighbors"
 _GRAPH_MATCH_TOOL = "mcp__mnemara_memory__graph_match"
 _GRAPH_SHORTEST_PATH_TOOL = "mcp__mnemara_memory__graph_shortest_path"
 _TUNE_WINDOW_TOOL = "mcp__mnemara_memory__tune_window"
+_EVICT_LAST_TOOL = "mcp__mnemara_memory__evict_last"
+_EVICT_IDS_TOOL = "mcp__mnemara_memory__evict_ids"
+_MARK_SEGMENT_TOOL = "mcp__mnemara_memory__mark_segment"
+_EVICT_SINCE_TOOL = "mcp__mnemara_memory__evict_since"
 
 
 class AgentSession:
@@ -799,6 +803,153 @@ class AgentSession:
                 "is_error": bool(errors) and not changes,
             }
 
+        @tool(
+            "evict_last",
+            "Drop the N most-recent rows from your rolling window. Use this "
+            "to actively forget the immediate past — e.g. you read a file, "
+            "decided it wasn't what you needed, want it out of your context "
+            "so it doesn't compete for attention. NOTE: the user turn that "
+            "triggered the current turn IS already in the store, so "
+            "evict_last(1) called from a tool drops THAT turn (the prompt "
+            "you're answering). For self-eviction prefer mark_segment + "
+            "evict_since which is exact rather than positional.",
+            {"n": int},
+        )
+        async def _evict_last_tool(args: dict[str, Any]) -> dict[str, Any]:
+            try:
+                n = int(args.get("n", 0))
+            except (TypeError, ValueError):
+                return {
+                    "content": [{"type": "text", "text": "n must be a positive integer"}],
+                    "is_error": True,
+                }
+            if n <= 0:
+                return {
+                    "content": [{"type": "text", "text": "n must be > 0"}],
+                    "is_error": True,
+                }
+            deleted = session.store.evict_last(n)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"deleted": deleted, "requested": n}),
+                    }
+                ]
+            }
+
+        @tool(
+            "evict_ids",
+            "Drop specific rows from your rolling window by id. Pass `ids` "
+            "as a comma-separated string (e.g. '4,7,9') or a JSON array "
+            "string ('[4,7,9]'). Use inspect_context to surface ids first, "
+            "or coordinate with the producer to learn which rows hold what. "
+            "Silently ignores ids that don't exist; the response reports "
+            "how many actually deleted.",
+            {"ids": str},
+        )
+        async def _evict_ids_tool(args: dict[str, Any]) -> dict[str, Any]:
+            raw = (args.get("ids") or "").strip()
+            if not raw:
+                return {
+                    "content": [{"type": "text", "text": "ids required"}],
+                    "is_error": True,
+                }
+            ids: list[int] = []
+            try:
+                if raw.startswith("["):
+                    parsed = json.loads(raw)
+                    ids = [int(x) for x in parsed]
+                else:
+                    ids = [int(x.strip()) for x in raw.replace(",", " ").split() if x.strip()]
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return {
+                    "content": [{"type": "text", "text": f"could not parse ids: {exc}"}],
+                    "is_error": True,
+                }
+            if not ids:
+                return {
+                    "content": [{"type": "text", "text": "no ids provided"}],
+                    "is_error": True,
+                }
+            deleted = session.store.evict_ids(ids)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({
+                            "deleted": deleted,
+                            "requested": len(ids),
+                            "missing": len(ids) - deleted,
+                        }),
+                    }
+                ]
+            }
+
+        @tool(
+            "mark_segment",
+            "Insert a named segment marker at the current tail of your "
+            "rolling window. Markers don't show up in the API messages "
+            "the model sees — they're invisible bookmarks. Pair with "
+            "evict_since to drop everything appended after the marker. "
+            "Use this BEFORE you start an exploratory tangent so you can "
+            "cleanly back out if it doesn't pan out.",
+            {"name": str},
+        )
+        async def _mark_segment_tool(args: dict[str, Any]) -> dict[str, Any]:
+            name = (args.get("name") or "").strip()
+            if not name:
+                return {
+                    "content": [{"type": "text", "text": "name required"}],
+                    "is_error": True,
+                }
+            try:
+                mid = session.store.mark_segment(name)
+            except Exception as exc:
+                return {
+                    "content": [{"type": "text", "text": f"mark insert failed: {exc}"}],
+                    "is_error": True,
+                }
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"marker_id": mid, "name": name}),
+                    }
+                ]
+            }
+
+        @tool(
+            "evict_since",
+            "Drop the named segment marker AND every row appended after "
+            "it. If multiple markers share the name, the most recent one "
+            "is used. Returns count deleted; 0 means no marker matched. "
+            "This is the clean way to abandon an exploratory tangent: "
+            "mark_segment('checkpoint') before, evict_since('checkpoint') "
+            "after if you decide the tangent wasn't useful.",
+            {"marker": str},
+        )
+        async def _evict_since_tool(args: dict[str, Any]) -> dict[str, Any]:
+            name = (args.get("marker") or "").strip()
+            if not name:
+                return {
+                    "content": [{"type": "text", "text": "marker name required"}],
+                    "is_error": True,
+                }
+            deleted = session.store.evict_since(name)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({
+                            "deleted": deleted,
+                            "marker": name,
+                            "matched": deleted > 0,
+                        }),
+                    }
+                ]
+            }
+
         registered = [
             _write_memory_tool,
             _inspect_context_tool,
@@ -816,6 +967,10 @@ class AgentSession:
             _graph_match_tool,
             _graph_shortest_path_tool,
             _tune_window_tool,
+            _evict_last_tool,
+            _evict_ids_tool,
+            _mark_segment_tool,
+            _evict_since_tool,
         ]
         # Expose handlers by name for in-process testing / introspection.
         self._registered_tools = {
@@ -853,6 +1008,10 @@ class AgentSession:
             _GRAPH_MATCH_TOOL,
             _GRAPH_SHORTEST_PATH_TOOL,
             _TUNE_WINDOW_TOOL,
+            _EVICT_LAST_TOOL,
+            _EVICT_IDS_TOOL,
+            _MARK_SEGMENT_TOOL,
+            _EVICT_SINCE_TOOL,
         ]
         for s in self.cfg.mcp_servers:
             # Permit any tool exposed by configured MCP servers.
@@ -1126,6 +1285,14 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "GraphShortestPath", ""
     if tool_name == _TUNE_WINDOW_TOOL or tool_name.endswith("__tune_window"):
         return "TuneWindow", ""
+    if tool_name == _EVICT_LAST_TOOL or tool_name.endswith("__evict_last"):
+        return "EvictLast", ""
+    if tool_name == _EVICT_IDS_TOOL or tool_name.endswith("__evict_ids"):
+        return "EvictIds", ""
+    if tool_name == _MARK_SEGMENT_TOOL or tool_name.endswith("__mark_segment"):
+        return "MarkSegment", ""
+    if tool_name == _EVICT_SINCE_TOOL or tool_name.endswith("__evict_since"):
+        return "EvictSince", ""
     return None, ""
 
 
