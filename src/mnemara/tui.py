@@ -482,11 +482,20 @@ class MnemaraTUI(App):  # type: ignore[misc]
         """
         rows = self.store.window()
         n_turns = len(rows)
+        # `tin` is the content-length/4 estimate of the rolling window's
+        # stored size in tokens. This is what `Store.evict()` enforces
+        # against `max_window_tokens`. `tout` is cumulative API output
+        # tokens across the session -- informational, NOT a cap input.
+        # Showing `tin + tout` against the cap (the previous behavior)
+        # was misleading: the displayed total could cross the cap while
+        # the enforced metric stayed well under, so eviction correctly
+        # didn't fire but the producer saw "over cap, no evictions" as
+        # a bug. Display the enforced metric against the cap and surface
+        # cumulative output tokens separately.
         tin, tout = self.store.total_tokens()
-        total = tin + tout
         base = (
             f"turns: {n_turns}/{self.cfg.max_window_turns} | "
-            f"tokens: {total}/{self.cfg.max_window_tokens} ({tin} in / {tout} out) | "
+            f"tokens: {tin}/{self.cfg.max_window_tokens} (out: {tout} cum) | "
             f"model: {self.cfg.model} | evicted: {self._evicted_total}"
         )
         try:
@@ -794,8 +803,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write(
                 f"[b]window caps[/b]\n"
                 f"  turns:   {n_turns} / {self.cfg.max_window_turns}\n"
-                f"  tokens:  {tin + tout} / {self.cfg.max_window_tokens} "
-                f"({tin} in / {tout} out)"
+                f"  tokens:  {tin} / {self.cfg.max_window_tokens}  "
+                f"[dim](enforced metric: rolling-window stored size)[/dim]\n"
+                f"  out:     {tout} cumulative  "
+                f"[dim](session-total API output tokens, not a cap input)[/dim]"
             )
             return
 
