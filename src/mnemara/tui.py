@@ -335,13 +335,35 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         # Ambient inbox state. Polls the architect returns table every 5s
         # for new peer pings — surfaces a chatlog notification line when a
-        # new ping lands AND refreshes the status-bar pending count without
-        # waiting for a turn boundary. Producer-flagged 2026-04-30: pings
-        # arriving during idle weren't visible until the producer manually
-        # ran /inbox or took a turn (which is what triggers the existing
-        # turn-time auto-surface). _last_seen_inbox_id tracks the highest
-        # row id we've already notified about so re-polls don't spam.
+        # new ping lands AND (when inbox_auto_respond is True) auto-spawns
+        # a worker turn so the agent processes the ping without waiting
+        # for a human-driven turn.
+        #
+        # Two independent trackers because notification (visual) and
+        # auto-respond (agent invocation) advance under different rules:
+        #
+        #   _last_seen_inbox_id     — highest row id already shown in
+        #                             chatlog; advances after a successful
+        #                             notification write so we don't spam
+        #                             a notice every 5s for the same ping.
+        #
+        #   _last_auto_processed_id — highest row id already handed to the
+        #                             agent via auto-respond worker (or
+        #                             skipped due to terminal payload_type).
+        #                             ONLY advances after spawning a worker
+        #                             or skipping for loop-guard reasons.
+        #                             If auto-respond is busy/disabled,
+        #                             pings stay queued for it without
+        #                             re-notifying visually.
+        #
+        # Producer-flagged 2026-04-30: visible-only notification was
+        # insufficient — coordinator panels (Producer) need the agent
+        # itself to act on pings, not wait for a human turn. The
+        # `inbox_auto_respond` cfg flag opts a panel into agent-level
+        # auto-invocation. See _check_inbox_ambient for the worker spawn
+        # + loop guard.
         self._last_seen_inbox_id = 0
+        self._last_auto_processed_id = 0
         self._inbox_ambient_timer = None  # set in on_mount
 
     # ------------------------------------------------------------- composition
@@ -593,27 +615,43 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._spinner_idx = 0
             self._render_status_widget()
 
+    # Payload types that don't trigger an auto-respond worker. The agent
+    # has nothing meaningful to do when the peer's message is just an
+    # acknowledgment or a final reply — auto-spawning a turn would either
+    # produce a no-op response or, worse, cause an infinite ack loop
+    # between two auto-responding panels. The agent can still drain these
+    # manually via /inbox or a human-driven turn.
+    _AUTO_RESPOND_TERMINAL_TYPES: frozenset[str] = frozenset({
+        "ack",
+        "ack_final",
+        "reply_final",
+    })
+
     def _check_inbox_ambient(self, *, boot: bool = False) -> None:
         """Interval-timer callback. Surfaces new peer pings ambiently.
 
-        Polls the architect returns table every 5s for pending pings from
-        any role in self.cfg.peer_roles (excluding self). On the first
-        call (boot=True) writes a single "N pending on boot" notice if
-        any pings exist, then primes _last_seen_inbox_id. Subsequent
-        calls fire one chatlog notification line per NEW ping (id >
-        _last_seen_inbox_id) and refresh the status-bar count.
+        Two responsibilities:
 
-        Producer-flagged 2026-04-30: pings arriving during idle weren't
-        visible until /inbox or a turn was taken. The existing
-        inbox_auto_surface mechanism (agent.py) only fires at turn
-        time — prepending the notice to the user prompt — which means
-        the producer has to type something to be told a ping arrived.
-        That's wrong for a coordinator panel that's mostly idle. This
-        poller is the ambient-notification half of the same UX.
+        1. **Visual notification** (always): polls the architect returns
+           table every 5s for pending pings from any role in
+           self.cfg.peer_roles (excluding self). New rows (id >
+           _last_seen_inbox_id) get one chatlog notification line each.
+           Boot-time pings collapse to a single "N pending on boot"
+           notice so a panel with a backlog doesn't spam the chatlog.
 
-        DB cost: count_pending is a single indexed query; running it at
-        0.2Hz is trivial. The poll lives entirely in this Mnemara
-        process; architect daemon is unaffected.
+        2. **Agent-level auto-respond** (opt-in via cfg.inbox_auto_respond):
+           after the visual notification lands, spawn a worker turn that
+           prompts the agent to drain + process + reply. New rows (id >
+           _last_auto_processed_id) trigger; if the panel is mid-stream
+           (self._busy), skip this tick — the auto-process tracker stays
+           put so the next tick retries. Loop guard skips payload types
+           in _AUTO_RESPOND_TERMINAL_TYPES (ack/ack_final/reply_final).
+
+        Two trackers because the responsibilities advance under different
+        rules — see __init__ comment block.
+
+        DB cost: count_pending is a single indexed query; running at 0.2Hz
+        is trivial.
         """
         db = getattr(self.cfg, "architect_db_path", "") or ""
         peers = getattr(self.cfg, "peer_roles", []) or []
@@ -625,15 +663,18 @@ class MnemaraTUI(App):  # type: ignore[misc]
             return
         if not pings:
             # Inbox is empty. If we previously had pings tracked, clear
-            # the marker and refresh the status bar so the count drops.
-            if self._last_seen_inbox_id > 0:
+            # both trackers and refresh the status bar so the count drops.
+            if self._last_seen_inbox_id > 0 or self._last_auto_processed_id > 0:
                 self._last_seen_inbox_id = 0
+                self._last_auto_processed_id = 0
                 self._refresh_status()
             return
         if boot:
             # First check on mount: collapse all pending into one notice
             # so a panel that boots with a backlog doesn't spam the
-            # chatlog with one line per row.
+            # chatlog with one line per row. Both trackers prime to the
+            # max id — boot-time backlog should NOT auto-respond (it
+            # could be days-old work; the human producer should triage).
             try:
                 chat = self._chat()
                 senders = sorted({p["agent_role"] for p in pings})
@@ -644,34 +685,104 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 )
             except Exception:
                 pass
-            self._last_seen_inbox_id = max(p["id"] for p in pings)
+            max_id = max(p["id"] for p in pings)
+            self._last_seen_inbox_id = max_id
+            self._last_auto_processed_id = max_id
             self._refresh_status()
             return
-        new_pings = [p for p in pings if p["id"] > self._last_seen_inbox_id]
-        if not new_pings:
+
+        # ---- Visual notification ----
+        new_for_notify = [p for p in pings if p["id"] > self._last_seen_inbox_id]
+        if new_for_notify:
+            try:
+                chat = self._chat()
+                for p in new_for_notify:
+                    sender = p["agent_role"]
+                    row_id = p["id"]
+                    task_id = p["task_id"]
+                    ptype = p["payload_type"]
+                    bits = [f"#{row_id}"]
+                    if task_id:
+                        bits.append(f"task={task_id}")
+                    if ptype:
+                        bits.append(f"type={ptype}")
+                    chat.write(
+                        f"[yellow]📨 inbox: ping from {sender} ("
+                        + ", ".join(bits)
+                        + ") — /inbox to read[/yellow]"
+                    )
+            except Exception:
+                pass
+            self._last_seen_inbox_id = max(p["id"] for p in pings)
+            self._refresh_status()
+
+        # ---- Agent-level auto-respond (opt-in) ----
+        if not getattr(self.cfg, "inbox_auto_respond", False):
             return
-        # New pings landed. One notification line each.
+        if self._busy:
+            # Agent currently processing a (user-driven or prior auto)
+            # turn. Skip this tick WITHOUT advancing the auto tracker so
+            # the next tick re-evaluates. Note: notification tracker
+            # already advanced — we don't want to re-notify visually
+            # every 5s while the agent is busy, just to retry the spawn.
+            return
+        new_for_auto = [p for p in pings if p["id"] > self._last_auto_processed_id]
+        if not new_for_auto:
+            return
+        # FIFO: pick the oldest unprocessed.
+        target = min(new_for_auto, key=lambda p: p["id"])
+        ptype = target.get("payload_type") or ""
+        if ptype in self._AUTO_RESPOND_TERMINAL_TYPES:
+            # Loop guard. Mark processed without spawning so we don't
+            # retry on every tick.
+            self._last_auto_processed_id = target["id"]
+            return
+
+        synthetic = self._build_inbox_auto_prompt(target)
+        # Advance tracker BEFORE spawning so a fast retry can't
+        # double-fire on the same row.
+        self._last_auto_processed_id = target["id"]
         try:
-            chat = self._chat()
-            for p in new_pings:
-                sender = p["agent_role"]
-                row_id = p["id"]
-                task_id = p["task_id"]
-                ptype = p["payload_type"]
-                bits = [f"#{row_id}"]
-                if task_id:
-                    bits.append(f"task={task_id}")
-                if ptype:
-                    bits.append(f"type={ptype}")
-                chat.write(
-                    f"[yellow]📨 inbox: ping from {sender} ("
-                    + ", ".join(bits)
-                    + ") — /inbox to read[/yellow]"
-                )
+            self.run_worker(
+                self._send_turn(synthetic),
+                name=f"mnemara_inbox_auto_{target['id']}",
+                group="turn",
+                exclusive=True,
+            )
         except Exception:
-            pass
-        self._last_seen_inbox_id = max(p["id"] for p in pings)
-        self._refresh_status()
+            # Spawn failed — back tracker out so a future tick retries.
+            self._last_auto_processed_id = max(
+                self._last_auto_processed_id - 1, 0
+            )
+
+    def _build_inbox_auto_prompt(self, ping: dict) -> str:
+        """Construct the synthetic user prompt for an auto-respond turn.
+
+        Keep this short and explicit: the agent should know this is
+        machine-generated (not a human producer typing) so it doesn't
+        try to engage conversationally. The agent's job is mechanical:
+        drain → process payload → reply if appropriate → ack.
+        """
+        sender = ping.get("agent_role", "?")
+        row_id = ping.get("id", "?")
+        task_id = ping.get("task_id") or "(none)"
+        ptype = ping.get("payload_type") or "(none)"
+        return (
+            "[AUTOMATIC INBOX TRIGGER — not a human prompt]\n"
+            f"A new peer ping has arrived from {sender} "
+            f"(row #{row_id}, task_id={task_id}, payload_type={ptype}).\n"
+            f"Drain it via next_return(agent_role=\"{sender}\"), "
+            "examine the payload, and:\n"
+            f"  - If the payload requests action or expects a reply, "
+            f"act on it and call submit_return(role=\"{self.instance}\", "
+            f"task_id=\"{task_id}\", payload={{...}}) to respond.\n"
+            "  - Use payload.type='reply_final' or 'ack_final' on your "
+            "reply if no further round-trip is needed (this prevents the "
+            "peer's auto-respond loop, if they have one, from re-triggering).\n"
+            f"  - Always call ack_return(row_id={row_id}) once you've "
+            "finished processing, so the row moves to status='done'.\n"
+            "Be brief. This is infrastructure work, not conversation."
+        )
 
     def _render_history(self) -> None:
         log_widget = self._chat()

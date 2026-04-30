@@ -1985,3 +1985,275 @@ def test_check_inbox_ambient_no_db_is_noop(home):
 
     _asyncio.run(_run())
     app.store.close()
+
+
+# ---------------------------------------------------------------- auto-respond
+
+
+def _build_returns_db(tmp_path):
+    """Helper: build a temp muninn.db with the returns schema + seed helpers."""
+    import sqlite3 as _sqlite3
+
+    db_path = tmp_path / "muninn.db"
+    conn = _sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE returns ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  session_id TEXT NOT NULL,"
+        "  agent_role TEXT NOT NULL,"
+        "  task_id TEXT,"
+        "  submitted_at TEXT NOT NULL,"
+        "  payload_json TEXT NOT NULL,"
+        "  status TEXT NOT NULL DEFAULT 'pending',"
+        "  processed_at TEXT,"
+        "  completed_at TEXT"
+        ")"
+    )
+    conn.execute("CREATE INDEX idx_returns_status ON returns(status)")
+    conn.commit()
+    return db_path, conn
+
+
+def _seed_ping(conn, sender, task="tX", payload_type="hello"):
+    cur = conn.execute(
+        "INSERT INTO returns (session_id, agent_role, task_id, "
+        "submitted_at, payload_json, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+        ("sess1", sender, task, "2026-04-30T00:00:00+00:00",
+         '{"type":"' + payload_type + '","body":"x"}'),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_inbox_auto_respond_spawns_worker_for_new_ping(home, tmp_path):
+    """When inbox_auto_respond=True, a new ping spawns a turn worker.
+
+    Patches run_worker to capture invocations rather than actually spinning
+    up _send_turn (which would need an MCP roundtrip). Verifies the
+    synthetic prompt structure and tracker advancement.
+    """
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    db_path, conn = _build_returns_db(tmp_path)
+    config_mod.init_instance("auto_resp_t")
+    cfg = config_mod.load("auto_resp_t")
+    cfg.architect_db_path = str(db_path)
+    cfg.peer_roles = ["substrate", "majordomo"]
+    cfg.inbox_auto_respond = True
+    config_mod.save("auto_resp_t", cfg)
+
+    app = tui_mod.MnemaraTUI("auto_resp_t")
+    spawn_calls = []
+
+    def _capture_run_worker(coro, **kw):
+        spawn_calls.append({"coro": coro, "kwargs": kw})
+        # Close the coroutine to avoid "never awaited" warnings.
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return None
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.run_worker = _capture_run_worker  # type: ignore[assignment]
+
+            # Add a new ping and tick the poller.
+            row_id = _seed_ping(conn, "substrate", task="ping_X", payload_type="hello")
+            app._check_inbox_ambient(boot=False)
+
+            # Worker spawned exactly once.
+            assert len(spawn_calls) == 1, f"expected 1 spawn, got {len(spawn_calls)}"
+            kw = spawn_calls[0]["kwargs"]
+            assert kw.get("group") == "turn"
+            assert kw.get("exclusive") is True
+            assert str(row_id) in kw.get("name", "")
+
+            # Both trackers advanced.
+            assert app._last_seen_inbox_id == row_id
+            assert app._last_auto_processed_id == row_id
+
+            # Second tick with no new pings is a no-op.
+            spawn_calls.clear()
+            app._check_inbox_ambient(boot=False)
+            assert spawn_calls == []
+
+    _asyncio.run(_run())
+    app.store.close()
+    conn.close()
+
+
+def test_inbox_auto_respond_skipped_when_disabled(home, tmp_path):
+    """When inbox_auto_respond=False, notification fires but no worker spawns."""
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    db_path, conn = _build_returns_db(tmp_path)
+    config_mod.init_instance("auto_off_t")
+    cfg = config_mod.load("auto_off_t")
+    cfg.architect_db_path = str(db_path)
+    cfg.peer_roles = ["substrate"]
+    cfg.inbox_auto_respond = False
+    config_mod.save("auto_off_t", cfg)
+
+    app = tui_mod.MnemaraTUI("auto_off_t")
+    spawn_calls = []
+    app_run_worker = lambda coro, **kw: (spawn_calls.append(kw), coro.close())
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.run_worker = app_run_worker  # type: ignore[assignment]
+
+            row_id = _seed_ping(conn, "substrate", task="ping_Y")
+            app._check_inbox_ambient(boot=False)
+
+            # Notification advanced; auto did not.
+            assert app._last_seen_inbox_id == row_id
+            assert app._last_auto_processed_id == 0
+            assert spawn_calls == []
+
+    _asyncio.run(_run())
+    app.store.close()
+    conn.close()
+
+
+def test_inbox_auto_respond_skipped_while_busy(home, tmp_path):
+    """When _busy=True, auto-respond defers; tracker stays put for retry."""
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    db_path, conn = _build_returns_db(tmp_path)
+    config_mod.init_instance("auto_busy_t")
+    cfg = config_mod.load("auto_busy_t")
+    cfg.architect_db_path = str(db_path)
+    cfg.peer_roles = ["substrate"]
+    cfg.inbox_auto_respond = True
+    config_mod.save("auto_busy_t", cfg)
+
+    app = tui_mod.MnemaraTUI("auto_busy_t")
+    spawn_calls = []
+    app_run_worker = lambda coro, **kw: (spawn_calls.append(kw), coro.close())
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.run_worker = app_run_worker  # type: ignore[assignment]
+
+            row_id = _seed_ping(conn, "substrate", task="ping_Z")
+            app._busy = True
+
+            app._check_inbox_ambient(boot=False)
+            # Notification advanced (visual happens regardless).
+            assert app._last_seen_inbox_id == row_id
+            # Auto tracker did NOT advance — retry-eligible.
+            assert app._last_auto_processed_id == 0
+            assert spawn_calls == []
+
+            # Once the panel un-busies, the next tick fires.
+            app._busy = False
+            app._check_inbox_ambient(boot=False)
+            assert app._last_auto_processed_id == row_id
+            assert len(spawn_calls) == 1
+
+    _asyncio.run(_run())
+    app.store.close()
+    conn.close()
+
+
+def test_inbox_auto_respond_skips_terminal_payload_types(home, tmp_path):
+    """ack / ack_final / reply_final pings advance tracker without spawning.
+
+    Loop guard: avoids two auto-responding panels infinitely acking each other.
+    """
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    db_path, conn = _build_returns_db(tmp_path)
+    config_mod.init_instance("auto_term_t")
+    cfg = config_mod.load("auto_term_t")
+    cfg.architect_db_path = str(db_path)
+    cfg.peer_roles = ["substrate"]
+    cfg.inbox_auto_respond = True
+    config_mod.save("auto_term_t", cfg)
+
+    app = tui_mod.MnemaraTUI("auto_term_t")
+    spawn_calls = []
+    app_run_worker = lambda coro, **kw: (spawn_calls.append(kw), coro.close())
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.run_worker = app_run_worker  # type: ignore[assignment]
+
+            ack_id = _seed_ping(conn, "substrate", payload_type="ack")
+            app._check_inbox_ambient(boot=False)
+            assert app._last_auto_processed_id == ack_id
+            assert spawn_calls == []
+
+            final_id = _seed_ping(conn, "substrate", payload_type="reply_final")
+            app._check_inbox_ambient(boot=False)
+            assert app._last_auto_processed_id == final_id
+            assert spawn_calls == []
+
+            # Non-terminal type after terminals: spawns.
+            hello_id = _seed_ping(conn, "substrate", payload_type="hello")
+            app._check_inbox_ambient(boot=False)
+            assert app._last_auto_processed_id == hello_id
+            assert len(spawn_calls) == 1
+
+    _asyncio.run(_run())
+    app.store.close()
+    conn.close()
+
+
+def test_inbox_auto_respond_boot_backlog_primes_both_trackers(home, tmp_path):
+    """Boot-time backlog should prime both trackers — don't auto-respond on boot."""
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    db_path, conn = _build_returns_db(tmp_path)
+    config_mod.init_instance("auto_boot_t")
+    cfg = config_mod.load("auto_boot_t")
+    cfg.architect_db_path = str(db_path)
+    cfg.peer_roles = ["substrate"]
+    cfg.inbox_auto_respond = True
+    config_mod.save("auto_boot_t", cfg)
+
+    # Pre-boot pings already pending.
+    p1 = _seed_ping(conn, "substrate", task="old1")
+    p2 = _seed_ping(conn, "substrate", task="old2")
+
+    app = tui_mod.MnemaraTUI("auto_boot_t")
+    spawn_calls = []
+    app_run_worker = lambda coro, **kw: (spawn_calls.append(kw), coro.close())
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            # Patch BEFORE any tick fires beyond the on_mount boot path.
+            app.run_worker = app_run_worker  # type: ignore[assignment]
+            await pilot.pause()
+
+            # Both trackers should now reflect the max pre-existing ping.
+            # Boot path runs in on_mount which already executed.
+            assert app._last_seen_inbox_id == max(p1, p2)
+            assert app._last_auto_processed_id == max(p1, p2)
+            # No worker spawned for boot backlog.
+            assert spawn_calls == []
+
+            # A NEW ping after boot does spawn.
+            new_id = _seed_ping(conn, "substrate", task="new1")
+            app._check_inbox_ambient(boot=False)
+            assert app._last_auto_processed_id == new_id
+            assert len(spawn_calls) == 1
+
+    _asyncio.run(_run())
+    app.store.close()
+    conn.close()

@@ -49,6 +49,15 @@ class Config:
     peer_roles: list[str] = field(default_factory=lambda: ["theseus", "majordomo"])
     architect_db_path: str = ""  # empty = not configured; set to .../architect/muninn.db for Aethon
     inbox_auto_surface: bool = True
+    # v0.3.1 — agent-level auto-respond to peer pings (off by default; opt-in
+    # per panel). When True, the TUI's ambient inbox poller spawns a worker
+    # turn the moment a new peer ping lands, prompting the agent to drain +
+    # process + reply without waiting for a human-driven turn. Coordinator
+    # panels (Theseus, Producer) typically want this on; engineer panels
+    # (Substrate) typically leave it off so they only act when explicitly
+    # prompted. See tui.py:_check_inbox_ambient for the loop guard
+    # (skips payload_type in {ack, ack_final, reply_final}).
+    inbox_auto_respond: bool = False
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7
@@ -112,6 +121,7 @@ class Config:
             peer_roles=list(d.get("peer_roles", ["theseus", "majordomo"])),
             architect_db_path=str(d.get("architect_db_path", "") or ""),
             inbox_auto_surface=bool(d.get("inbox_auto_surface", True)),
+            inbox_auto_respond=bool(d.get("inbox_auto_respond", False)),
             graph_enabled=bool(d.get("graph_enabled", True)),
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),
