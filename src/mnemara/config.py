@@ -13,6 +13,55 @@ DEFAULT_MAX_TURNS = 100
 DEFAULT_MAX_TOKENS = 500_000  # matches observed productive ceiling — natural compaction sets in around 600K, 500K leaves 100K safety buffer
 
 
+def normalize_model_name(raw: str) -> str:
+    """Validate and normalize a model name string. Returns the cleaned name.
+
+    Accepts Anthropic-style model identifiers: an alphabetic first character
+    followed by letters, digits, dots, or hyphens. Strips outer whitespace
+    but rejects any internal whitespace (the bug producer reported
+    2026-04-30 was `/swap claude sonnet 4 5` with spaces silently stored as
+    a literal model="claude sonnet 4 5" string, which the SDK then rejected
+    on the next turn with an opaque error from deep in the transport).
+
+    Permissive about the model FAMILY by design — Anthropic adds new
+    families regularly ('claude-3-...', 'claude-3-5-...', 'claude-sonnet-4-5',
+    'claude-opus-4-7', etc.) and a hardcoded allowlist would drift. Format
+    validation catches the common typo classes (whitespace, control chars,
+    accidental quotes) and lets the API itself reject genuinely-unknown
+    model names on first use with a clear error.
+
+    Raises ValueError on:
+      - empty / whitespace-only input
+      - internal whitespace
+      - characters outside [a-zA-Z0-9.-]
+      - first character not alphabetic
+    """
+    if raw is None:
+        raise ValueError("model name required")
+    s = str(raw).strip()
+    if not s:
+        raise ValueError("model name required")
+    # Reject any internal whitespace explicitly so the error message
+    # points at the actual bug rather than a generic format complaint.
+    if any(c.isspace() for c in s):
+        raise ValueError(
+            f"model name contains whitespace: {raw!r} — "
+            "did you mean it without spaces? (e.g. 'claude-sonnet-4-5')"
+        )
+    if not s[0].isalpha():
+        raise ValueError(
+            f"model name must start with a letter, got: {raw!r}"
+        )
+    # Letters / digits / dots / hyphens only.
+    for ch in s:
+        if not (ch.isalnum() or ch in ".-"):
+            raise ValueError(
+                f"model name contains invalid character {ch!r} in {raw!r} "
+                "(allowed: letters, digits, '.', '-')"
+            )
+    return s
+
+
 @dataclass
 class ToolPolicy:
     tool: str

@@ -978,9 +978,14 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd == "/swap":
             if not arg:
-                chat.write("[red]usage: /swap <model>[/red]")
+                chat.write("[red]usage: /swap <model>  e.g. /swap claude-sonnet-4-5[/red]")
                 return
-            self.cfg.model = arg
+            try:
+                normalized = config_mod.normalize_model_name(arg)
+            except ValueError as exc:
+                chat.write(f"[red]{exc}[/red]")
+                return
+            self.cfg.model = normalized
             config_mod.save(self.instance, self.cfg)
             self.sub_title = f"model={self.cfg.model}  role={self.cfg.role_doc_path or '(none)'}"
             chat.write(f"[green]model set to[/green] {self.cfg.model}")

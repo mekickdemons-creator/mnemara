@@ -3210,3 +3210,93 @@ def test_parse_duration_seconds_invalid_raises():
         parse_duration_seconds("abc")
     with pytest.raises(ValueError, match="invalid duration"):
         parse_duration_seconds("10x")  # unknown suffix falls through to int parse
+
+
+# ---------------------------------------------------------------- normalize_model_name
+
+
+def test_normalize_model_name_strips_whitespace():
+    """Leading/trailing whitespace is stripped."""
+    from mnemara.config import normalize_model_name
+
+    assert normalize_model_name("claude-sonnet-4-5") == "claude-sonnet-4-5"
+    assert normalize_model_name("  claude-sonnet-4-5  ") == "claude-sonnet-4-5"
+    assert normalize_model_name("\tclaude-opus-4-7\n") == "claude-opus-4-7"
+
+
+def test_normalize_model_name_rejects_internal_whitespace():
+    """The actual reported bug: spaces inside the model name."""
+    import pytest
+    from mnemara.config import normalize_model_name
+
+    with pytest.raises(ValueError, match="whitespace"):
+        normalize_model_name("claude sonnet 4 5")
+    with pytest.raises(ValueError, match="whitespace"):
+        normalize_model_name("claude-sonnet 4-5")
+    with pytest.raises(ValueError, match="whitespace"):
+        normalize_model_name("claude\tsonnet")
+
+
+def test_normalize_model_name_rejects_empty():
+    """Empty / None / whitespace-only inputs raise."""
+    import pytest
+    from mnemara.config import normalize_model_name
+
+    with pytest.raises(ValueError, match="required"):
+        normalize_model_name("")
+    with pytest.raises(ValueError, match="required"):
+        normalize_model_name("   ")
+    with pytest.raises(ValueError, match="required"):
+        normalize_model_name(None)
+
+
+def test_normalize_model_name_rejects_non_alpha_first_char():
+    """First character must be a letter (catches accidental quote chars / leading hyphens)."""
+    import pytest
+    from mnemara.config import normalize_model_name
+
+    with pytest.raises(ValueError, match="must start"):
+        normalize_model_name("-claude-sonnet")
+    with pytest.raises(ValueError, match="must start"):
+        normalize_model_name("4claude")
+    with pytest.raises(ValueError, match="must start"):
+        normalize_model_name("'claude'")
+
+
+def test_normalize_model_name_rejects_invalid_chars():
+    """Characters outside [a-zA-Z0-9.-] raise."""
+    import pytest
+    from mnemara.config import normalize_model_name
+
+    with pytest.raises(ValueError, match="invalid character"):
+        normalize_model_name("claude/sonnet")
+    with pytest.raises(ValueError, match="invalid character"):
+        normalize_model_name("claude_sonnet")  # underscore not allowed
+    with pytest.raises(ValueError, match="invalid character"):
+        normalize_model_name("claude@sonnet")
+
+
+def test_normalize_model_name_accepts_known_anthropic_formats():
+    """Real Anthropic model names from various families parse cleanly."""
+    from mnemara.config import normalize_model_name
+
+    valid = [
+        "claude-opus-4-7",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-haiku-20240307",
+        "claude-3-opus-20240229",
+        # Permissive — future families and dotted versions OK.
+        "claude-4.0-mini",
+        "anthropic-foo-bar",
+    ]
+    for name in valid:
+        assert normalize_model_name(name) == name
+
+
+def test_normalize_model_name_idempotent_on_clean_input():
+    """A pre-normalized name passes through unchanged."""
+    from mnemara.config import normalize_model_name
+
+    assert normalize_model_name("claude-opus-4-7") == "claude-opus-4-7"

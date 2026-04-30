@@ -182,9 +182,14 @@ def _handle_slash(line: str, instance: str, cfg: Config, store: Store) -> bool:
 
     if cmd == "/swap":
         if not arg:
-            console.print("[red]usage: /swap <model>[/red]")
+            console.print("[red]usage: /swap <model>  e.g. /swap claude-sonnet-4-5[/red]")
             return True
-        cfg.model = arg
+        try:
+            normalized = config_mod.normalize_model_name(arg)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return True
+        cfg.model = normalized
         config_mod.save(instance, cfg)
         console.print(f"[green]model set to[/green] {cfg.model}")
         return True
