@@ -3658,3 +3658,176 @@ def test_evict_thinking_and_tool_use_compose(home):
     types = [b["type"] for b in rows[0]["content"]]
     assert types == ["text", "tool_result"]
     store.close()
+
+
+# ----------------------------------------------------------------------
+# Eviction-stats counter (session-scoped, surfaced via get_eviction_stats)
+# ----------------------------------------------------------------------
+
+def test_eviction_stats_starts_zeroed(home):
+    """A fresh Store reports zero counters across the board."""
+    from mnemara.store import Store
+
+    store = Store("evstats_zero_t")
+    s = store.get_eviction_stats()
+    assert s == {"rows_evicted": 0, "blocks_evicted": 0, "bytes_freed": 0}
+    store.close()
+
+
+def test_eviction_stats_get_returns_snapshot_copy(home):
+    """get_eviction_stats returns a copy; mutating it doesn't affect store."""
+    from mnemara.store import Store
+
+    store = Store("evstats_snapshot_t")
+    s = store.get_eviction_stats()
+    s["rows_evicted"] = 999  # mutate caller copy
+    s2 = store.get_eviction_stats()
+    assert s2["rows_evicted"] == 0
+    store.close()
+
+
+def test_eviction_stats_bumps_on_cap_fifo(home):
+    """Cap-driven evict() bumps rows_evicted by deleted count."""
+    from mnemara.store import Store
+
+    store = Store("evstats_fifo_t")
+    for i in range(5):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+    # Cap of 2 forces 3 rows evicted.
+    deleted = store.evict(max_turns=2)
+    assert deleted == 3
+    s = store.get_eviction_stats()
+    assert s["rows_evicted"] == 3
+    assert s["blocks_evicted"] == 0
+    assert s["bytes_freed"] == 0
+    store.close()
+
+
+def test_eviction_stats_bumps_on_evict_last(home):
+    """evict_last bumps rows_evicted by actual count."""
+    from mnemara.store import Store
+
+    store = Store("evstats_last_t")
+    for i in range(4):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+    n = store.evict_last(2)
+    assert n == 2
+    assert store.get_eviction_stats()["rows_evicted"] == 2
+    store.close()
+
+
+def test_eviction_stats_bumps_on_evict_ids(home):
+    """evict_ids bumps rows_evicted by existing-row count, not requested count."""
+    from mnemara.store import Store
+
+    store = Store("evstats_ids_t")
+    a = store.append_turn("user", [{"type": "text", "text": "a"}])
+    b = store.append_turn("user", [{"type": "text", "text": "b"}])
+    # Request includes one nonexistent id (99999); only the two real ones bump.
+    n = store.evict_ids([a, b, 99999])
+    assert n == 2
+    assert store.get_eviction_stats()["rows_evicted"] == 2
+    store.close()
+
+
+def test_eviction_stats_bumps_on_evict_since(home):
+    """evict_since bumps rows_evicted by deleted count."""
+    from mnemara.store import Store
+
+    store = Store("evstats_since_t")
+    store.append_turn("user", [{"type": "text", "text": "before"}])
+    store.mark_segment("M")
+    store.append_turn("user", [{"type": "text", "text": "after1"}])
+    store.append_turn("user", [{"type": "text", "text": "after2"}])
+    n = store.evict_since("M")
+    # marker + 2 rows after = 3 deleted
+    assert n == 3
+    assert store.get_eviction_stats()["rows_evicted"] == 3
+    store.close()
+
+
+def test_eviction_stats_bumps_on_evict_older_than(home):
+    """evict_older_than bumps rows_evicted by deleted-row count."""
+    from mnemara.store import Store
+
+    store = Store("evstats_older_t")
+    rid = store.append_turn("user", [{"type": "text", "text": "old"}])
+    # Backdate the row so it qualifies for the 1-second cutoff.
+    store.conn.execute(
+        "UPDATE turns SET ts='2020-01-01T00:00:00+00:00' WHERE id=?",
+        (rid,),
+    )
+    store.conn.commit()
+    result = store.evict_older_than(1)
+    assert result["rows_evicted"] == 1
+    assert store.get_eviction_stats()["rows_evicted"] == 1
+    store.close()
+
+
+def test_eviction_stats_bumps_on_block_surgery(home):
+    """Block surgery bumps blocks_evicted + bytes_freed; row count unchanged."""
+    from mnemara.store import Store
+
+    store = Store("evstats_blocks_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "x" * 200},
+            {"type": "text", "text": "kept"},
+            {"type": "thinking", "text": "y" * 100},
+        ],
+    )
+    result = store.evict_thinking_blocks(ids=[rid])
+    assert result["blocks_evicted"] == 2
+    assert result["bytes_freed"] > 0
+    s = store.get_eviction_stats()
+    assert s["rows_evicted"] == 0  # block surgery doesn't drop rows
+    assert s["blocks_evicted"] == 2
+    assert s["bytes_freed"] == result["bytes_freed"]
+    store.close()
+
+
+def test_eviction_stats_accumulates_across_multiple_calls(home):
+    """Counters compose: row drops + block surgery sum cleanly within a session."""
+    from mnemara.store import Store
+
+    store = Store("evstats_accum_t")
+    # Add 5 rows, drop the last 2 explicitly, do block surgery on the rest.
+    ids = []
+    for i in range(5):
+        ids.append(store.append_turn(
+            "assistant",
+            [
+                {"type": "thinking", "text": f"t{i}"},
+                {"type": "text", "text": f"a{i}"},
+            ],
+        ))
+    n = store.evict_last(2)
+    assert n == 2
+    r = store.evict_thinking_blocks(all_rows=True)
+    assert r["blocks_evicted"] == 3  # 3 surviving rows had 1 thinking each
+
+    s = store.get_eviction_stats()
+    assert s["rows_evicted"] == 2
+    assert s["blocks_evicted"] == 3
+    assert s["bytes_freed"] > 0
+    store.close()
+
+
+def test_eviction_stats_reset_on_new_store_instance(home):
+    """Counters are session-scoped: a fresh Store() on the same DB starts at 0."""
+    from mnemara.store import Store
+
+    store1 = Store("evstats_reset_t")
+    store1.append_turn("user", [{"type": "text", "text": "x"}])
+    store1.evict_last(1)
+    assert store1.get_eviction_stats()["rows_evicted"] == 1
+    store1.close()
+
+    store2 = Store("evstats_reset_t")
+    assert store2.get_eviction_stats() == {
+        "rows_evicted": 0,
+        "blocks_evicted": 0,
+        "bytes_freed": 0,
+    }
+    store2.close()

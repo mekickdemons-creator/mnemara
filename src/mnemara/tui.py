@@ -538,10 +538,20 @@ class MnemaraTUI(App):  # type: ignore[misc]
         # a bug. Display the enforced metric against the cap and surface
         # cumulative output tokens separately.
         tin, tout = self.store.total_tokens()
+        # Eviction display reads from the store's session-scoped counters
+        # so EVERY eviction path (cap-FIFO, manual /evict, block surgery,
+        # auto-evict-after-write) is reflected. Format stays compact:
+        #   evicted: 12r                          (rows only — no surgery yet)
+        #   evicted: 12r 318b ~245KB              (with block surgery this session)
+        ev_stats = self.store.get_eviction_stats()
+        ev_str = f"{ev_stats['rows_evicted']}r"
+        if ev_stats["blocks_evicted"]:
+            kb = ev_stats["bytes_freed"] / 1024
+            ev_str += f" {ev_stats['blocks_evicted']}b ~{kb:.0f}KB"
         base = (
             f"turns: {n_turns}/{self.cfg.max_window_turns} | "
             f"tokens: {tin}/{self.cfg.max_window_tokens} (out: {tout} cum) | "
-            f"model: {self.cfg.model} | evicted: {self._evicted_total}"
+            f"model: {self.cfg.model} | evicted: {ev_str}"
         )
         try:
             n_prop = paths.role_proposals_count(self.instance)

@@ -37,6 +37,17 @@ class Store:
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self._migrate_schema()
+        # Session-scoped eviction stats. Bumped by every eviction path
+        # (cap-FIFO via evict(), manual via evict_last/evict_ids/evict_since/
+        # evict_older_than, block surgery via _strip_blocks_by_type, and the
+        # auto-evict-after-write pairing primitive). NOT persisted — resets
+        # on each Store() construction. Read via get_eviction_stats() for
+        # status-bar display, reporting, etc.
+        self._eviction_stats: dict[str, int] = {
+            "rows_evicted": 0,
+            "blocks_evicted": 0,
+            "bytes_freed": 0,
+        }
 
     def _migrate_schema(self) -> None:
         """Idempotent column adds for older DBs that pre-date a column.
@@ -76,6 +87,40 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    # ---------------------------------------------- eviction stats counter
+    # Single funnel for all eviction paths so the status bar (and any other
+    # reporter) sees a consistent live picture. Counters are session-scoped:
+    # not persisted, reset on Store() construction. The semantics:
+    #   rows_evicted   — full rows deleted (cap-FIFO + manual row deletion)
+    #   blocks_evicted — block-surgery blocks stripped (thinking + tool_use
+    #                    + write-pair stubs)
+    #   bytes_freed    — sum of (old_content_len - new_content_len) across
+    #                    block surgery and pair eviction; rough estimate of
+    #                    context-budget savings.
+
+    def _bump_eviction_stats(
+        self,
+        *,
+        rows: int = 0,
+        blocks: int = 0,
+        bytes_: int = 0,
+    ) -> None:
+        if rows:
+            self._eviction_stats["rows_evicted"] += int(rows)
+        if blocks:
+            self._eviction_stats["blocks_evicted"] += int(blocks)
+        if bytes_:
+            self._eviction_stats["bytes_freed"] += int(bytes_)
+
+    def get_eviction_stats(self) -> dict[str, int]:
+        """Return a snapshot of session-scoped eviction counters.
+
+        Snapshot semantics: returned dict is a copy; callers can stash it
+        without worrying about mutation. Reset on Store() construction
+        (i.e. once per panel session).
+        """
+        return dict(self._eviction_stats)
 
     def append_turn(
         self,
@@ -132,6 +177,8 @@ class Store:
                 self.conn.execute("DELETE FROM turns WHERE id = ?", (row[0],))
                 self.conn.commit()
                 deleted += 1
+        if deleted:
+            self._bump_eviction_stats(rows=deleted)
         return deleted
 
     def window(self, limit: int | None = None) -> list[dict[str, Any]]:
@@ -282,7 +329,10 @@ class Store:
             f"DELETE FROM turns WHERE id IN ({placeholders})", ids
         )
         self.conn.commit()
-        return len(ids)
+        n = len(ids)
+        if n:
+            self._bump_eviction_stats(rows=n)
+        return n
 
     def evict_ids(self, ids: list[int]) -> int:
         """Delete specific row ids. Returns count actually deleted.
@@ -306,6 +356,8 @@ class Store:
             f"DELETE FROM turns WHERE id IN ({placeholders})", clean
         )
         self.conn.commit()
+        if existing:
+            self._bump_eviction_stats(rows=existing)
         return existing
 
     def mark_segment(self, name: str) -> int:
@@ -377,6 +429,8 @@ class Store:
             n = int(cur.fetchone()[0])
             self.conn.execute("DELETE FROM turns WHERE id >= ?", (marker_id,))
         self.conn.commit()
+        if n:
+            self._bump_eviction_stats(rows=n)
         return n
 
     def evict_older_than(
@@ -445,6 +499,7 @@ class Store:
             )
         if n_evict:
             self.conn.commit()
+            self._bump_eviction_stats(rows=n_evict)
         return {
             "rows_evicted": n_evict,
             "rows_skipped_pinned": n_skipped,
@@ -601,6 +656,7 @@ class Store:
 
         if rows_modified:
             self.conn.commit()
+            self._bump_eviction_stats(blocks=blocks_evicted, bytes_=bytes_freed)
 
         return {
             "rows_scanned": len(rows),
