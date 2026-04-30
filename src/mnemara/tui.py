@@ -253,6 +253,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._evicted_total = 0
         self._copy_flash: str = ""
 
+        # Spinner state. The spinner ticks via a Textual interval timer at
+        # 150ms — fast enough to feel alive, slow enough to not flood the
+        # render queue or contend with streaming. The cached static portion
+        # of the status text avoids re-running DB queries on every tick.
+        self._spinner_idx = 0
+        self._spinner_was_busy = False
+        self._cached_status_static = ""
+        self._spinner_timer = None  # set in on_mount
+
     # ------------------------------------------------------------- composition
 
     def compose(self) -> "ComposeResult":
@@ -316,6 +325,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
                     drv._enable_mouse_support = _safe_reenable  # type: ignore[method-assign]
         except Exception:
             pass
+        # Prime the cached status text so the first paint has full content.
+        self._cached_status_static = self._compute_status_text()
+        # Start the spinner ticker. 150ms is fast enough to feel alive but
+        # slow enough that even 100% packed 8h sessions cost trivial CPU.
+        # The callback bails out cheaply when not busy.
+        try:
+            self._spinner_timer = self.set_interval(0.15, self._tick_spinner)
+        except Exception:
+            self._spinner_timer = None
         self._render_history()
         self._focus_input_after_refresh()
 
@@ -341,7 +359,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
     def _chat(self) -> "RichLog":
         return self.query_one("#chatlog", RichLog)
 
-    def _status_text(self) -> str:
+    # Braille-pattern spinner frames. 10 frames at 150ms = full rotation in 1.5s.
+    _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def _compute_status_text(self) -> str:
+        """Compute the static portion of the status line.
+
+        Runs the DB queries (window, total_tokens, role_proposals_count,
+        inbox count_pending). Called only on turn boundaries / explicit
+        refresh — NOT on every spinner tick. Result is cached in
+        self._cached_status_static.
+        """
         rows = self.store.window()
         n_turns = len(rows)
         tin, tout = self.store.total_tokens()
@@ -370,11 +398,58 @@ class MnemaraTUI(App):  # type: ignore[misc]
             base += f" | [green]{self._copy_flash}[/green]"
         return base
 
-    def _refresh_status(self) -> None:
+    def _status_text(self) -> str:
+        """Backward-compat: callers that want the full status line.
+
+        Internally uses _compute_status_text; kept for tests.
+        """
+        return self._compute_status_text()
+
+    def _render_status_widget(self) -> None:
+        """Push current cached status (with spinner if busy) to the widget.
+
+        Called on every spinner tick AND on every _refresh_status() call.
+        Cheap — no DB queries; just a string format and Static.update().
+        """
+        if self._busy:
+            frame = self._SPINNER_FRAMES[self._spinner_idx % len(self._SPINNER_FRAMES)]
+            text = f"[#6f9ad9]{frame}[/#6f9ad9] {self._cached_status_static}"
+        else:
+            text = self._cached_status_static
         try:
-            self.query_one("#status", Static).update(self._status_text())
+            self.query_one("#status", Static).update(text)
         except Exception:
             pass
+
+    def _refresh_status(self) -> None:
+        """Recompute the cached static portion + push to widget.
+
+        Called on turn boundaries, copy flash transitions, and similar
+        state changes. Spinner ticks DO NOT call this — they only call
+        _render_status_widget().
+        """
+        self._cached_status_static = self._compute_status_text()
+        self._render_status_widget()
+
+    def _tick_spinner(self) -> None:
+        """Interval-timer callback. Updates spinner cell only.
+
+        Triggered every 150ms regardless of busy state. When busy:
+        advance the frame and re-render. When idle: clear the spinner
+        once on the busy→idle transition, then no-op until the next
+        turn starts.
+        """
+        if self._busy:
+            self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER_FRAMES)
+            self._spinner_was_busy = True
+            self._render_status_widget()
+            return
+        # Idle. Only push an update on the busy→idle edge so we don't
+        # spam Static.update() at 7Hz when nothing's happening.
+        if self._spinner_was_busy:
+            self._spinner_was_busy = False
+            self._spinner_idx = 0
+            self._render_status_widget()
 
     def _render_history(self) -> None:
         log_widget = self._chat()
