@@ -1147,10 +1147,20 @@ async def _run_turn(
         # Explicitly yield control to the event loop on every SDK message.
         # The SDK's async iterator can deliver buffered messages back-to-back
         # without internally awaiting on I/O — when tokens arrive in bursts,
-        # the loop body runs synchronously and starves concurrent tasks
-        # (Textual Input keypress handler, resize events, spinner timer).
+        # the loop body runs synchronously and starves concurrent tasks.
         # asyncio.sleep(0) is the standard way to let the scheduler dispatch
-        # other ready tasks before continuing.
+        # other ready tasks before continuing. Cost: negligible.
+        #
+        # NOTE 2026-04-30: an earlier diagnosis attempted to fix the
+        # resize-during-streaming bug by escalating these yields to
+        # sleep(0.001). That didn't work because the structural problem
+        # was elsewhere: in tui.py, on_input_submitted was awaiting
+        # _send_turn directly, blocking Textual's _process_messages_loop
+        # on dispatch_message for the entire stream. Yields here had no
+        # path to wake Textual's pump because the pump's task was parked
+        # on US, not waiting on the queue. The real fix lives in tui.py
+        # (run_worker pattern). These sleep(0) yields remain as cheap
+        # hygiene against future task-starvation scenarios.
         await asyncio.sleep(0)
         if isinstance(message, AssistantMessage):
             for block in message.content:
@@ -1160,6 +1170,9 @@ async def _run_turn(
                 assistant_blocks.append(bd)
                 if bd.get("type") == "text" and bd.get("text"):
                     if on_token is not None:
+                        # Per-text-block yield (an AssistantMessage can
+                        # carry many text blocks back-to-back).
+                        await asyncio.sleep(0)
                         await _maybe_await(on_token(bd["text"]))
                     elif stream and not callback_mode:
                         console.print(bd["text"], end="", soft_wrap=True, highlight=False)

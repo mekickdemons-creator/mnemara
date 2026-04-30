@@ -354,6 +354,45 @@ class MnemaraTUI(App):  # type: ignore[misc]
         )
         yield Footer()
 
+    def _on_resize(self, event: "_txt_events.Resize") -> None:  # type: ignore[name-defined]
+        """Logs each resize event for diagnosis of resize-during-streaming.
+
+        Resize-during-streaming root cause (resolved 2026-04-30): until the
+        worker-pattern fix in on_input_submitted, this handler effectively
+        could not run during a stream. on_input_submitted was awaiting
+        _send_turn directly, which blocked Textual's _process_messages_loop
+        on dispatch_message for the entire stream. Queued resize events
+        sat in the message queue but couldn't be dispatched until our
+        handler returned (~50s post-stream). Producer-confirmed via this
+        very log: a mid-stream resize emitted no state="streaming" entry,
+        only a state="idle" one ~50s later when the stream had ended.
+
+        After the run_worker fix in on_input_submitted, mid-stream resize
+        events emit state="streaming" entries here in real time. If the
+        bug recurs (visuals break + log shows state="streaming" entries
+        at the breakage timestamps), that's a different problem: dispatch
+        is happening but layout isn't sticking. Branch B fixes apply:
+        call_after_refresh second-pass refresh, manual child walks, or
+        _compositor.full_map invalidation, scoped to self._busy.
+
+        IMPORTANT: do NOT call event.prevent_default() here. Textual's
+        App._on_resize must still run AFTER us in the MRO walk so the
+        actual layout reflow happens.
+        See ~/.mnemara/substrate/wiki/textual_subclass_mro_dispatch.md.
+        """
+        try:
+            log(
+                "tui_resize",
+                state="streaming" if self._busy else "idle",
+                w=event.size.width,
+                h=event.size.height,
+                stream_chars=self._stream_chars if self._busy else 0,
+            )
+        except Exception:
+            pass
+        # Intentionally do not call event.stop() either; let resize
+        # bubble normally through the framework.
+
     def on_mount(self) -> None:
         log("tui_start", instance=self.instance, model=self.cfg.model)
         # Replace Textual's mouse-enable sequence with one that uses only
@@ -574,7 +613,29 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._refresh_status()
             return
 
-        await self._send_turn(text)
+        # Spawn streaming as a Textual worker so this handler returns
+        # immediately. CRITICAL for the resize-during-streaming bug:
+        # Textual's _process_messages_loop (textual/message_pump.py:634)
+        # awaits _dispatch_message on each event, which means while we
+        # await _send_turn here, the pump is suspended on US for the
+        # entire stream duration. Queued resize / key / mouse events
+        # can't be dispatched until our handler returns -- no amount
+        # of asyncio.sleep(0) inside the SDK iterator helps because
+        # the pump's *task* is parked on dispatch, not waiting on the
+        # queue. Producer-confirmed 2026-04-30 via debug.log: a resize
+        # mid-stream emitted no state=streaming entry; the queued
+        # event only fired ~50s later, post-stream, with state=idle.
+        # Worker pattern decouples streaming from event dispatch so
+        # the pump runs concurrently and processes events at normal
+        # cadence. exclusive=True cancels any prior in-flight stream
+        # if the producer submits a new prompt before the prior turn
+        # finishes.
+        self.run_worker(
+            self._send_turn(text),
+            name="mnemara_turn",
+            group="turn",
+            exclusive=True,
+        )
 
     async def _send_turn(self, text: str) -> None:
         self._busy = True

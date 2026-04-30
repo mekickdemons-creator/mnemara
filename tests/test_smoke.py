@@ -1775,3 +1775,93 @@ def test_userinput_paste_collapses_multiline_atomically(home):
 
     _asyncio.run(_run())
     app.store.close()
+
+
+# ---------------------------------------------------------------- worker decoupling
+
+
+def test_on_input_submitted_returns_before_send_turn_completes(home, monkeypatch):
+    """on_input_submitted must spawn _send_turn as a worker, not await it.
+
+    Pins down the resize-during-streaming fix: the input handler must
+    return immediately so Textual's _process_messages_loop is freed to
+    dispatch other queued events (resize, key, mouse) concurrently with
+    the streaming work. If on_input_submitted reverts to awaiting
+    _send_turn directly, this test fails -- the assertion would only
+    hold if _send_turn awaited completion before returning, and that's
+    exactly the architecture we don't want.
+    """
+    import asyncio as _asyncio
+    import time as _time
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+    from textual.widgets import Input
+
+    config_mod.init_instance("worker_t")
+    app = tui_mod.MnemaraTUI("worker_t")
+
+    send_turn_started = _asyncio.Event()
+    send_turn_can_finish = _asyncio.Event()
+
+    async def _slow_send_turn(text: str) -> None:
+        # Simulates a streaming turn that takes "forever" -- enough time
+        # for the test to assert handler-return before completion.
+        send_turn_started.set()
+        app._busy = True
+        try:
+            await send_turn_can_finish.wait()
+        finally:
+            app._busy = False
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Patch _send_turn to our slow stand-in.
+            monkeypatch.setattr(app, "_send_turn", _slow_send_turn)
+
+            # Simulate a submission. The handler should return BEFORE
+            # _send_turn completes; we measure by checking the busy flag
+            # is set (worker started) but the handler awaitable resolved
+            # without blocking.
+            inp = app.query_one("#userinput", Input)
+            inp.value = "hello"
+            handler_returned_at = None
+
+            async def _do_submit() -> None:
+                nonlocal handler_returned_at
+                t0 = _time.monotonic()
+                # Mimic Textual posting an Input.Submitted event.
+                event = Input.Submitted(inp, "hello")
+                await app.on_input_submitted(event)
+                handler_returned_at = _time.monotonic() - t0
+
+            # Run the handler; it should return promptly because
+            # _send_turn was spawned as a worker, not awaited.
+            await _do_submit()
+
+            # Wait for the worker to actually start (proves it WAS spawned).
+            await _asyncio.wait_for(send_turn_started.wait(), timeout=2.0)
+
+            # The handler returned in well under a second even though
+            # the worker is still parked on send_turn_can_finish.
+            assert handler_returned_at is not None
+            assert handler_returned_at < 0.5, (
+                f"on_input_submitted took {handler_returned_at:.3f}s -- "
+                "this means it awaited _send_turn directly instead of "
+                "spawning it as a worker. Resize-during-streaming bug "
+                "will recur."
+            )
+
+            # Confirm the worker is actually running (busy=True).
+            assert app._busy is True
+
+            # Let the worker finish so app teardown is clean.
+            send_turn_can_finish.set()
+            # Drain any remaining tasks.
+            for _ in range(20):
+                if not app._busy:
+                    break
+                await pilot.pause()
+
+    _asyncio.run(_run())
+    app.store.close()
