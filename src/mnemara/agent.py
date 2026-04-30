@@ -94,6 +94,7 @@ _EVICT_IDS_TOOL = "mcp__mnemara_memory__evict_ids"
 _MARK_SEGMENT_TOOL = "mcp__mnemara_memory__mark_segment"
 _EVICT_SINCE_TOOL = "mcp__mnemara_memory__evict_since"
 _EVICT_THINKING_BLOCKS_TOOL = "mcp__mnemara_memory__evict_thinking_blocks"
+_EVICT_TOOL_USE_BLOCKS_TOOL = "mcp__mnemara_memory__evict_tool_use_blocks"
 _EVICT_OLDER_THAN_TOOL = "mcp__mnemara_memory__evict_older_than"
 _PIN_ROW_TOOL = "mcp__mnemara_memory__pin_row"
 _UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
@@ -1045,6 +1046,104 @@ class AgentSession:
             }
 
         @tool(
+            "evict_tool_use_blocks",
+            "Strip 'tool_use' blocks from rolling-window rows while preserving "
+            "text/thinking blocks. HIGHEST-IMPACT block surgery for context "
+            "budget — tool_use spec blocks (file paths, command strings, "
+            "payload JSONs, edit before/after content) average ~870 bytes each "
+            "and dominate stored bytes in long sessions (78% of substrate's "
+            "store, vs. <1% for thinking signature stubs). Pairing-safe: in "
+            "mnemara only assistant_blocks are persisted — tool_result blocks "
+            "from the SDK come back via callback only and are never stored, "
+            "so all tool_use blocks in our store are already orphaned by "
+            "design and stripping them from historical rows is safe (the API "
+            "tolerates orphaned tool_use in non-final assistant messages). "
+            "Selection (exactly one required): "
+            "`ids='4,7,9'` (explicit list, comma- or JSON-array-encoded); "
+            "`keep_recent='N'` (strip from every row EXCEPT the most-recent N "
+            "— preserves recent tool calls the agent may want to reference; "
+            "'0' is legal and equivalent to all_rows); `all_rows='true'` "
+            "(strip every row); `older_than='10m'` (strip from rows whose ts "
+            "is older than the duration). Pinned rows preserved by default; "
+            "pass `skip_pinned='false'` to override. AUDIT TRAIL CAVEAT: "
+            "stripping a tool_use block removes the model's record of what "
+            "it called. The actual EFFECT (commit, file change, etc.) lives "
+            "in git or wherever the tool wrote; only the CALL is gone from "
+            "the rolling window. For sessions where the agent needs to "
+            "remember 'did I already call X?', prefer keep_recent or pinning "
+            "the relevant rows. Consider write_memory(category='tool_audit') "
+            "with a one-line summary of significant calls before evicting, "
+            "the same opt-in breadcrumb pattern as thought_summary for "
+            "thinking surgery. Returns {rows_scanned, rows_modified, "
+            "blocks_evicted, bytes_freed, rows_skipped_pinned}.",
+            {
+                "ids": str,
+                "keep_recent": str,
+                "all_rows": str,
+                "older_than": str,
+                "skip_pinned": str,
+            },
+        )
+        async def _evict_tool_use_blocks_tool(args: dict[str, Any]) -> dict[str, Any]:
+            raw_ids = (args.get("ids") or "").strip()
+            raw_keep = (args.get("keep_recent") or "").strip()
+            raw_all = (args.get("all_rows") or "").strip().lower()
+            raw_older = (args.get("older_than") or "").strip()
+            raw_skip = (args.get("skip_pinned") or "true").strip().lower()
+
+            have_ids = bool(raw_ids)
+            have_keep = bool(raw_keep)
+            have_all = raw_all in ("true", "1", "yes")
+            have_older = bool(raw_older)
+
+            if sum([have_ids, have_keep, have_all, have_older]) != 1:
+                return {
+                    "content": [{"type": "text", "text":
+                        "exactly one of ids, keep_recent, all_rows, older_than required"}],
+                    "is_error": True,
+                }
+
+            kw: dict[str, Any] = {
+                "skip_pinned": raw_skip not in ("false", "0", "no", "off"),
+            }
+            try:
+                if have_ids:
+                    if raw_ids.startswith("["):
+                        parsed = json.loads(raw_ids)
+                        ids = [int(x) for x in parsed]
+                    else:
+                        ids = [int(x.strip()) for x in raw_ids.replace(",", " ").split() if x.strip()]
+                    if not ids:
+                        return {
+                            "content": [{"type": "text", "text": "no ids provided"}],
+                            "is_error": True,
+                        }
+                    kw["ids"] = ids
+                elif have_keep:
+                    kw["keep_recent"] = int(raw_keep)
+                elif have_older:
+                    kw["older_than_seconds"] = store_mod.parse_duration_seconds(raw_older)
+                else:
+                    kw["all_rows"] = True
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return {
+                    "content": [{"type": "text", "text": f"parse error: {exc}"}],
+                    "is_error": True,
+                }
+
+            try:
+                result = session.store.evict_tool_use_blocks(**kw)
+            except (ValueError, TypeError) as exc:
+                return {
+                    "content": [{"type": "text", "text": str(exc)}],
+                    "is_error": True,
+                }
+
+            return {
+                "content": [{"type": "text", "text": json.dumps(result)}]
+            }
+
+        @tool(
             "pin_row",
             "Pin a rolling-window row with a free-form category label. Pinned "
             "rows are preserved against PROACTIVE eviction (evict_older_than, "
@@ -1219,6 +1318,7 @@ class AgentSession:
             _mark_segment_tool,
             _evict_since_tool,
             _evict_thinking_blocks_tool,
+            _evict_tool_use_blocks_tool,
             _pin_row_tool,
             _unpin_row_tool,
             _list_pinned_tool,
@@ -1265,6 +1365,7 @@ class AgentSession:
             _MARK_SEGMENT_TOOL,
             _EVICT_SINCE_TOOL,
             _EVICT_THINKING_BLOCKS_TOOL,
+            _EVICT_TOOL_USE_BLOCKS_TOOL,
             _EVICT_OLDER_THAN_TOOL,
             _PIN_ROW_TOOL,
             _UNPIN_ROW_TOOL,
@@ -1565,6 +1666,8 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "EvictSince", ""
     if tool_name == _EVICT_THINKING_BLOCKS_TOOL or tool_name.endswith("__evict_thinking_blocks"):
         return "EvictThinkingBlocks", ""
+    if tool_name == _EVICT_TOOL_USE_BLOCKS_TOOL or tool_name.endswith("__evict_tool_use_blocks"):
+        return "EvictToolUseBlocks", ""
     if tool_name == _EVICT_OLDER_THAN_TOOL or tool_name.endswith("__evict_older_than"):
         return "EvictOlderThan", ""
     if tool_name == _PIN_ROW_TOOL or tool_name.endswith("__pin_row"):

@@ -3300,3 +3300,361 @@ def test_normalize_model_name_idempotent_on_clean_input():
     from mnemara.config import normalize_model_name
 
     assert normalize_model_name("claude-opus-4-7") == "claude-opus-4-7"
+
+
+# ---------------------------------------------------------------- tool_use surgery
+
+
+def test_evict_tool_use_blocks_strips_tool_use_only(home):
+    """tool_use blocks evicted; text + thinking + tool_result preserved."""
+    from mnemara.store import Store
+
+    store = Store("etub_basic_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "consider the read"},
+            {"type": "tool_use", "id": "tu1", "name": "Read", "input": {"path": "/foo"}},
+            {"type": "text", "text": "I'll read foo first"},
+            {"type": "tool_use", "id": "tu2", "name": "Edit", "input": {"old": "x", "new": "y"}},
+            {"type": "tool_result", "tool_use_id": "tu1", "content": "file content"},
+        ],
+    )
+
+    result = store.evict_tool_use_blocks(ids=[rid])
+    assert result["rows_scanned"] == 1
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 2
+    assert result["bytes_freed"] > 0
+
+    rows = store.window()
+    blocks = rows[0]["content"]
+    types = [b["type"] for b in blocks]
+    assert types == ["thinking", "text", "tool_result"]
+    # Verify the thinking and text are preserved verbatim.
+    assert blocks[0]["text"] == "consider the read"
+    assert blocks[1]["text"] == "I'll read foo first"
+    store.close()
+
+
+def test_evict_tool_use_blocks_keep_recent_preserves_tail(home):
+    """keep_recent=N strips tool_use from older rows but not the last N."""
+    from mnemara.store import Store
+
+    store = Store("etub_keep_t")
+    ids = []
+    for i in range(5):
+        ids.append(store.append_turn(
+            "assistant",
+            [
+                {"type": "tool_use", "id": f"tu{i}", "name": "Bash", "input": {"command": f"ls {i}"}},
+                {"type": "text", "text": f"output {i}"},
+            ],
+        ))
+    result = store.evict_tool_use_blocks(keep_recent=2)
+    assert result["rows_scanned"] == 3
+    assert result["rows_modified"] == 3
+    assert result["blocks_evicted"] == 3
+
+    rows = store.window()
+    # Older 3 should have tool_use stripped.
+    for r in rows[:3]:
+        types = [b["type"] for b in r["content"]]
+        assert types == ["text"], f"row {r['id']}: tool_use should be stripped, got {types}"
+    # Most-recent 2 untouched.
+    for r in rows[3:]:
+        types = [b["type"] for b in r["content"]]
+        assert types == ["tool_use", "text"]
+    store.close()
+
+
+def test_evict_tool_use_blocks_all_rows(home):
+    """all_rows=True strips tool_use from every row regardless of role."""
+    from mnemara.store import Store
+
+    store = Store("etub_all_t")
+    user_id = store.append_turn("user", [{"type": "text", "text": "ping"}])
+    asst_id = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "tu1", "name": "Read", "input": {}},
+            {"type": "text", "text": "answer"},
+        ],
+    )
+
+    result = store.evict_tool_use_blocks(all_rows=True)
+    assert result["rows_scanned"] == 2
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 1
+
+    rows = {r["id"]: r for r in store.window()}
+    assert [b["type"] for b in rows[asst_id]["content"]] == ["text"]
+    assert [b["type"] for b in rows[user_id]["content"]] == ["text"]
+    store.close()
+
+
+def test_evict_tool_use_blocks_older_than(home):
+    """older_than_seconds selector works for tool_use blocks."""
+    from mnemara.store import Store
+
+    store = Store("etub_older_t")
+    old_id = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "old", "name": "Read", "input": {}},
+            {"type": "text", "text": "old answer"},
+        ],
+    )
+    store.conn.execute(
+        "UPDATE turns SET ts='2020-01-01T00:00:00+00:00' WHERE id=?",
+        (old_id,),
+    )
+    store.conn.commit()
+    fresh_id = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "fresh", "name": "Read", "input": {}},
+            {"type": "text", "text": "fresh answer"},
+        ],
+    )
+
+    result = store.evict_tool_use_blocks(older_than_seconds=60)
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 1
+
+    rows = {r["id"]: r for r in store.window()}
+    assert [b["type"] for b in rows[old_id]["content"]] == ["text"]
+    assert [b["type"] for b in rows[fresh_id]["content"]] == ["tool_use", "text"]
+    store.close()
+
+
+def test_evict_tool_use_blocks_skips_pinned_in_bulk_modes(home):
+    """Pinned rows preserved in all_rows / keep_recent / older_than modes."""
+    from mnemara.store import Store
+
+    store = Store("etub_pin_t")
+    pinned = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "tu_p", "name": "Read", "input": {"path": "/important"}},
+            {"type": "text", "text": "decision"},
+        ],
+    )
+    unpinned = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "tu_u", "name": "Read", "input": {"path": "/scratch"}},
+            {"type": "text", "text": "answer"},
+        ],
+    )
+    store.pin_row(pinned, label="audit")
+
+    result = store.evict_tool_use_blocks(all_rows=True)
+    assert result["rows_modified"] == 1
+    assert result["rows_skipped_pinned"] == 1
+
+    rows = {r["id"]: r for r in store.window()}
+    # Pinned row's tool_use preserved.
+    assert [b["type"] for b in rows[pinned]["content"]] == ["tool_use", "text"]
+    # Unpinned row's tool_use stripped.
+    assert [b["type"] for b in rows[unpinned]["content"]] == ["text"]
+    store.close()
+
+
+def test_evict_tool_use_blocks_skip_pinned_false_overrides(home):
+    """skip_pinned=False strips tool_use from pinned rows too."""
+    from mnemara.store import Store
+
+    store = Store("etub_pin_force_t")
+    pinned = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "tu", "name": "X", "input": {}},
+            {"type": "text", "text": "y"},
+        ],
+    )
+    store.pin_row(pinned, label="commit")
+
+    result = store.evict_tool_use_blocks(all_rows=True, skip_pinned=False)
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 1
+    assert result["rows_skipped_pinned"] == 0
+    rows = store.window()
+    assert [b["type"] for b in rows[0]["content"]] == ["text"]
+    store.close()
+
+
+def test_evict_tool_use_blocks_skips_empty_result_rows(home):
+    """Rows whose stripping leaves 0 blocks are skipped without modification.
+
+    A row containing ONLY tool_use blocks (e.g. an assistant turn that
+    silently called several tools without producing text) would be emptied
+    by a strip. Since Anthropic rejects empty content lists, the strip
+    pass leaves such rows alone — agent can evict_ids them explicitly.
+    """
+    from mnemara.store import Store
+
+    store = Store("etub_empty_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "a", "name": "X", "input": {}},
+            {"type": "tool_use", "id": "b", "name": "Y", "input": {}},
+        ],
+    )
+    result = store.evict_tool_use_blocks(ids=[rid])
+    assert result["rows_scanned"] == 1
+    assert result["rows_modified"] == 0
+    assert result["blocks_evicted"] == 0
+    # Row content unchanged.
+    rows = store.window()
+    assert [b["type"] for b in rows[0]["content"]] == ["tool_use", "tool_use"]
+    store.close()
+
+
+def test_evict_tool_use_blocks_noop_when_no_tool_use(home):
+    """A row with no tool_use blocks is scanned but not modified."""
+    from mnemara.store import Store
+
+    store = Store("etub_noop_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "text", "text": "no tools called"},
+            {"type": "thinking", "text": "scratch"},
+        ],
+    )
+    result = store.evict_tool_use_blocks(ids=[rid])
+    assert result["rows_scanned"] == 1
+    assert result["rows_modified"] == 0
+    assert result["blocks_evicted"] == 0
+    store.close()
+
+
+def test_evict_tool_use_blocks_idempotent_on_rerun(home):
+    """Second run on already-stripped row reports zero changes."""
+    from mnemara.store import Store
+
+    store = Store("etub_idem_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "tu", "name": "X", "input": {}},
+            {"type": "text", "text": "y"},
+        ],
+    )
+    r1 = store.evict_tool_use_blocks(ids=[rid])
+    assert r1["rows_modified"] == 1
+    r2 = store.evict_tool_use_blocks(ids=[rid])
+    assert r2["rows_modified"] == 0
+    assert r2["blocks_evicted"] == 0
+    store.close()
+
+
+def test_evict_tool_use_blocks_selector_validation(home):
+    """Exactly one of ids/keep_recent/all_rows/older_than_seconds required."""
+    import pytest
+    from mnemara.store import Store
+
+    store = Store("etub_sel_t")
+    store.append_turn("assistant", [{"type": "tool_use", "id": "x", "name": "y", "input": {}}, {"type": "text", "text": "z"}])
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_tool_use_blocks()
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_tool_use_blocks(ids=[1], all_rows=True)
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_tool_use_blocks(keep_recent=2, older_than_seconds=60)
+    store.close()
+
+
+def test_evict_tool_use_blocks_messages_for_api_stays_valid(home):
+    """After stripping, every emitted row has non-empty content list.
+
+    Regression guard for the empty-row skip rule across both surgeries.
+    """
+    from mnemara.store import Store
+
+    store = Store("etub_api_t")
+    store.append_turn("user", [{"type": "text", "text": "u"}])
+    # All-tool_use row: strip would empty it, must be skipped.
+    store.append_turn(
+        "assistant",
+        [{"type": "tool_use", "id": "lone", "name": "X", "input": {}}],
+    )
+    # Mixed row: strip leaves text behind.
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "tu", "name": "Y", "input": {}},
+            {"type": "text", "text": "answer"},
+        ],
+    )
+
+    store.evict_tool_use_blocks(all_rows=True)
+    msgs = store.messages_for_api()
+    for m in msgs:
+        assert isinstance(m["content"], list) and len(m["content"]) > 0, (
+            f"row produced empty content list: {m}"
+        )
+    store.close()
+
+
+def test_evict_tool_use_blocks_real_world_byte_savings(home):
+    """Sanity check: stripping a realistic tool_use block frees significant bytes.
+
+    Documents the high-impact value of this surgery vs thinking — a single
+    Edit tool_use spec is hundreds of bytes; tool_use blocks dominate
+    long-session stores.
+    """
+    from mnemara.store import Store
+
+    store = Store("etub_real_t")
+    realistic_input = {
+        "file_path": "/home/user/workspace/some/long/path/to/a/file.py",
+        "old_string": "def some_function(x, y, z):\n    return x + y + z\n" * 10,
+        "new_string": "def some_function(x, y, z):\n    return x * y * z\n" * 10,
+    }
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "text", "text": "Editing the file."},
+            {"type": "tool_use", "id": "tu_edit", "name": "Edit", "input": realistic_input},
+        ],
+    )
+    result = store.evict_tool_use_blocks(ids=[rid])
+    assert result["blocks_evicted"] == 1
+    # The Edit input alone is ~600+ bytes, plus block wrapper overhead.
+    assert result["bytes_freed"] > 500, (
+        f"expected >500 bytes freed for realistic Edit tool_use, got {result['bytes_freed']}"
+    )
+    store.close()
+
+
+def test_evict_thinking_and_tool_use_compose(home):
+    """Both surgeries can run on the same row sequentially without conflict.
+
+    Regression guard for the shared _strip_blocks_by_type helper: stripping
+    thinking from a row, then stripping tool_use from the same row, should
+    leave only text + tool_result blocks.
+    """
+    from mnemara.store import Store
+
+    store = Store("etub_compose_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "scratch"},
+            {"type": "tool_use", "id": "tu", "name": "X", "input": {}},
+            {"type": "text", "text": "answer"},
+            {"type": "tool_result", "tool_use_id": "tu", "content": "ok"},
+        ],
+    )
+    r1 = store.evict_thinking_blocks(ids=[rid])
+    assert r1["blocks_evicted"] == 1
+    r2 = store.evict_tool_use_blocks(ids=[rid])
+    assert r2["blocks_evicted"] == 1
+
+    rows = store.window()
+    types = [b["type"] for b in rows[0]["content"]]
+    assert types == ["text", "tool_result"]
+    store.close()

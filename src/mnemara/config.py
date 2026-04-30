@@ -142,6 +142,7 @@ class Config:
                 ToolPolicy(tool="MarkSegment", mode="allow"),
                 ToolPolicy(tool="EvictSince", mode="allow"),
                 ToolPolicy(tool="EvictThinkingBlocks", mode="allow"),
+                ToolPolicy(tool="EvictToolUseBlocks", mode="allow"),
                 ToolPolicy(tool="EvictOlderThan", mode="allow"),
                 ToolPolicy(tool="PinRow", mode="allow"),
                 ToolPolicy(tool="UnpinRow", mode="allow"),

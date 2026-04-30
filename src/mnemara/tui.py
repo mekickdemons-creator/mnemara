@@ -943,6 +943,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /evict thinking all     strip thinking blocks from every row (block surgery)\n"
                 "  /evict thinking keep N  strip thinking from all but the last N rows\n"
                 "  /evict thinking older 10m  strip thinking from rows older than duration\n"
+                "  /evict tools all        strip tool_use blocks (HIGH IMPACT — ~80% of bytes)\n"
+                "  /evict tools keep N     strip tool_use from all but the last N rows\n"
                 "  /pin <id> [label]       pin a row to preserve against proactive eviction\n"
                 "  /unpin <id>             remove the pin from a row\n"
                 "  /pinned [label]         list pinned rows (optionally filter by label)\n"
@@ -1435,6 +1437,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /evict thinking keep N              strip thinking from all but last N rows\n"
                 "  /evict thinking older 10m           strip thinking from rows older than 10m\n"
                 "  /evict thinking ids 4,7,9           strip thinking from specific rows\n"
+                "  /evict tools all                    strip tool_use blocks from every row (HIGH IMPACT)\n"
+                "  /evict tools keep N                 strip tool_use from all but last N rows\n"
+                "  /evict tools older 10m              strip tool_use from rows older than 10m\n"
+                "  /evict tools ids 4,7,9              strip tool_use from specific rows\n"
                 "  (append `force` to most modes to override skip_pinned)"
             )
             return
@@ -1585,7 +1591,83 @@ class MnemaraTUI(App):  # type: ignore[misc]
             )
             self._refresh_status()
             return
-        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since|older|thinking)[/red]")
+        if sub == "tools":
+            # /evict tools all                          — strip every row
+            # /evict tools keep N                       — preserve last N rows
+            # /evict tools ids 4,7,9 (or [4,7,9])       — explicit list
+            # /evict tools older 10m                    — strip rows older than X
+            #
+            # tool_use blocks are the largest bloat category in long sessions
+            # (~870 bytes/block vs ~32 for thinking stubs, often 80%+ of
+            # stored bytes). Audit-trail caveat: stripping removes the
+            # model's record of what it called; the EFFECT lives in git or
+            # wherever the tool wrote, but the call itself is gone.
+            sub_parts = rest.split(None, 1)
+            if not sub_parts:
+                chat.write(
+                    "[red]usage:[/red]\n"
+                    "  /evict tools all\n"
+                    "  /evict tools keep N\n"
+                    "  /evict tools ids 4,7,9\n"
+                    "  /evict tools older 10m\n"
+                    "  [dim]warning: removes audit trail of past tool calls; "
+                    "EFFECTS persist in git etc., calls themselves are gone[/dim]"
+                )
+                return
+            mode = sub_parts[0].lower()
+            mode_arg = sub_parts[1] if len(sub_parts) > 1 else ""
+            kw: dict = {"skip_pinned": not force}
+            try:
+                if mode == "all":
+                    kw["all_rows"] = True
+                elif mode == "keep":
+                    if not mode_arg.strip():
+                        chat.write("[red]usage: /evict tools keep N[/red]")
+                        return
+                    kw["keep_recent"] = int(mode_arg.strip())
+                elif mode == "ids":
+                    raw = mode_arg.strip()
+                    if not raw:
+                        chat.write("[red]usage: /evict tools ids 4,7,9[/red]")
+                        return
+                    if raw.startswith("["):
+                        import json as _json
+                        ids_list = [int(x) for x in _json.loads(raw)]
+                    else:
+                        ids_list = [int(x.strip()) for x in raw.replace(",", " ").split() if x.strip()]
+                    if not ids_list:
+                        chat.write("[red]no ids provided[/red]")
+                        return
+                    kw["ids"] = ids_list
+                elif mode == "older":
+                    raw = mode_arg.strip()
+                    if not raw:
+                        chat.write("[red]usage: /evict tools older <duration>[/red]")
+                        return
+                    from .store import parse_duration_seconds
+                    kw["older_than_seconds"] = parse_duration_seconds(raw)
+                else:
+                    chat.write(f"[red]unknown tools mode '{mode}'  (use all|keep|ids|older)[/red]")
+                    return
+            except (ValueError, TypeError) as exc:
+                chat.write(f"[red]parse error: {exc}[/red]")
+                return
+            try:
+                result = self.store.evict_tool_use_blocks(**kw)
+            except (ValueError, TypeError) as exc:
+                chat.write(f"[red]{exc}[/red]")
+                return
+            n_skip = result.get("rows_skipped_pinned", 0)
+            chat.write(
+                f"[green]tool_use surgery: {result['rows_modified']}/{result['rows_scanned']} "
+                f"row{'s' if result['rows_scanned'] != 1 else ''} modified, "
+                f"{result['blocks_evicted']} block{'s' if result['blocks_evicted'] != 1 else ''} "
+                f"evicted, ~{result['bytes_freed']:,} bytes freed[/green]"
+                + (f"  [dim](preserved {n_skip} pinned)[/dim]" if n_skip else "")
+            )
+            self._refresh_status()
+            return
+        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since|older|thinking|tools)[/red]")
 
     async def _slash_copy(self, arg: str, chat: "RichLog") -> None:
         """/copy [all|N] — copy turns to clipboard."""

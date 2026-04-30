@@ -459,6 +459,157 @@ class Store:
     # types the model doesn't reference back (thinking) without losing
     # the durable signal in the same turn (text + tool_use).
 
+    def _resolve_strip_target_ids(
+        self,
+        *,
+        ids: list[int] | None,
+        keep_recent: int | None,
+        all_rows: bool,
+        older_than_seconds: int | None,
+        skip_pinned: bool,
+    ) -> tuple[list[int], int]:
+        """Resolve the target id set for a block-surgery operation.
+
+        Validates the selector (exactly-one-of-four), resolves to a list of
+        candidate row ids, then applies the pin filter. Returns
+        (target_ids, rows_skipped_pinned). Shared by all evict_*_blocks
+        public methods so the selector + pin semantics stay consistent.
+
+        Raises ValueError on selector validation failure or non-integer ids.
+        """
+        have_ids = ids is not None
+        have_keep = keep_recent is not None
+        have_all = all_rows is True
+        have_older = older_than_seconds is not None
+        n_selected = sum([have_ids, have_keep, have_all, have_older])
+        if n_selected != 1:
+            raise ValueError(
+                "exactly one of ids, keep_recent, all_rows, older_than_seconds required "
+                f"(got ids={have_ids}, keep_recent={have_keep}, "
+                f"all_rows={have_all}, older_than_seconds={have_older})"
+            )
+
+        target_ids: list[int]
+        if have_ids:
+            try:
+                target_ids = [int(i) for i in ids]  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"ids must be integers: {exc}") from exc
+        elif have_keep:
+            n = max(0, int(keep_recent))  # type: ignore[arg-type]
+            cur = self.conn.execute("SELECT id FROM turns ORDER BY id DESC")
+            all_ids_desc = [r[0] for r in cur.fetchall()]
+            target_ids = all_ids_desc[n:]
+        elif have_older:
+            secs = int(older_than_seconds)  # type: ignore[arg-type]
+            if secs <= 0:
+                target_ids = []
+            else:
+                from datetime import timedelta
+                cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=secs)
+                cutoff_ts = cutoff_dt.isoformat()
+                cur = self.conn.execute(
+                    "SELECT id FROM turns WHERE ts < ? ORDER BY id ASC",
+                    (cutoff_ts,),
+                )
+                target_ids = [r[0] for r in cur.fetchall()]
+        else:  # have_all
+            cur = self.conn.execute("SELECT id FROM turns ORDER BY id ASC")
+            target_ids = [r[0] for r in cur.fetchall()]
+
+        rows_skipped_pinned = 0
+        if skip_pinned and target_ids:
+            placeholders = ",".join("?" * len(target_ids))
+            cur = self.conn.execute(
+                f"SELECT id FROM turns "
+                f"WHERE id IN ({placeholders}) AND pin_label IS NOT NULL",
+                target_ids,
+            )
+            pinned_ids = {r[0] for r in cur.fetchall()}
+            if pinned_ids:
+                target_ids = [i for i in target_ids if i not in pinned_ids]
+                rows_skipped_pinned = len(pinned_ids)
+
+        return target_ids, rows_skipped_pinned
+
+    def _strip_blocks_by_type(
+        self,
+        target_ids: list[int],
+        block_type: str,
+        rows_skipped_pinned: int,
+    ) -> dict[str, int]:
+        """Strip all blocks of the given type from the target rows.
+
+        Caller is responsible for resolving target_ids via
+        _resolve_strip_target_ids (which also produces rows_skipped_pinned
+        passed through here so the return dict stays complete).
+
+        Common rules across all block surgery:
+          - non-list content (legacy strings, marker JSON strings) is
+            scanned but skipped (no blocks to strip)
+          - rows whose strip would leave 0 blocks are skipped without
+            modification (Anthropic API rejects empty content lists)
+          - returns {rows_scanned, rows_modified, blocks_evicted,
+            bytes_freed, rows_skipped_pinned}
+        """
+        if not target_ids:
+            return {
+                "rows_scanned": 0,
+                "rows_modified": 0,
+                "blocks_evicted": 0,
+                "bytes_freed": 0,
+                "rows_skipped_pinned": rows_skipped_pinned,
+            }
+
+        placeholders = ",".join("?" * len(target_ids))
+        rows = list(self.conn.execute(
+            f"SELECT id, content FROM turns WHERE id IN ({placeholders})",
+            target_ids,
+        ))
+
+        rows_modified = 0
+        blocks_evicted = 0
+        bytes_freed = 0
+        for row_id, content_str in rows:
+            try:
+                blocks = json.loads(content_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(blocks, list):
+                continue
+            new_blocks = [
+                b for b in blocks
+                if not (isinstance(b, dict) and b.get("type") == block_type)
+            ]
+            n_evicted = len(blocks) - len(new_blocks)
+            if n_evicted == 0:
+                continue
+            if not new_blocks:
+                # Don't leave a row with empty content — Anthropic's API
+                # rejects messages with empty content lists. Agent can
+                # evict_ids this row separately if they want it gone.
+                continue
+            new_str = json.dumps(new_blocks)
+            delta = len(content_str) - len(new_str)
+            self.conn.execute(
+                "UPDATE turns SET content=? WHERE id=?",
+                (new_str, row_id),
+            )
+            rows_modified += 1
+            blocks_evicted += n_evicted
+            bytes_freed += delta
+
+        if rows_modified:
+            self.conn.commit()
+
+        return {
+            "rows_scanned": len(rows),
+            "rows_modified": rows_modified,
+            "blocks_evicted": blocks_evicted,
+            "bytes_freed": bytes_freed,
+            "rows_skipped_pinned": rows_skipped_pinned,
+        }
+
     def evict_thinking_blocks(
         self,
         *,
@@ -516,126 +667,72 @@ class Store:
                                     meaningful when skip_pinned=True).
           }
         """
-        # Selector validation: exactly one path. `all_rows` defaults to
-        # False so the explicit-True check is unambiguous; `keep_recent`
-        # and `older_than_seconds` use None as the unset sentinel so 0 is
-        # a legal value (semantically a no-op for both).
-        have_ids = ids is not None
-        have_keep = keep_recent is not None
-        have_all = all_rows is True
-        have_older = older_than_seconds is not None
-        n_selected = sum([have_ids, have_keep, have_all, have_older])
-        if n_selected != 1:
-            raise ValueError(
-                "exactly one of ids, keep_recent, all_rows, older_than_seconds required "
-                f"(got ids={have_ids}, keep_recent={have_keep}, "
-                f"all_rows={have_all}, older_than_seconds={have_older})"
-            )
+        target_ids, rows_skipped_pinned = self._resolve_strip_target_ids(
+            ids=ids,
+            keep_recent=keep_recent,
+            all_rows=all_rows,
+            older_than_seconds=older_than_seconds,
+            skip_pinned=skip_pinned,
+        )
+        return self._strip_blocks_by_type(target_ids, "thinking", rows_skipped_pinned)
 
-        # Resolve the target id set.
-        target_ids: list[int]
-        if have_ids:
-            try:
-                target_ids = [int(i) for i in ids]  # type: ignore[arg-type]
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"ids must be integers: {exc}") from exc
-        elif have_keep:
-            n = max(0, int(keep_recent))  # type: ignore[arg-type]
-            cur = self.conn.execute("SELECT id FROM turns ORDER BY id DESC")
-            all_ids_desc = [r[0] for r in cur.fetchall()]
-            # Skip the first N (most recent); strip the rest.
-            target_ids = all_ids_desc[n:]
-        elif have_older:
-            secs = int(older_than_seconds)  # type: ignore[arg-type]
-            if secs <= 0:
-                target_ids = []
-            else:
-                from datetime import timedelta
-                cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=secs)
-                cutoff_ts = cutoff_dt.isoformat()
-                cur = self.conn.execute(
-                    "SELECT id FROM turns WHERE ts < ? ORDER BY id ASC",
-                    (cutoff_ts,),
-                )
-                target_ids = [r[0] for r in cur.fetchall()]
-        else:  # have_all
-            cur = self.conn.execute("SELECT id FROM turns ORDER BY id ASC")
-            target_ids = [r[0] for r in cur.fetchall()]
+    def evict_tool_use_blocks(
+        self,
+        *,
+        ids: list[int] | None = None,
+        keep_recent: int | None = None,
+        all_rows: bool = False,
+        older_than_seconds: int | None = None,
+        skip_pinned: bool = True,
+    ) -> dict[str, int]:
+        """Strip 'tool_use' blocks from selected rolling-window rows.
 
-        # Apply pin filter to the resolved id set.
-        rows_skipped_pinned = 0
-        if skip_pinned and target_ids:
-            placeholders = ",".join("?" * len(target_ids))
-            cur = self.conn.execute(
-                f"SELECT id FROM turns "
-                f"WHERE id IN ({placeholders}) AND pin_label IS NOT NULL",
-                target_ids,
-            )
-            pinned_ids = {r[0] for r in cur.fetchall()}
-            if pinned_ids:
-                target_ids = [i for i in target_ids if i not in pinned_ids]
-                rows_skipped_pinned = len(pinned_ids)
+        Block-level surgery for the largest bloat category in long sessions.
+        Substrate's pre-surgery store had 78% of bytes in tool_use specs
+        (file paths, command strings, payload JSONs, edit before/after
+        strings) — far more than thinking. Stripping them is the highest-
+        impact context budget intervention available.
 
-        if not target_ids:
-            return {
-                "rows_scanned": 0,
-                "rows_modified": 0,
-                "blocks_evicted": 0,
-                "bytes_freed": 0,
-                "rows_skipped_pinned": rows_skipped_pinned,
-            }
+        Pairing safety note: in the standard SDK pattern, tool_use blocks
+        in assistant turns pair with tool_result blocks in the next user
+        turn. Anthropic's API rejects orphaned pairs in the LAST assistant
+        message (the one being continued). However, mnemara's agent ONLY
+        persists assistant_blocks — tool_result blocks from the SDK come
+        back via callback only and are never stored. So all tool_use blocks
+        in our store are already orphaned by design, and stripping them
+        from HISTORICAL rows is safe (the API tolerates orphaned tool_use
+        in non-final assistant messages because the model already
+        incorporated the result into its continuation text/thinking before
+        producing the stored assistant_blocks). The skip-empty-row rule
+        prevents accidentally leaving an empty content list on the most-
+        recent assistant turn if it happened to consist entirely of
+        tool_use blocks.
 
-        placeholders = ",".join("?" * len(target_ids))
-        rows = list(self.conn.execute(
-            f"SELECT id, content FROM turns WHERE id IN ({placeholders})",
-            target_ids,
-        ))
+        Selectors and behavior identical to evict_thinking_blocks.
 
-        rows_modified = 0
-        blocks_evicted = 0
-        bytes_freed = 0
-        for row_id, content_str in rows:
-            try:
-                blocks = json.loads(content_str)
-            except (json.JSONDecodeError, TypeError):
-                # Non-JSON content (legacy string turns) — nothing to strip.
-                continue
-            if not isinstance(blocks, list):
-                # JSON value but not a block list (e.g. marker rows store
-                # the marker name as a JSON string). Skip.
-                continue
-            new_blocks = [
-                b for b in blocks
-                if not (isinstance(b, dict) and b.get("type") == "thinking")
-            ]
-            n_evicted = len(blocks) - len(new_blocks)
-            if n_evicted == 0:
-                continue
-            if not new_blocks:
-                # Don't leave a row with empty content — Anthropic's API
-                # rejects messages with empty content lists. Agent can
-                # evict_ids this row separately if they want it gone.
-                continue
-            new_str = json.dumps(new_blocks)
-            delta = len(content_str) - len(new_str)
-            self.conn.execute(
-                "UPDATE turns SET content=? WHERE id=?",
-                (new_str, row_id),
-            )
-            rows_modified += 1
-            blocks_evicted += n_evicted
-            bytes_freed += delta
-
-        if rows_modified:
-            self.conn.commit()
-
-        return {
-            "rows_scanned": len(rows),
-            "rows_modified": rows_modified,
-            "blocks_evicted": blocks_evicted,
-            "bytes_freed": bytes_freed,
-            "rows_skipped_pinned": rows_skipped_pinned,
-        }
+        Trade-offs to be aware of:
+          - High byte savings: tool_use blocks average ~870 bytes each
+            (vs. ~32 for thinking signature stubs).
+          - Audit trail loss: stripping a tool_use block removes the
+            model's record of what it called. The actual EFFECT (the
+            commit, the file change, etc.) lives in git or wherever the
+            tool wrote; only the CALL itself is gone from the rolling
+            window. For most work this is fine; for sessions where the
+            agent needs to remember "did I already call X?" within the
+            window, prefer keep_recent or pinning specific rows.
+          - The agent may want to write_memory(category='tool_audit')
+            with a one-line summary of significant tool calls before
+            evicting, the same opt-in pattern as thought_summary for
+            thinking-block surgery.
+        """
+        target_ids, rows_skipped_pinned = self._resolve_strip_target_ids(
+            ids=ids,
+            keep_recent=keep_recent,
+            all_rows=all_rows,
+            older_than_seconds=older_than_seconds,
+            skip_pinned=skip_pinned,
+        )
+        return self._strip_blocks_by_type(target_ids, "tool_use", rows_skipped_pinned)
 
     def total_tokens(self) -> tuple[int, int]:
         """Return (estimated_stored_tokens, sum_output_tokens).
