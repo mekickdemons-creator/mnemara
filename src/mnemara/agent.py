@@ -95,6 +95,7 @@ _MARK_SEGMENT_TOOL = "mcp__mnemara_memory__mark_segment"
 _EVICT_SINCE_TOOL = "mcp__mnemara_memory__evict_since"
 _EVICT_THINKING_BLOCKS_TOOL = "mcp__mnemara_memory__evict_thinking_blocks"
 _EVICT_TOOL_USE_BLOCKS_TOOL = "mcp__mnemara_memory__evict_tool_use_blocks"
+_EVICT_WRITE_PAIRS_TOOL = "mcp__mnemara_memory__evict_write_pairs"
 _EVICT_OLDER_THAN_TOOL = "mcp__mnemara_memory__evict_older_than"
 _PIN_ROW_TOOL = "mcp__mnemara_memory__pin_row"
 _UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
@@ -212,12 +213,37 @@ class AgentSession:
         total_out = result["tokens_out"]
 
         # Persist final assistant turn (full block list) and evict.
-        self.store.append_turn(
+        assistant_row_id = self.store.append_turn(
             "assistant",
             assistant_blocks or [{"type": "text", "text": ""}],
             tokens_in=total_in,
             tokens_out=total_out,
         )
+        # Auto-evict-after-write: if the toggle is on AND the just-persisted
+        # turn contains any Edit/Write/MultiEdit/NotebookEdit tool_use, stub
+        # their bulky body content (and matching prior Read specs for the
+        # same files). The block structure stays — audit trail intact, just
+        # the kilobytes-per-block payloads collapse to {file_path, _evicted:
+        # true}. Pinned rows skipped. Off by default; opt-in per panel.
+        if getattr(self.cfg, "auto_evict_after_write", False):
+            try:
+                pair_result = self.store.evict_write_pairs(
+                    only_in_rows=[assistant_row_id],
+                    skip_pinned=True,
+                )
+                if pair_result.get("rows_modified", 0) > 0:
+                    log(
+                        "auto_evict_pairs",
+                        writes=pair_result["writes_stubbed"],
+                        reads=pair_result["reads_stubbed"],
+                        rows=pair_result["rows_modified"],
+                        bytes_freed=pair_result["bytes_freed"],
+                        files=pair_result["files_seen"],
+                    )
+            except Exception as exc:
+                # Eviction failures must never crash a turn; audit-trail
+                # eviction is opportunistic.
+                log("auto_evict_pairs_error", error=str(exc))
         evicted = self.store.evict(self.cfg.max_window_turns, self.cfg.max_window_tokens)
         if evicted:
             log("eviction", deleted=evicted)
@@ -1144,6 +1170,65 @@ class AgentSession:
             }
 
         @tool(
+            "evict_write_pairs",
+            "Stub bulky body content from Edit/Write/MultiEdit/NotebookEdit "
+            "tool_use blocks (and matching prior Read tool_use blocks for "
+            "the same file_path) in the rolling window. UNLIKE block-type "
+            "surgery (evict_thinking_blocks, evict_tool_use_blocks), this "
+            "PRESERVES the block — the model still sees 'I called Edit on "
+            "/foo/bar.py' — but collapses the input dict to "
+            "{file_path, _evicted: true}, dropping the kilobytes-per-block "
+            "old_string/new_string/content/edits payloads. The actual "
+            "change persists in git or wherever the tool wrote; only the "
+            "in-context audit body goes. "
+            "When cfg.auto_evict_after_write=true this runs automatically "
+            "after each turn that did writes, scoped to that turn's "
+            "assistant row. Calling this tool manually scans ALL rows by "
+            "default (or restrict to specific rows via only_in_rows). "
+            "Pinned rows are skipped. "
+            "Idempotent: already-stubbed inputs keep their _evicted marker. "
+            "Returns {writes_stubbed, reads_stubbed, rows_modified, "
+            "bytes_freed, files_seen, rows_skipped_pinned}.",
+            {
+                "only_in_rows": str,
+                "skip_pinned": str,
+            },
+        )
+        async def _evict_write_pairs_tool(args: dict[str, Any]) -> dict[str, Any]:
+            raw_only = (args.get("only_in_rows") or "").strip()
+            raw_skip = (args.get("skip_pinned") or "true").strip().lower()
+            kw: dict[str, Any] = {
+                "skip_pinned": raw_skip not in ("false", "0", "no", "off"),
+            }
+            if raw_only:
+                try:
+                    if raw_only.startswith("["):
+                        parsed = json.loads(raw_only)
+                        only_ids = [int(x) for x in parsed]
+                    else:
+                        only_ids = [
+                            int(x.strip())
+                            for x in raw_only.replace(",", " ").split()
+                            if x.strip()
+                        ]
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                    return {
+                        "content": [{"type": "text", "text": f"parse error: {exc}"}],
+                        "is_error": True,
+                    }
+                kw["only_in_rows"] = only_ids
+            try:
+                result = session.store.evict_write_pairs(**kw)
+            except (ValueError, TypeError) as exc:
+                return {
+                    "content": [{"type": "text", "text": str(exc)}],
+                    "is_error": True,
+                }
+            return {
+                "content": [{"type": "text", "text": json.dumps(result)}]
+            }
+
+        @tool(
             "pin_row",
             "Pin a rolling-window row with a free-form category label. Pinned "
             "rows are preserved against PROACTIVE eviction (evict_older_than, "
@@ -1319,6 +1404,7 @@ class AgentSession:
             _evict_since_tool,
             _evict_thinking_blocks_tool,
             _evict_tool_use_blocks_tool,
+            _evict_write_pairs_tool,
             _pin_row_tool,
             _unpin_row_tool,
             _list_pinned_tool,
@@ -1366,6 +1452,7 @@ class AgentSession:
             _EVICT_SINCE_TOOL,
             _EVICT_THINKING_BLOCKS_TOOL,
             _EVICT_TOOL_USE_BLOCKS_TOOL,
+            _EVICT_WRITE_PAIRS_TOOL,
             _EVICT_OLDER_THAN_TOOL,
             _PIN_ROW_TOOL,
             _UNPIN_ROW_TOOL,
@@ -1668,6 +1755,8 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "EvictThinkingBlocks", ""
     if tool_name == _EVICT_TOOL_USE_BLOCKS_TOOL or tool_name.endswith("__evict_tool_use_blocks"):
         return "EvictToolUseBlocks", ""
+    if tool_name == _EVICT_WRITE_PAIRS_TOOL or tool_name.endswith("__evict_write_pairs"):
+        return "EvictWritePairs", ""
     if tool_name == _EVICT_OLDER_THAN_TOOL or tool_name.endswith("__evict_older_than"):
         return "EvictOlderThan", ""
     if tool_name == _PIN_ROW_TOOL or tool_name.endswith("__pin_row"):

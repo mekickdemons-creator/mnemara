@@ -107,6 +107,20 @@ class Config:
     # prompted. See tui.py:_check_inbox_ambient for the loop guard
     # (skips payload_type in {ack, ack_final, reply_final}).
     inbox_auto_respond: bool = False
+    # v0.3.2 — auto-evict-after-write context discipline
+    # When True, after each turn that contained Edit/Write/MultiEdit/
+    # NotebookEdit tool_use blocks, mnemara stubs the bulky body content
+    # of those tool_use specs (old_string/new_string/content/edits arrays)
+    # AND any prior Read tool_use spec for the same file_path. The block
+    # itself is preserved (audit-trail intact: "I edited /foo/bar.py")
+    # but the bulky strings — often 1-5KB per Edit, full file contents on
+    # Write — collapse to a tiny stub like
+    # {"file_path": "/foo/bar.py", "_evicted": true}.
+    # Pinned rows are skipped. The actual change persists in git or
+    # wherever the tool wrote; only the in-context audit body goes.
+    # Off by default; opt-in per panel. Same agent-decides-primitive-
+    # stays-clean pattern as inbox_auto_respond.
+    auto_evict_after_write: bool = False
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7
@@ -144,6 +158,7 @@ class Config:
                 ToolPolicy(tool="EvictThinkingBlocks", mode="allow"),
                 ToolPolicy(tool="EvictToolUseBlocks", mode="allow"),
                 ToolPolicy(tool="EvictOlderThan", mode="allow"),
+                ToolPolicy(tool="EvictWritePairs", mode="allow"),
                 ToolPolicy(tool="PinRow", mode="allow"),
                 ToolPolicy(tool="UnpinRow", mode="allow"),
                 ToolPolicy(tool="ListPinned", mode="allow"),
@@ -177,6 +192,7 @@ class Config:
             architect_db_path=str(d.get("architect_db_path", "") or ""),
             inbox_auto_surface=bool(d.get("inbox_auto_surface", True)),
             inbox_auto_respond=bool(d.get("inbox_auto_respond", False)),
+            auto_evict_after_write=bool(d.get("auto_evict_after_write", False)),
             graph_enabled=bool(d.get("graph_enabled", True)),
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),

@@ -3831,3 +3831,482 @@ def test_eviction_stats_reset_on_new_store_instance(home):
         "bytes_freed": 0,
     }
     store2.close()
+
+
+# ----------------------------------------------------------------------
+# evict_write_pairs — auto-evict-after-write surgery
+# ----------------------------------------------------------------------
+
+def _big(n: int) -> str:
+    """Helper: a large filler string to make bytes_freed nonzero in tests."""
+    return "x" * n
+
+
+def test_evict_write_pairs_stubs_edit_input(home):
+    """Edit tool_use input gets stubbed to {file_path, _evicted: true}."""
+    from mnemara.store import Store
+
+    store = Store("ewp_edit_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {
+                "type": "tool_use",
+                "id": "tu1",
+                "name": "Edit",
+                "input": {
+                    "file_path": "/foo/bar.py",
+                    "old_string": _big(2000),
+                    "new_string": _big(2500),
+                },
+            },
+            {"type": "text", "text": "edited."},
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 1
+    assert result["reads_stubbed"] == 0
+    assert result["rows_modified"] == 1
+    assert result["files_seen"] == 1
+    assert result["bytes_freed"] > 4000  # at least the bulky strings
+
+    rows = store.window()
+    blocks = rows[0]["content"]
+    edit_block = next(b for b in blocks if b["type"] == "tool_use")
+    assert edit_block["name"] == "Edit"
+    assert edit_block["input"] == {"file_path": "/foo/bar.py", "_evicted": True}
+    # Other blocks preserved verbatim.
+    text_block = next(b for b in blocks if b["type"] == "text")
+    assert text_block["text"] == "edited."
+    store.close()
+
+
+def test_evict_write_pairs_stubs_write_content(home):
+    """Write tool's `content` field is stripped; file_path preserved."""
+    from mnemara.store import Store
+
+    store = Store("ewp_write_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {
+                "type": "tool_use",
+                "id": "tu1",
+                "name": "Write",
+                "input": {
+                    "file_path": "/new/file.py",
+                    "content": _big(5000),
+                },
+            },
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 1
+    assert result["bytes_freed"] > 4000
+
+    blocks = store.window()[0]["content"]
+    inp = blocks[0]["input"]
+    assert inp == {"file_path": "/new/file.py", "_evicted": True}
+    assert "content" not in inp
+    store.close()
+
+
+def test_evict_write_pairs_stubs_multiedit(home):
+    """MultiEdit's `edits` array is stripped; file_path preserved."""
+    from mnemara.store import Store
+
+    store = Store("ewp_multi_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {
+                "type": "tool_use",
+                "id": "tu1",
+                "name": "MultiEdit",
+                "input": {
+                    "file_path": "/multi.py",
+                    "edits": [
+                        {"old_string": _big(1000), "new_string": _big(1100)},
+                        {"old_string": _big(800), "new_string": _big(900)},
+                    ],
+                },
+            },
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 1
+    blocks = store.window()[0]["content"]
+    assert blocks[0]["input"] == {"file_path": "/multi.py", "_evicted": True}
+    store.close()
+
+
+def test_evict_write_pairs_stubs_matching_prior_read(home):
+    """Read for /foo before Edit on /foo gets stubbed by pair scan."""
+    from mnemara.store import Store
+
+    store = Store("ewp_pair_t")
+    # Row 1: Read /foo
+    store.append_turn(
+        "assistant",
+        [
+            {
+                "type": "tool_use",
+                "id": "r1",
+                "name": "Read",
+                "input": {"file_path": "/foo/bar.py"},
+            },
+        ],
+    )
+    # Row 2: Edit /foo with bulky payload
+    store.append_turn(
+        "assistant",
+        [
+            {
+                "type": "tool_use",
+                "id": "e1",
+                "name": "Edit",
+                "input": {
+                    "file_path": "/foo/bar.py",
+                    "old_string": _big(2000),
+                    "new_string": _big(2000),
+                },
+            },
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 1
+    assert result["reads_stubbed"] == 1
+    assert result["rows_modified"] == 2
+
+    rows = store.window()
+    # Read got stubbed
+    read_inp = rows[0]["content"][0]["input"]
+    assert read_inp == {"file_path": "/foo/bar.py", "_evicted": True}
+    # Edit got stubbed
+    edit_inp = rows[1]["content"][0]["input"]
+    assert edit_inp == {"file_path": "/foo/bar.py", "_evicted": True}
+    store.close()
+
+
+def test_evict_write_pairs_does_not_touch_unrelated_reads(home):
+    """Reads for OTHER files are left alone."""
+    from mnemara.store import Store
+
+    store = Store("ewp_unrelated_t")
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "r1", "name": "Read",
+             "input": {"file_path": "/keep_me.py"}},
+        ],
+    )
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/different.py",
+                       "old_string": _big(1000), "new_string": _big(1000)}},
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 1
+    assert result["reads_stubbed"] == 0  # Read was for a different file
+
+    rows = store.window()
+    read_inp = rows[0]["content"][0]["input"]
+    assert read_inp == {"file_path": "/keep_me.py"}  # untouched
+    store.close()
+
+
+def test_evict_write_pairs_does_not_touch_later_reads(home):
+    """A Read AFTER the Edit is left alone (not a stale-read pairing)."""
+    from mnemara.store import Store
+
+    store = Store("ewp_later_t")
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/foo.py",
+                       "old_string": _big(1000), "new_string": _big(1000)}},
+        ],
+    )
+    store.append_turn(
+        "assistant",
+        [
+            # This Read happened AFTER the Edit; it's the post-edit re-read,
+            # not a stale prior read. Don't stub it.
+            {"type": "tool_use", "id": "r1", "name": "Read",
+             "input": {"file_path": "/foo.py"}},
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 1
+    assert result["reads_stubbed"] == 0
+
+    rows = store.window()
+    later_read = rows[1]["content"][0]["input"]
+    assert later_read == {"file_path": "/foo.py"}  # preserved
+    store.close()
+
+
+def test_evict_write_pairs_only_in_rows_scopes_write_scan(home):
+    """only_in_rows=[N] limits the write scan to row N (auto-evict pattern)."""
+    from mnemara.store import Store
+
+    store = Store("ewp_scope_t")
+    rid1 = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/a.py",
+                       "old_string": _big(500), "new_string": _big(500)}},
+        ],
+    )
+    rid2 = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e2", "name": "Edit",
+             "input": {"file_path": "/b.py",
+                       "old_string": _big(500), "new_string": _big(500)}},
+        ],
+    )
+    # Scope to row 2 only — row 1's Edit should remain bulky.
+    result = store.evict_write_pairs(only_in_rows=[rid2])
+    assert result["writes_stubbed"] == 1
+    assert result["files_seen"] == 1
+
+    rows = store.window()
+    # Row 1 untouched
+    assert "old_string" in rows[0]["content"][0]["input"]
+    # Row 2 stubbed
+    assert rows[1]["content"][0]["input"] == {"file_path": "/b.py", "_evicted": True}
+    store.close()
+
+
+def test_evict_write_pairs_skip_pinned_default(home):
+    """Pinned rows are skipped by default; their writes/reads stay bulky."""
+    from mnemara.store import Store
+
+    store = Store("ewp_pinned_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/foo.py",
+                       "old_string": _big(2000), "new_string": _big(2000)}},
+        ],
+    )
+    store.pin_row(rid, "deliberate")
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 0
+    assert result["rows_skipped_pinned"] == 1
+
+    rows = store.window()
+    # Edit body still has its bulky strings.
+    assert "old_string" in rows[0]["content"][0]["input"]
+    store.close()
+
+
+def test_evict_write_pairs_skip_pinned_false_strips_anyway(home):
+    """skip_pinned=False overrides pin protection."""
+    from mnemara.store import Store
+
+    store = Store("ewp_force_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/foo.py",
+                       "old_string": _big(2000), "new_string": _big(2000)}},
+        ],
+    )
+    store.pin_row(rid, "deliberate")
+    result = store.evict_write_pairs(skip_pinned=False)
+    assert result["writes_stubbed"] == 1
+
+    rows = store.window()
+    assert rows[0]["content"][0]["input"] == {"file_path": "/foo.py", "_evicted": True}
+    store.close()
+
+
+def test_evict_write_pairs_idempotent(home):
+    """Running twice on the same data — second run stubs nothing."""
+    from mnemara.store import Store
+
+    store = Store("ewp_idem_t")
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/foo.py",
+                       "old_string": _big(2000), "new_string": _big(2000)}},
+        ],
+    )
+    r1 = store.evict_write_pairs()
+    assert r1["writes_stubbed"] == 1
+
+    r2 = store.evict_write_pairs()
+    assert r2["writes_stubbed"] == 0
+    assert r2["reads_stubbed"] == 0
+    assert r2["rows_modified"] == 0
+    store.close()
+
+
+def test_evict_write_pairs_no_writes_no_op(home):
+    """If no rows contain Edit/Write/MultiEdit, function reports zeros."""
+    from mnemara.store import Store
+
+    store = Store("ewp_empty_t")
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "text", "text": "no tool calls here"},
+            {"type": "tool_use", "id": "r1", "name": "Read",
+             "input": {"file_path": "/foo.py"}},
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 0
+    assert result["reads_stubbed"] == 0
+    assert result["rows_modified"] == 0
+    # The standalone Read is not stubbed because there's no matching Write.
+    rows = store.window()
+    read_block = next(
+        b for b in rows[0]["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_use"
+    )
+    assert read_block["input"] == {"file_path": "/foo.py"}
+    store.close()
+
+
+def test_evict_write_pairs_bumps_eviction_stats(home):
+    """Stubbing increments blocks_evicted + bytes_freed in session stats."""
+    from mnemara.store import Store
+
+    store = Store("ewp_stats_t")
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/foo.py",
+                       "old_string": _big(2000), "new_string": _big(2000)}},
+        ],
+    )
+    s_before = store.get_eviction_stats()
+    assert s_before["blocks_evicted"] == 0
+    result = store.evict_write_pairs()
+    s_after = store.get_eviction_stats()
+    assert s_after["blocks_evicted"] == 1  # 1 write stubbed
+    assert s_after["bytes_freed"] == result["bytes_freed"]
+    assert s_after["rows_evicted"] == 0  # no rows dropped
+    store.close()
+
+
+def test_evict_write_pairs_only_in_rows_empty_returns_zeros(home):
+    """only_in_rows=[] short-circuits to a zero report."""
+    from mnemara.store import Store
+
+    store = Store("ewp_emptyscope_t")
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/foo.py",
+                       "old_string": _big(2000), "new_string": _big(2000)}},
+        ],
+    )
+    result = store.evict_write_pairs(only_in_rows=[])
+    assert result["writes_stubbed"] == 0
+    assert result["rows_modified"] == 0
+    store.close()
+
+
+def test_evict_write_pairs_handles_tool_use_without_file_path(home):
+    """Tool_use of a write tool with no file_path: stub still strips bulky fields, no file recorded."""
+    from mnemara.store import Store
+
+    store = Store("ewp_nofp_t")
+    store.append_turn(
+        "assistant",
+        [
+            # Edit without file_path (degenerate, but agent might emit it)
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"old_string": _big(2000), "new_string": _big(2000)}},
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 1
+    assert result["files_seen"] == 0  # no file_path to record
+
+    blocks = store.window()[0]["content"]
+    assert blocks[0]["input"] == {"_evicted": True}
+    store.close()
+
+
+def test_evict_write_pairs_preserves_non_write_tool_use(home):
+    """Bash/Grep/etc. tool_use blocks in the same row are NOT stubbed."""
+    from mnemara.store import Store
+
+    store = Store("ewp_mixed_t")
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "tool_use", "id": "b1", "name": "Bash",
+             "input": {"command": "ls -la"}},
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/foo.py",
+                       "old_string": _big(2000), "new_string": _big(2000)}},
+        ],
+    )
+    result = store.evict_write_pairs()
+    assert result["writes_stubbed"] == 1
+
+    blocks = store.window()[0]["content"]
+    bash_block = next(b for b in blocks if b.get("name") == "Bash")
+    assert bash_block["input"] == {"command": "ls -la"}  # untouched
+
+    edit_block = next(b for b in blocks if b.get("name") == "Edit")
+    assert edit_block["input"] == {"file_path": "/foo.py", "_evicted": True}
+    store.close()
+
+
+# ----------------------------------------------------------------------
+# Config.auto_evict_after_write toggle
+# ----------------------------------------------------------------------
+
+def test_config_auto_evict_after_write_default_false():
+    from mnemara.config import Config
+
+    cfg = Config()
+    assert cfg.auto_evict_after_write is False
+
+
+def test_config_auto_evict_after_write_round_trips_through_dict():
+    from mnemara.config import Config
+
+    cfg = Config()
+    cfg.auto_evict_after_write = True
+    d = cfg.to_dict()
+    assert d["auto_evict_after_write"] is True
+
+    cfg2 = Config.from_dict(d)
+    assert cfg2.auto_evict_after_write is True
+
+
+def test_config_auto_evict_after_write_missing_field_defaults_false():
+    """Pre-existing config.json files without the field load as False."""
+    from mnemara.config import Config
+
+    minimal = {"role_doc_path": "", "model": "claude-opus-4-5"}
+    cfg = Config.from_dict(minimal)
+    assert cfg.auto_evict_after_write is False
+
+
+def test_config_default_includes_evict_write_pairs_policy():
+    """Fresh instances get EvictWritePairs allowlisted by default."""
+    from mnemara.config import Config
+
+    cfg = Config.default()
+    tool_names = {t.tool for t in cfg.allowed_tools}
+    assert "EvictWritePairs" in tool_names

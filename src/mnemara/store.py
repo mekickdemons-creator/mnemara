@@ -790,6 +790,317 @@ class Store:
         )
         return self._strip_blocks_by_type(target_ids, "tool_use", rows_skipped_pinned)
 
+    # ------------------------------------------- read/write pair eviction
+    # Distinct surgery shape from evict_thinking_blocks / evict_tool_use_blocks:
+    # those strip ENTIRE blocks of a given type. evict_write_pairs preserves
+    # the block but stubs only its `input` field down to a small audit-trail
+    # ({file_path, _evicted: true}), keeping the model's record that "I
+    # called Edit on /foo/bar.py" while dropping the bulky old_string /
+    # new_string / content payloads. Designed to run automatically after
+    # each turn that did writes (cfg.auto_evict_after_write).
+    #
+    # The "pair" semantics: when an Edit/Write happens for /foo/bar.py,
+    # any prior Read tool_use for the same file is also stubbed. Read
+    # specs are usually small (just `file_path`), so this mostly just
+    # marks them as superseded for audit clarity. The major savings come
+    # from the Edit/Write side.
+
+    # Tool-name conventions. Anthropic's built-in toolset uses these
+    # names; mnemara's MCP-spawned tools never collide because they're
+    # prefixed with mcp__. NotebookEdit uses 'edits' or 'cell_source'
+    # depending on cell type; we strip both. MultiEdit stores 'edits'
+    # (a list of dicts with old_string/new_string per edit).
+    _WRITE_TOOL_NAMES: frozenset[str] = frozenset({
+        "Edit", "Write", "MultiEdit", "NotebookEdit",
+    })
+    _READ_TOOL_NAMES: frozenset[str] = frozenset({"Read"})
+    # Field names within tool_use.input that hold bulky body content.
+    # Stripping these (replacing with `_evicted: true`) preserves the
+    # block structure + the audit trail (file_path stays) while freeing
+    # the kilobytes-per-block bloat.
+    _BULKY_INPUT_FIELDS: frozenset[str] = frozenset({
+        "content",      # Write
+        "old_string",   # Edit, MultiEdit (per-edit)
+        "new_string",   # Edit, MultiEdit (per-edit)
+        "edits",        # MultiEdit (entire list)
+        "cell_source",  # NotebookEdit
+        "new_source",   # NotebookEdit
+    })
+
+    def evict_write_pairs(
+        self,
+        *,
+        only_in_rows: list[int] | None = None,
+        skip_pinned: bool = True,
+    ) -> dict[str, int]:
+        """Stub bulky body content from Edit/Write tool_use blocks + matching prior Reads.
+
+        For each tool_use block in scope whose `name` is one of
+        Edit/Write/MultiEdit/NotebookEdit, strip the bulky body fields
+        (old_string, new_string, content, edits, cell_source, new_source)
+        from its `input` dict, replacing them with `_evicted: true`.
+        The `file_path` is preserved so the audit trail says "I edited
+        /foo/bar.py" without holding the kilobytes of before/after.
+
+        For each unique file_path collected from the writes, scan rows
+        OLDER than the writing row for prior Read tool_use blocks
+        targeting the same file_path, and stub them the same way (the
+        stale read content is no longer current after the edit; the
+        audit trail "I read /foo/bar.py" stays intact).
+
+        Args:
+          only_in_rows: if provided, restrict the WRITE scan to these
+            rows. Read scan still searches ALL rows older than each
+            write. Used by auto-evict-after-write to scope to the
+            current-turn assistant row. None = scan all rows for writes.
+          skip_pinned: if True (default), pinned rows are excluded from
+            both write and read scans. Pin protection covers the
+            advisory-not-locked semantics consistent with other eviction.
+
+        Returns:
+          {
+            "writes_stubbed":   tool_use blocks stubbed in write tools,
+            "reads_stubbed":    tool_use blocks stubbed in read tools,
+            "rows_modified":    distinct rows whose content was rewritten,
+            "bytes_freed":      sum of (old_content_len - new_content_len)
+                                 across modified rows,
+            "files_seen":       distinct file_paths processed,
+            "rows_skipped_pinned": rows that matched the scope but were
+                                 skipped because pinned,
+          }
+
+        Idempotent: re-running stubs nothing new (already-stubbed inputs
+        keep their `_evicted: true` marker; the bulky fields are gone).
+        """
+        # Resolve the row set to scan for WRITES (the trigger source).
+        if only_in_rows is not None:
+            try:
+                write_scan_ids = [int(i) for i in only_in_rows]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"only_in_rows must be integers: {exc}") from exc
+            if not write_scan_ids:
+                return {
+                    "writes_stubbed": 0, "reads_stubbed": 0, "rows_modified": 0,
+                    "bytes_freed": 0, "files_seen": 0, "rows_skipped_pinned": 0,
+                }
+            placeholders = ",".join("?" * len(write_scan_ids))
+            cur = self.conn.execute(
+                f"SELECT id, content, pin_label FROM turns "
+                f"WHERE id IN ({placeholders}) AND role='assistant' "
+                f"ORDER BY id ASC",
+                write_scan_ids,
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT id, content, pin_label FROM turns "
+                "WHERE role='assistant' ORDER BY id ASC"
+            )
+
+        # Per-row mutation accumulator: row_id -> (orig_content_str, new_blocks)
+        # We rewrite each row at most once, accumulating both write-side and
+        # read-side stubs into a single UPDATE so bytes_freed is calculated
+        # against the ORIGINAL content. This keeps the row-modification
+        # count honest (a row that has both a Write and a stale Read
+        # counts as one row_modified, not two).
+        pending: dict[int, dict[str, Any]] = {}
+        # (file_path, max_write_row_id) so we know how far back to scan
+        # for stale Reads. A Read at row 50 paired with a Write at row 80
+        # gets stubbed; a Read at row 90 (after the Write) doesn't.
+        files_max_write_id: dict[str, int] = {}
+        rows_skipped_pinned = 0
+
+        for row_id, content_str, pin_label in cur.fetchall():
+            if skip_pinned and pin_label is not None:
+                rows_skipped_pinned += 1
+                continue
+            try:
+                blocks = json.loads(content_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(blocks, list):
+                continue
+            new_blocks, n_stubbed, files_seen_in_row = self._stub_write_blocks(blocks)
+            if n_stubbed > 0:
+                pending[row_id] = {
+                    "orig": content_str,
+                    "blocks": new_blocks,
+                    "writes": n_stubbed,
+                    "reads": 0,
+                }
+                for fp in files_seen_in_row:
+                    prior = files_max_write_id.get(fp, -1)
+                    if row_id > prior:
+                        files_max_write_id[fp] = row_id
+
+        # If no writes found in scope, nothing to do.
+        if not pending:
+            return {
+                "writes_stubbed": 0, "reads_stubbed": 0, "rows_modified": 0,
+                "bytes_freed": 0, "files_seen": 0,
+                "rows_skipped_pinned": rows_skipped_pinned,
+            }
+
+        # Read scan: for each (file_path, max_write_id), find prior Read
+        # tool_use blocks for that file_path in rows older than the write.
+        # Read scan covers ALL rows (not just only_in_rows), because stale
+        # Reads naturally live in earlier turns.
+        for file_path, max_write_id in files_max_write_id.items():
+            cur = self.conn.execute(
+                "SELECT id, content, pin_label FROM turns "
+                "WHERE id < ? AND role='assistant' ORDER BY id ASC",
+                (max_write_id,),
+            )
+            for row_id, content_str, pin_label in cur.fetchall():
+                if skip_pinned and pin_label is not None:
+                    # Counted in rows_skipped_pinned only if we WOULD have
+                    # otherwise scanned + modified the row. We don't double-
+                    # count rows already counted in the write scan.
+                    continue
+                # Use the already-pending blocks if this row has them; else
+                # parse fresh from disk.
+                if row_id in pending:
+                    blocks = pending[row_id]["blocks"]
+                    orig = pending[row_id]["orig"]
+                else:
+                    try:
+                        blocks = json.loads(content_str)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(blocks, list):
+                        continue
+                    orig = content_str
+                new_blocks, n_stubbed = self._stub_read_blocks_for_file(
+                    blocks, file_path
+                )
+                if n_stubbed > 0:
+                    if row_id in pending:
+                        pending[row_id]["blocks"] = new_blocks
+                        pending[row_id]["reads"] += n_stubbed
+                    else:
+                        pending[row_id] = {
+                            "orig": orig,
+                            "blocks": new_blocks,
+                            "writes": 0,
+                            "reads": n_stubbed,
+                        }
+
+        # Single UPDATE per row, calculating bytes_freed against the
+        # ORIGINAL content string captured at the start of pending entry.
+        rows_modified = 0
+        writes_stubbed = 0
+        reads_stubbed = 0
+        bytes_freed = 0
+        for row_id, entry in pending.items():
+            new_str = json.dumps(entry["blocks"])
+            delta = len(entry["orig"]) - len(new_str)
+            self.conn.execute(
+                "UPDATE turns SET content=? WHERE id=?",
+                (new_str, row_id),
+            )
+            rows_modified += 1
+            writes_stubbed += entry["writes"]
+            reads_stubbed += entry["reads"]
+            bytes_freed += delta
+
+        if rows_modified:
+            self.conn.commit()
+            self._bump_eviction_stats(
+                blocks=writes_stubbed + reads_stubbed,
+                bytes_=bytes_freed,
+            )
+
+        return {
+            "writes_stubbed": writes_stubbed,
+            "reads_stubbed": reads_stubbed,
+            "rows_modified": rows_modified,
+            "bytes_freed": bytes_freed,
+            "files_seen": len(files_max_write_id),
+            "rows_skipped_pinned": rows_skipped_pinned,
+        }
+
+    def _stub_write_blocks(
+        self, blocks: list[Any]
+    ) -> tuple[list[Any], int, set[str]]:
+        """Stub Edit/Write/MultiEdit/NotebookEdit tool_use blocks in-place.
+
+        Returns (new_blocks, count_stubbed, files_seen).
+        Already-stubbed blocks (those whose input has '_evicted': True)
+        are skipped to keep the operation idempotent.
+        """
+        new_blocks: list[Any] = []
+        n_stubbed = 0
+        files_seen: set[str] = set()
+        for b in blocks:
+            if not (
+                isinstance(b, dict)
+                and b.get("type") == "tool_use"
+                and b.get("name") in self._WRITE_TOOL_NAMES
+            ):
+                new_blocks.append(b)
+                continue
+            inp = b.get("input")
+            if not isinstance(inp, dict):
+                new_blocks.append(b)
+                continue
+            if inp.get("_evicted") is True:
+                # Already stubbed; idempotent skip. Still record the
+                # file_path for read-pair scan even on re-runs.
+                fp = inp.get("file_path") or inp.get("notebook_path")
+                if isinstance(fp, str) and fp:
+                    files_seen.add(fp)
+                new_blocks.append(b)
+                continue
+            # Build a stubbed input preserving file_path + audit marker.
+            fp = inp.get("file_path") or inp.get("notebook_path")
+            stub_input: dict[str, Any] = {"_evicted": True}
+            if isinstance(fp, str) and fp:
+                stub_input["file_path"] = fp
+                files_seen.add(fp)
+            new_b = dict(b)
+            new_b["input"] = stub_input
+            new_blocks.append(new_b)
+            n_stubbed += 1
+        return new_blocks, n_stubbed, files_seen
+
+    def _stub_read_blocks_for_file(
+        self, blocks: list[Any], file_path: str
+    ) -> tuple[list[Any], int]:
+        """Stub Read tool_use blocks targeting `file_path` in-place.
+
+        Returns (new_blocks, count_stubbed). Reads for OTHER files in
+        the same row are left untouched. Already-stubbed reads are
+        skipped (idempotent).
+        """
+        new_blocks: list[Any] = []
+        n_stubbed = 0
+        for b in blocks:
+            if not (
+                isinstance(b, dict)
+                and b.get("type") == "tool_use"
+                and b.get("name") in self._READ_TOOL_NAMES
+            ):
+                new_blocks.append(b)
+                continue
+            inp = b.get("input")
+            if not isinstance(inp, dict):
+                new_blocks.append(b)
+                continue
+            if inp.get("file_path") != file_path:
+                new_blocks.append(b)
+                continue
+            if inp.get("_evicted") is True:
+                new_blocks.append(b)
+                continue
+            stub_input: dict[str, Any] = {
+                "file_path": file_path,
+                "_evicted": True,
+            }
+            new_b = dict(b)
+            new_b["input"] = stub_input
+            new_blocks.append(new_b)
+            n_stubbed += 1
+        return new_blocks, n_stubbed
+
     def total_tokens(self) -> tuple[int, int]:
         """Return (estimated_stored_tokens, sum_output_tokens).
 

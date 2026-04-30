@@ -955,6 +955,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /evict thinking older 10m  strip thinking from rows older than duration\n"
                 "  /evict tools all        strip tool_use blocks (HIGH IMPACT — ~80% of bytes)\n"
                 "  /evict tools keep N     strip tool_use from all but the last N rows\n"
+                "  /evict pairs            stub Edit/Write/Read bodies (preserves audit trail)\n"
+                "  /auto-evict on|off|status   toggle auto-evict-after-write for this session\n"
                 "  /pin <id> [label]       pin a row to preserve against proactive eviction\n"
                 "  /unpin <id>             remove the pin from a row\n"
                 "  /pinned [label]         list pinned rows (optionally filter by label)\n"
@@ -1093,6 +1095,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd == "/pinned":
             self._slash_pinned(arg, chat)
+            return
+
+        if cmd == "/auto-evict":
+            self._slash_auto_evict(arg, chat)
             return
 
         chat.write(f"[red]unknown command:[/red] {cmd}  (try /help)")
@@ -1433,6 +1439,42 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 f"[yellow]{r['pin_label']}[/yellow]  {preview}"
             )
 
+    def _slash_auto_evict(self, arg: str, chat: "RichLog") -> None:
+        """`/auto-evict on|off|status` — toggle auto-evict-after-write.
+
+        When ON, after each turn that did Edit/Write/MultiEdit/NotebookEdit,
+        mnemara stubs the bulky body content of those tool_use specs
+        (and matching prior Read specs) to {file_path, _evicted: true} —
+        preserves audit trail, drops kilobytes-per-block payload. Pinned
+        rows skipped. The change persists in git or wherever the tool
+        wrote; only the in-context audit body goes.
+
+        Live toggle: doesn't persist back to config.json automatically
+        (set cfg.auto_evict_after_write in config.json for boot-time
+        default). The in-process toggle survives until panel restart.
+        """
+        a = arg.strip().lower()
+        if a in ("", "status"):
+            state = "ON" if getattr(self.cfg, "auto_evict_after_write", False) else "OFF"
+            color = "green" if state == "ON" else "yellow"
+            chat.write(
+                f"[{color}]auto-evict-after-write: {state}[/{color}]\n"
+                f"  When ON, every turn that does Edit/Write/MultiEdit/NotebookEdit\n"
+                f"  auto-stubs those tool_use bodies + matching prior Reads.\n"
+                f"  Use /auto-evict on  or  /auto-evict off  to toggle for this session.\n"
+                f"  Set cfg.auto_evict_after_write in config.json for boot-time default."
+            )
+            return
+        if a in ("on", "true", "1", "yes", "enable"):
+            self.cfg.auto_evict_after_write = True
+            chat.write("[green]auto-evict-after-write: ON[/green] (this session)")
+            return
+        if a in ("off", "false", "0", "no", "disable"):
+            self.cfg.auto_evict_after_write = False
+            chat.write("[yellow]auto-evict-after-write: OFF[/yellow] (this session)")
+            return
+        chat.write(f"[red]usage: /auto-evict on|off|status[/red]")
+
     def _slash_evict(self, arg: str, chat: "RichLog") -> None:
         """`/evict last N` | `/evict ids ...` | `/evict since <name>` | `/evict thinking ...` | `/evict older Xm`."""
         parts = arg.split(None, 1)
@@ -1451,6 +1493,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /evict tools keep N                 strip tool_use from all but last N rows\n"
                 "  /evict tools older 10m              strip tool_use from rows older than 10m\n"
                 "  /evict tools ids 4,7,9              strip tool_use from specific rows\n"
+                "  /evict pairs                        stub Edit/Write/Read tool_use bodies (preserves audit trail)\n"
+                "  /evict pairs in 4,7,9               same, restricted to specific assistant rows\n"
                 "  (append `force` to most modes to override skip_pinned)"
             )
             return
@@ -1677,7 +1721,56 @@ class MnemaraTUI(App):  # type: ignore[misc]
             )
             self._refresh_status()
             return
-        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since|older|thinking|tools)[/red]")
+        if sub == "pairs":
+            # /evict pairs [in 4,7,9] [force]
+            #
+            # Stubs Edit/Write/MultiEdit/NotebookEdit tool_use bodies in
+            # the rolling window — preserves the block (audit trail "I
+            # called Edit on /foo/bar.py") but drops the bulky
+            # old_string/new_string/content payloads. Also stubs prior
+            # Read tool_use blocks for the same files. With auto-evict-
+            # after-write enabled, this runs automatically each turn that
+            # did writes; manual invocation here scans ALL rows by default
+            # or restricts to rows specified after `in`.
+            kw: dict = {"skip_pinned": not force}
+            sub_parts = rest.split(None, 1)
+            if sub_parts and sub_parts[0].lower() == "in":
+                # /evict pairs in 4,7,9
+                raw = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+                if not raw:
+                    chat.write("[red]usage: /evict pairs in 4,7,9[/red]")
+                    return
+                try:
+                    if raw.startswith("["):
+                        import json as _json
+                        only_ids = [int(x) for x in _json.loads(raw)]
+                    else:
+                        only_ids = [int(x.strip()) for x in raw.replace(",", " ").split() if x.strip()]
+                except (ValueError, TypeError) as exc:
+                    chat.write(f"[red]parse error: {exc}[/red]")
+                    return
+                if not only_ids:
+                    chat.write("[red]no ids provided[/red]")
+                    return
+                kw["only_in_rows"] = only_ids
+            try:
+                result = self.store.evict_write_pairs(**kw)
+            except (ValueError, TypeError) as exc:
+                chat.write(f"[red]{exc}[/red]")
+                return
+            n_skip = result.get("rows_skipped_pinned", 0)
+            chat.write(
+                f"[green]write-pair surgery: "
+                f"{result['rows_modified']} row{'s' if result['rows_modified'] != 1 else ''} modified, "
+                f"{result['writes_stubbed']} write{'s' if result['writes_stubbed'] != 1 else ''} + "
+                f"{result['reads_stubbed']} read{'s' if result['reads_stubbed'] != 1 else ''} stubbed, "
+                f"{result['files_seen']} file{'s' if result['files_seen'] != 1 else ''} touched, "
+                f"~{result['bytes_freed']:,} bytes freed[/green]"
+                + (f"  [dim](preserved {n_skip} pinned)[/dim]" if n_skip else "")
+            )
+            self._refresh_status()
+            return
+        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since|older|thinking|tools|pairs)[/red]")
 
     async def _slash_copy(self, arg: str, chat: "RichLog") -> None:
         """/copy [all|N] — copy turns to clipboard."""
