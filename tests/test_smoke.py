@@ -2403,3 +2403,315 @@ def test_count_pending_routes_to_recipient(home, tmp_path):
     assert n == 1
 
     conn.close()
+
+
+# ---------------------------------------------------------------- thinking surgery
+
+
+def test_evict_thinking_blocks_strips_thinking_only(home):
+    """thinking blocks evicted; text + tool_use + tool_result preserved."""
+    from mnemara.store import Store
+
+    store = Store("etb_basic_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "scratch reasoning"},
+            {"type": "text", "text": "the answer is X"},
+            {"type": "tool_use", "id": "tu1", "name": "Read", "input": {"path": "/foo"}},
+            {"type": "thinking", "text": "more scratch"},
+        ],
+    )
+
+    result = store.evict_thinking_blocks(ids=[rid])
+    assert result["rows_scanned"] == 1
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 2
+    assert result["bytes_freed"] > 0
+
+    rows = store.window()
+    assert len(rows) == 1
+    blocks = rows[0]["content"]
+    assert isinstance(blocks, list)
+    types = [b["type"] for b in blocks]
+    assert types == ["text", "tool_use"]
+    # text + tool_use payload preserved verbatim
+    assert blocks[0]["text"] == "the answer is X"
+    assert blocks[1]["name"] == "Read"
+    store.close()
+
+
+def test_evict_thinking_blocks_keep_recent_preserves_tail(home):
+    """keep_recent=N strips from all rows except the most-recent N."""
+    from mnemara.store import Store
+
+    store = Store("etb_keep_t")
+    ids = []
+    for i in range(5):
+        ids.append(store.append_turn(
+            "assistant",
+            [
+                {"type": "thinking", "text": f"scratch {i}"},
+                {"type": "text", "text": f"answer {i}"},
+            ],
+        ))
+    # Keep last 2 untouched; strip from the older 3.
+    result = store.evict_thinking_blocks(keep_recent=2)
+    assert result["rows_scanned"] == 3
+    assert result["rows_modified"] == 3
+    assert result["blocks_evicted"] == 3
+
+    rows = store.window()
+    # Older 3 should have only text blocks.
+    for r in rows[:3]:
+        types = [b["type"] for b in r["content"]]
+        assert types == ["text"], f"row {r['id']} should have thinking stripped: {types}"
+    # Most-recent 2 should still have both.
+    for r in rows[3:]:
+        types = [b["type"] for b in r["content"]]
+        assert types == ["thinking", "text"], f"row {r['id']} should be untouched: {types}"
+    store.close()
+
+
+def test_evict_thinking_blocks_keep_recent_zero_strips_all(home):
+    """keep_recent=0 is equivalent to all_rows=True semantically."""
+    from mnemara.store import Store
+
+    store = Store("etb_keep_zero_t")
+    for i in range(3):
+        store.append_turn(
+            "assistant",
+            [
+                {"type": "thinking", "text": f"x{i}"},
+                {"type": "text", "text": f"a{i}"},
+            ],
+        )
+    result = store.evict_thinking_blocks(keep_recent=0)
+    assert result["rows_modified"] == 3
+    assert result["blocks_evicted"] == 3
+    for r in store.window():
+        assert all(b["type"] != "thinking" for b in r["content"])
+    store.close()
+
+
+def test_evict_thinking_blocks_all_rows_strips_every_row(home):
+    """all_rows=True strips thinking from every row in the store."""
+    from mnemara.store import Store
+
+    store = Store("etb_all_t")
+    store.append_turn("user", [{"type": "text", "text": "u1"}])  # no thinking
+    a = store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "..."},
+            {"type": "text", "text": "answer"},
+        ],
+    )
+    store.append_turn(
+        "user",
+        [{"type": "tool_result", "tool_use_id": "tu1", "content": "ok"}],
+    )
+
+    result = store.evict_thinking_blocks(all_rows=True)
+    assert result["rows_scanned"] == 3
+    assert result["rows_modified"] == 1  # only the assistant row had thinking
+    assert result["blocks_evicted"] == 1
+
+    # Verify the assistant row now has only text.
+    for r in store.window():
+        if r["id"] == a:
+            assert [b["type"] for b in r["content"]] == ["text"]
+    store.close()
+
+
+def test_evict_thinking_blocks_skips_empty_result_rows(home):
+    """Rows whose stripping leaves 0 blocks are skipped without modification."""
+    from mnemara.store import Store
+
+    store = Store("etb_empty_t")
+    # Row that's 100% thinking — stripping would empty it.
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "lone scratch"},
+        ],
+    )
+    result = store.evict_thinking_blocks(ids=[rid])
+    assert result["rows_scanned"] == 1
+    assert result["rows_modified"] == 0
+    assert result["blocks_evicted"] == 0
+    assert result["bytes_freed"] == 0
+
+    # Original content unchanged.
+    rows = store.window()
+    assert len(rows) == 1
+    assert [b["type"] for b in rows[0]["content"]] == ["thinking"]
+    store.close()
+
+
+def test_evict_thinking_blocks_noop_when_no_thinking_present(home):
+    """A row with no thinking blocks is scanned but not modified."""
+    from mnemara.store import Store
+
+    store = Store("etb_noop_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "text", "text": "no thinking here"},
+            {"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": "ls"}},
+        ],
+    )
+    result = store.evict_thinking_blocks(ids=[rid])
+    assert result["rows_scanned"] == 1
+    assert result["rows_modified"] == 0
+    assert result["blocks_evicted"] == 0
+    assert result["bytes_freed"] == 0
+    store.close()
+
+
+def test_evict_thinking_blocks_idempotent_on_rerun(home):
+    """Running twice on the same row produces no further changes the second time."""
+    from mnemara.store import Store
+
+    store = Store("etb_idem_t")
+    rid = store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "x"},
+            {"type": "text", "text": "y"},
+        ],
+    )
+    r1 = store.evict_thinking_blocks(ids=[rid])
+    assert r1["rows_modified"] == 1
+    assert r1["blocks_evicted"] == 1
+    r2 = store.evict_thinking_blocks(ids=[rid])
+    assert r2["rows_modified"] == 0
+    assert r2["blocks_evicted"] == 0
+    store.close()
+
+
+def test_evict_thinking_blocks_handles_string_and_marker_rows(home):
+    """Legacy string-encoded content and marker rows are skipped without error."""
+    from mnemara.store import Store
+
+    store = Store("etb_legacy_t")
+    # Legacy string-encoded turn (content stored as plain string, not JSON list).
+    legacy = store.append_turn("user", "plain-string-content-no-blocks")
+    # Marker row (role='marker', content=json.dumps(name)).
+    marker = store.mark_segment("checkpoint-A")
+    # Real assistant row with thinking.
+    real = store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "real"},
+            {"type": "text", "text": "kept"},
+        ],
+    )
+
+    result = store.evict_thinking_blocks(all_rows=True)
+    # Legacy + marker scanned but skipped (no list content); real row modified.
+    assert result["rows_scanned"] == 3
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 1
+
+    # Confirm legacy + marker rows untouched.
+    rows = {r["id"]: r for r in store.window()}
+    # Legacy string content is parsed by _maybe_json — could come back as
+    # str or dict depending on JSON shape. Just confirm the row still exists
+    # and wasn't modified to an empty list.
+    assert legacy in rows
+    assert marker in rows
+    # Marker row content should still parse to its original name.
+    assert rows[marker]["content"] == "checkpoint-A"
+    store.close()
+
+
+def test_evict_thinking_blocks_selector_validation(home):
+    """Exactly one of ids / keep_recent / all_rows must be provided."""
+    from mnemara.store import Store
+    import pytest
+
+    store = Store("etb_sel_t")
+    store.append_turn("assistant", [{"type": "text", "text": "x"}])
+
+    # Zero selectors.
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks()
+    # Two selectors.
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks(ids=[1], keep_recent=2)
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks(ids=[1], all_rows=True)
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks(keep_recent=2, all_rows=True)
+    # Three selectors.
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks(ids=[1], keep_recent=2, all_rows=True)
+    store.close()
+
+
+def test_evict_thinking_blocks_empty_ids_list_is_zero(home):
+    """An empty ids list yields all-zero counts (not an error)."""
+    from mnemara.store import Store
+
+    store = Store("etb_empty_ids_t")
+    store.append_turn("assistant", [{"type": "thinking", "text": "x"}, {"type": "text", "text": "y"}])
+    result = store.evict_thinking_blocks(ids=[])
+    assert result == {
+        "rows_scanned": 0,
+        "rows_modified": 0,
+        "blocks_evicted": 0,
+        "bytes_freed": 0,
+    }
+    # Original row untouched.
+    rows = store.window()
+    assert len(rows[0]["content"]) == 2
+    store.close()
+
+
+def test_evict_thinking_blocks_unknown_ids_silently_ignored(home):
+    """Ids that don't exist are silently dropped (rows_scanned reflects matches)."""
+    from mnemara.store import Store
+
+    store = Store("etb_unknown_t")
+    rid = store.append_turn(
+        "assistant", [{"type": "thinking", "text": "x"}, {"type": "text", "text": "y"}]
+    )
+    result = store.evict_thinking_blocks(ids=[rid, 99999, 88888])
+    # Only the real row scanned.
+    assert result["rows_scanned"] == 1
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 1
+    store.close()
+
+
+def test_evict_thinking_blocks_messages_for_api_stays_valid(home):
+    """After stripping, messages_for_api still produces non-empty content per row.
+
+    Regression guard for the empty-row skip rule. If we ever forget to skip
+    a row that would empty out, messages_for_api would emit a row with
+    content=[] and the Anthropic API would 400. This test asserts the
+    skip works for an all-thinking row even when bundled with normal rows.
+    """
+    from mnemara.store import Store
+
+    store = Store("etb_api_t")
+    # Mix: an all-thinking assistant row (will be skipped), a normal row.
+    store.append_turn("user", [{"type": "text", "text": "u"}])
+    store.append_turn("assistant", [{"type": "thinking", "text": "lone"}])
+    store.append_turn(
+        "assistant",
+        [
+            {"type": "thinking", "text": "x"},
+            {"type": "text", "text": "answer"},
+        ],
+    )
+
+    store.evict_thinking_blocks(all_rows=True)
+
+    msgs = store.messages_for_api()
+    for m in msgs:
+        assert isinstance(m["content"], list) and len(m["content"]) > 0, (
+            f"row produced empty content list: {m}"
+        )
+    store.close()

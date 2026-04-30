@@ -92,6 +92,7 @@ class Config:
                 ToolPolicy(tool="EvictIds", mode="allow"),
                 ToolPolicy(tool="MarkSegment", mode="allow"),
                 ToolPolicy(tool="EvictSince", mode="allow"),
+                ToolPolicy(tool="EvictThinkingBlocks", mode="allow"),
             ]
         )
 

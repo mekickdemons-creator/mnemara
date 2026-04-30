@@ -939,6 +939,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /evict last N           drop the N most-recent rows\n"
                 "  /evict ids 4,7,9        drop specific rows by id (see /show ids)\n"
                 "  /evict since <name>     drop the named marker and everything after it\n"
+                "  /evict thinking all     strip thinking blocks from every row (block surgery)\n"
+                "  /evict thinking keep N  strip thinking from all but the last N rows\n"
                 "  /quit, /exit     exit\n"
                 "[b]Key bindings:[/b]\n"
                 "  Ctrl+Y           copy last assistant response to clipboard\n"
@@ -1311,14 +1313,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._refresh_status()
 
     def _slash_evict(self, arg: str, chat: "RichLog") -> None:
-        """`/evict last N` | `/evict ids 4,7,9` | `/evict since <name>`."""
+        """`/evict last N` | `/evict ids ...` | `/evict since <name>` | `/evict thinking ...`."""
         parts = arg.split(None, 1)
         if not parts:
             chat.write(
                 "[red]usage:[/red]\n"
-                "  /evict last N            drop the N most-recent rows\n"
-                "  /evict ids 4,7,9         drop specific rows by id\n"
-                "  /evict since <name>      drop named marker + everything after"
+                "  /evict last N                       drop the N most-recent rows\n"
+                "  /evict ids 4,7,9                    drop specific rows by id\n"
+                "  /evict since <name>                 drop named marker + everything after\n"
+                "  /evict thinking all                 strip thinking blocks from every row\n"
+                "  /evict thinking keep N              strip thinking from all but last N rows\n"
+                "  /evict thinking ids 4,7,9           strip thinking from specific rows"
             )
             return
         sub = parts[0].lower()
@@ -1366,7 +1371,64 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 )
                 self._refresh_status()
             return
-        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since)[/red]")
+        if sub == "thinking":
+            # /evict thinking all                       — strip every row
+            # /evict thinking keep N                    — preserve last N rows
+            # /evict thinking ids 4,7,9 (or [4,7,9])    — explicit list
+            sub_parts = rest.split(None, 1)
+            if not sub_parts:
+                chat.write(
+                    "[red]usage:[/red]\n"
+                    "  /evict thinking all\n"
+                    "  /evict thinking keep N\n"
+                    "  /evict thinking ids 4,7,9"
+                )
+                return
+            mode = sub_parts[0].lower()
+            mode_arg = sub_parts[1] if len(sub_parts) > 1 else ""
+            kw: dict = {}
+            try:
+                if mode == "all":
+                    kw["all_rows"] = True
+                elif mode == "keep":
+                    if not mode_arg.strip():
+                        chat.write("[red]usage: /evict thinking keep N[/red]")
+                        return
+                    kw["keep_recent"] = int(mode_arg.strip())
+                elif mode == "ids":
+                    raw = mode_arg.strip()
+                    if not raw:
+                        chat.write("[red]usage: /evict thinking ids 4,7,9[/red]")
+                        return
+                    if raw.startswith("["):
+                        import json as _json
+                        ids_list = [int(x) for x in _json.loads(raw)]
+                    else:
+                        ids_list = [int(x.strip()) for x in raw.replace(",", " ").split() if x.strip()]
+                    if not ids_list:
+                        chat.write("[red]no ids provided[/red]")
+                        return
+                    kw["ids"] = ids_list
+                else:
+                    chat.write(f"[red]unknown thinking mode '{mode}'  (use all|keep|ids)[/red]")
+                    return
+            except (ValueError, TypeError) as exc:
+                chat.write(f"[red]parse error: {exc}[/red]")
+                return
+            try:
+                result = self.store.evict_thinking_blocks(**kw)
+            except (ValueError, TypeError) as exc:
+                chat.write(f"[red]{exc}[/red]")
+                return
+            chat.write(
+                f"[green]thinking surgery: {result['rows_modified']}/{result['rows_scanned']} "
+                f"row{'s' if result['rows_scanned'] != 1 else ''} modified, "
+                f"{result['blocks_evicted']} block{'s' if result['blocks_evicted'] != 1 else ''} "
+                f"evicted, ~{result['bytes_freed']:,} bytes freed[/green]"
+            )
+            self._refresh_status()
+            return
+        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since|thinking)[/red]")
 
     async def _slash_copy(self, arg: str, chat: "RichLog") -> None:
         """/copy [all|N] — copy turns to clipboard."""

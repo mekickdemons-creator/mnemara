@@ -242,6 +242,147 @@ class Store:
         self.conn.commit()
         return n
 
+    # ---------------------------------------------------- block-level surgery
+    # The row-level eviction primitives above (evict_last/evict_ids/
+    # evict_since) drop entire turns. Block-level surgery operates
+    # *inside* a row: strip specific block types out of the content list
+    # while preserving the rest. Used to free context budget for content
+    # types the model doesn't reference back (thinking) without losing
+    # the durable signal in the same turn (text + tool_use).
+
+    def evict_thinking_blocks(
+        self,
+        *,
+        ids: list[int] | None = None,
+        keep_recent: int | None = None,
+        all_rows: bool = False,
+    ) -> dict[str, int]:
+        """Strip 'thinking' blocks from selected rolling-window rows.
+
+        Block-level surgery: unlike evict_ids/evict_last/evict_since which
+        delete entire rows, this strips ONE block type out of rows while
+        preserving text + tool_use + tool_result blocks. Designed for the
+        common case where you want to free context budget by dropping the
+        model's past thinking scratch (which it doesn't reference back
+        across turns) while keeping the durable signal in text + tool_use
+        blocks of the same turn.
+
+        Selection (exactly one of these required):
+
+          ids          explicit row id list
+          keep_recent  strip from every row EXCEPT the most-recent N
+                       (preserves recent reasoning chains the model may
+                       still reference; 0 = strip from every row, same
+                       semantic as all_rows)
+          all_rows     strip from every row in the store
+
+        Rows whose stripping would leave 0 blocks are skipped without
+        modification — the agent can `evict_ids` such rows separately
+        if a full delete is desired.
+
+        Rows with non-list content (legacy string-encoded turns, marker
+        rows, etc.) are also skipped — they have no blocks to strip.
+
+        Returns:
+          {
+            "rows_scanned":   rows examined (the selector's resolved set)
+            "rows_modified":  rows whose content was rewritten
+            "blocks_evicted": total thinking blocks removed
+            "bytes_freed":    sum of (old_content_len - new_content_len)
+                              across modified rows; rough estimate of
+                              context-budget savings (eviction enforces
+                              against bytes/4 per total_tokens()).
+          }
+        """
+        # Selector validation: exactly one path. `all_rows` defaults to
+        # False so the explicit-True check is unambiguous; `keep_recent`
+        # uses None as the unset sentinel so 0 is a legal value.
+        have_ids = ids is not None
+        have_keep = keep_recent is not None
+        have_all = all_rows is True
+        n_selected = sum([have_ids, have_keep, have_all])
+        if n_selected != 1:
+            raise ValueError(
+                "exactly one of ids, keep_recent, all_rows required "
+                f"(got ids={have_ids}, keep_recent={have_keep}, all_rows={have_all})"
+            )
+
+        # Resolve the target id set.
+        target_ids: list[int]
+        if have_ids:
+            try:
+                target_ids = [int(i) for i in ids]  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"ids must be integers: {exc}") from exc
+        elif have_keep:
+            n = max(0, int(keep_recent))  # type: ignore[arg-type]
+            cur = self.conn.execute("SELECT id FROM turns ORDER BY id DESC")
+            all_ids_desc = [r[0] for r in cur.fetchall()]
+            # Skip the first N (most recent); strip the rest.
+            target_ids = all_ids_desc[n:]
+        else:  # have_all
+            cur = self.conn.execute("SELECT id FROM turns ORDER BY id ASC")
+            target_ids = [r[0] for r in cur.fetchall()]
+
+        if not target_ids:
+            return {
+                "rows_scanned": 0,
+                "rows_modified": 0,
+                "blocks_evicted": 0,
+                "bytes_freed": 0,
+            }
+
+        placeholders = ",".join("?" * len(target_ids))
+        rows = list(self.conn.execute(
+            f"SELECT id, content FROM turns WHERE id IN ({placeholders})",
+            target_ids,
+        ))
+
+        rows_modified = 0
+        blocks_evicted = 0
+        bytes_freed = 0
+        for row_id, content_str in rows:
+            try:
+                blocks = json.loads(content_str)
+            except (json.JSONDecodeError, TypeError):
+                # Non-JSON content (legacy string turns) — nothing to strip.
+                continue
+            if not isinstance(blocks, list):
+                # JSON value but not a block list (e.g. marker rows store
+                # the marker name as a JSON string). Skip.
+                continue
+            new_blocks = [
+                b for b in blocks
+                if not (isinstance(b, dict) and b.get("type") == "thinking")
+            ]
+            n_evicted = len(blocks) - len(new_blocks)
+            if n_evicted == 0:
+                continue
+            if not new_blocks:
+                # Don't leave a row with empty content — Anthropic's API
+                # rejects messages with empty content lists. Agent can
+                # evict_ids this row separately if they want it gone.
+                continue
+            new_str = json.dumps(new_blocks)
+            delta = len(content_str) - len(new_str)
+            self.conn.execute(
+                "UPDATE turns SET content=? WHERE id=?",
+                (new_str, row_id),
+            )
+            rows_modified += 1
+            blocks_evicted += n_evicted
+            bytes_freed += delta
+
+        if rows_modified:
+            self.conn.commit()
+
+        return {
+            "rows_scanned": len(rows),
+            "rows_modified": rows_modified,
+            "blocks_evicted": blocks_evicted,
+            "bytes_freed": bytes_freed,
+        }
+
     def total_tokens(self) -> tuple[int, int]:
         """Return (estimated_stored_tokens, sum_output_tokens).
 
