@@ -43,6 +43,7 @@ from . import role as role_mod
 from . import tools as tools_mod
 from .config import Config
 from .logging_util import log, warn
+from . import store as store_mod
 from .store import Store
 from .tools import ToolRunner
 
@@ -93,6 +94,10 @@ _EVICT_IDS_TOOL = "mcp__mnemara_memory__evict_ids"
 _MARK_SEGMENT_TOOL = "mcp__mnemara_memory__mark_segment"
 _EVICT_SINCE_TOOL = "mcp__mnemara_memory__evict_since"
 _EVICT_THINKING_BLOCKS_TOOL = "mcp__mnemara_memory__evict_thinking_blocks"
+_EVICT_OLDER_THAN_TOOL = "mcp__mnemara_memory__evict_older_than"
+_PIN_ROW_TOOL = "mcp__mnemara_memory__pin_row"
+_UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
+_LIST_PINNED_TOOL = "mcp__mnemara_memory__list_pinned"
 
 
 class AgentSession:
@@ -962,31 +967,46 @@ class AgentSession:
             "`keep_recent='N'` (strip from every row EXCEPT the most-recent N — "
             "preserves recent reasoning chains the model may still want to "
             "reference; '0' is legal and equivalent to all_rows); "
-            "`all_rows='true'` (strip every row in the store). Rows whose "
-            "stripping would leave 0 blocks are skipped without modification. "
-            "If you want to remember a thinking chain before evicting it, call "
-            "write_memory(category='thought_summary', text=...) first — the "
-            "primitive itself doesn't auto-summarize. Returns "
-            "{rows_scanned, rows_modified, blocks_evicted, bytes_freed}.",
-            {"ids": str, "keep_recent": str, "all_rows": str},
+            "`all_rows='true'` (strip every row in the store); "
+            "`older_than='10m'` (strip from rows whose ts is older than the "
+            "duration — accepts 'Ns', 'Nm', 'Nh', 'Nd' suffixes or bare integer "
+            "seconds). Rows whose stripping would leave 0 blocks are skipped "
+            "without modification. Pinned rows are preserved by default; pass "
+            "`skip_pinned='false'` to override. If you want to remember a "
+            "thinking chain before evicting it, call write_memory("
+            "category='thought_summary', text=...) first — the primitive "
+            "itself doesn't auto-summarize. Returns {rows_scanned, "
+            "rows_modified, blocks_evicted, bytes_freed, rows_skipped_pinned}.",
+            {
+                "ids": str,
+                "keep_recent": str,
+                "all_rows": str,
+                "older_than": str,
+                "skip_pinned": str,
+            },
         )
         async def _evict_thinking_blocks_tool(args: dict[str, Any]) -> dict[str, Any]:
             raw_ids = (args.get("ids") or "").strip()
             raw_keep = (args.get("keep_recent") or "").strip()
             raw_all = (args.get("all_rows") or "").strip().lower()
+            raw_older = (args.get("older_than") or "").strip()
+            raw_skip = (args.get("skip_pinned") or "true").strip().lower()
 
             have_ids = bool(raw_ids)
             have_keep = bool(raw_keep)
             have_all = raw_all in ("true", "1", "yes")
+            have_older = bool(raw_older)
 
-            if sum([have_ids, have_keep, have_all]) != 1:
+            if sum([have_ids, have_keep, have_all, have_older]) != 1:
                 return {
                     "content": [{"type": "text", "text":
-                        "exactly one of ids, keep_recent, all_rows required"}],
+                        "exactly one of ids, keep_recent, all_rows, older_than required"}],
                     "is_error": True,
                 }
 
-            kw: dict[str, Any] = {}
+            kw: dict[str, Any] = {
+                "skip_pinned": raw_skip not in ("false", "0", "no", "off"),
+            }
             try:
                 if have_ids:
                     if raw_ids.startswith("["):
@@ -1002,6 +1022,8 @@ class AgentSession:
                     kw["ids"] = ids
                 elif have_keep:
                     kw["keep_recent"] = int(raw_keep)
+                elif have_older:
+                    kw["older_than_seconds"] = store_mod.parse_duration_seconds(raw_older)
                 else:
                     kw["all_rows"] = True
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1018,6 +1040,159 @@ class AgentSession:
                     "is_error": True,
                 }
 
+            return {
+                "content": [{"type": "text", "text": json.dumps(result)}]
+            }
+
+        @tool(
+            "pin_row",
+            "Pin a rolling-window row with a free-form category label. Pinned "
+            "rows are preserved against PROACTIVE eviction (evict_older_than, "
+            "bulk-mode thinking-block surgery, future auto-decay) but explicit "
+            "evict_ids still drops them — the pin is advisory, not a lock. "
+            "Use this to mark narrative-bearing turns: commits ('label=commit'), "
+            "findings ('label=finding'), decisions ('label=decision'), summaries. "
+            "Idempotent: re-pinning with a new label overwrites the previous "
+            "label. Returns {row_id, label, matched} where matched=False means "
+            "the row id didn't exist.",
+            {"row_id": str, "label": str},
+        )
+        async def _pin_row_tool(args: dict[str, Any]) -> dict[str, Any]:
+            try:
+                row_id = int(str(args.get("row_id", "")).strip())
+            except (TypeError, ValueError):
+                return {
+                    "content": [{"type": "text", "text": "row_id must be an integer"}],
+                    "is_error": True,
+                }
+            label = (args.get("label") or "pinned").strip()
+            if not label:
+                label = "pinned"
+            try:
+                matched = session.store.pin_row(row_id, label)
+            except (ValueError, TypeError) as exc:
+                return {
+                    "content": [{"type": "text", "text": str(exc)}],
+                    "is_error": True,
+                }
+            return {
+                "content": [{"type": "text", "text": json.dumps({
+                    "row_id": row_id, "label": label, "matched": matched,
+                })}]
+            }
+
+        @tool(
+            "unpin_row",
+            "Remove the pin from a rolling-window row. Returns {row_id, matched} "
+            "where matched=False means the row didn't exist OR existed but was "
+            "not pinned (idempotent unpin is a no-op).",
+            {"row_id": str},
+        )
+        async def _unpin_row_tool(args: dict[str, Any]) -> dict[str, Any]:
+            try:
+                row_id = int(str(args.get("row_id", "")).strip())
+            except (TypeError, ValueError):
+                return {
+                    "content": [{"type": "text", "text": "row_id must be an integer"}],
+                    "is_error": True,
+                }
+            matched = session.store.unpin_row(row_id)
+            return {
+                "content": [{"type": "text", "text": json.dumps({
+                    "row_id": row_id, "matched": matched,
+                })}]
+            }
+
+        @tool(
+            "list_pinned",
+            "List all currently-pinned rows in id-ascending order. Each entry "
+            "has {id, ts, role, pin_label, content_preview}. Optional `label` "
+            "argument filters to rows with that exact pin_label (e.g. "
+            "label='commit' for all commits). Without a label, returns every "
+            "pinned row regardless of category. Use to audit what survives "
+            "proactive eviction.",
+            {"label": str},
+        )
+        async def _list_pinned_tool(args: dict[str, Any]) -> dict[str, Any]:
+            label_filter = (args.get("label") or "").strip() or None
+            rows = session.store.list_pinned(label_filter)
+            preview_rows = []
+            for r in rows:
+                content = r.get("content")
+                if isinstance(content, list):
+                    # Build a short preview from text + tool_use names.
+                    bits = []
+                    for b in content[:3]:
+                        if not isinstance(b, dict):
+                            continue
+                        bt = b.get("type")
+                        if bt == "text":
+                            txt = (b.get("text") or "")[:60]
+                            bits.append(f"text:{txt!r}")
+                        elif bt == "tool_use":
+                            bits.append(f"tool:{b.get('name', '?')}")
+                        elif bt == "tool_result":
+                            bits.append("tool_result")
+                        elif bt == "thinking":
+                            bits.append("thinking")
+                    preview = " | ".join(bits) if bits else f"({len(content)} blocks)"
+                elif isinstance(content, str):
+                    preview = content[:80]
+                else:
+                    preview = str(content)[:80]
+                preview_rows.append({
+                    "id": r["id"],
+                    "ts": r["ts"],
+                    "role": r["role"],
+                    "pin_label": r["pin_label"],
+                    "preview": preview,
+                })
+            return {
+                "content": [{"type": "text", "text": json.dumps({
+                    "count": len(preview_rows),
+                    "label_filter": label_filter,
+                    "rows": preview_rows,
+                })}]
+            }
+
+        @tool(
+            "evict_older_than",
+            "Time-based row-level eviction: drop rows whose ts is older than "
+            "the given duration. Pass `duration` as a string with optional "
+            "suffix — 'Ns' (seconds), 'Nm' (minutes), 'Nh' (hours), 'Nd' "
+            "(days), or bare integer for seconds. Examples: '600' (10 minutes), "
+            "'10m', '1h', '1d'. Pinned rows are preserved by default; pass "
+            "`skip_pinned='false'` for hard time purges. Returns "
+            "{rows_evicted, rows_skipped_pinned, cutoff_ts}. Designed for "
+            "autonomous decay — an agent can call evict_older_than('10m') "
+            "periodically while pin_row protecting load-bearing turns.",
+            {"duration": str, "skip_pinned": str},
+        )
+        async def _evict_older_than_tool(args: dict[str, Any]) -> dict[str, Any]:
+            raw_duration = (args.get("duration") or "").strip()
+            if not raw_duration:
+                return {
+                    "content": [{"type": "text", "text": "duration required"}],
+                    "is_error": True,
+                }
+            try:
+                seconds = store_mod.parse_duration_seconds(raw_duration)
+            except ValueError as exc:
+                return {
+                    "content": [{"type": "text", "text": str(exc)}],
+                    "is_error": True,
+                }
+            raw_skip = (args.get("skip_pinned") or "true").strip().lower()
+            skip_pinned = raw_skip not in ("false", "0", "no", "off")
+            try:
+                result = session.store.evict_older_than(
+                    seconds, skip_pinned=skip_pinned
+                )
+            except (ValueError, TypeError) as exc:
+                return {
+                    "content": [{"type": "text", "text": str(exc)}],
+                    "is_error": True,
+                }
             return {
                 "content": [{"type": "text", "text": json.dumps(result)}]
             }
@@ -1044,6 +1219,10 @@ class AgentSession:
             _mark_segment_tool,
             _evict_since_tool,
             _evict_thinking_blocks_tool,
+            _pin_row_tool,
+            _unpin_row_tool,
+            _list_pinned_tool,
+            _evict_older_than_tool,
         ]
         # Expose handlers by name for in-process testing / introspection.
         self._registered_tools = {
@@ -1085,6 +1264,11 @@ class AgentSession:
             _EVICT_IDS_TOOL,
             _MARK_SEGMENT_TOOL,
             _EVICT_SINCE_TOOL,
+            _EVICT_THINKING_BLOCKS_TOOL,
+            _EVICT_OLDER_THAN_TOOL,
+            _PIN_ROW_TOOL,
+            _UNPIN_ROW_TOOL,
+            _LIST_PINNED_TOOL,
         ]
         for s in self.cfg.mcp_servers:
             # Permit any tool exposed by configured MCP servers.
@@ -1379,6 +1563,16 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "MarkSegment", ""
     if tool_name == _EVICT_SINCE_TOOL or tool_name.endswith("__evict_since"):
         return "EvictSince", ""
+    if tool_name == _EVICT_THINKING_BLOCKS_TOOL or tool_name.endswith("__evict_thinking_blocks"):
+        return "EvictThinkingBlocks", ""
+    if tool_name == _EVICT_OLDER_THAN_TOOL or tool_name.endswith("__evict_older_than"):
+        return "EvictOlderThan", ""
+    if tool_name == _PIN_ROW_TOOL or tool_name.endswith("__pin_row"):
+        return "PinRow", ""
+    if tool_name == _UNPIN_ROW_TOOL or tool_name.endswith("__unpin_row"):
+        return "UnpinRow", ""
+    if tool_name == _LIST_PINNED_TOOL or tool_name.endswith("__list_pinned"):
+        return "ListPinned", ""
     return None, ""
 
 

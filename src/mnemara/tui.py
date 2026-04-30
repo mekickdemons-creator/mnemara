@@ -936,11 +936,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /show ids        print rolling window with row ids (target evict)\n"
                 "  /mark <name>     insert a named segment marker at this point\n"
                 "  /marks           list all segment markers in the window\n"
-                "  /evict last N           drop the N most-recent rows\n"
-                "  /evict ids 4,7,9        drop specific rows by id (see /show ids)\n"
-                "  /evict since <name>     drop the named marker and everything after it\n"
+                "  /evict last N           drop the N most-recent rows (skip pinned)\n"
+                "  /evict ids 4,7,9        drop specific rows by id (ignores pin)\n"
+                "  /evict since <name>     drop named marker + everything after (skip pinned)\n"
+                "  /evict older 10m        drop rows older than duration (skip pinned)\n"
                 "  /evict thinking all     strip thinking blocks from every row (block surgery)\n"
                 "  /evict thinking keep N  strip thinking from all but the last N rows\n"
+                "  /evict thinking older 10m  strip thinking from rows older than duration\n"
+                "  /pin <id> [label]       pin a row to preserve against proactive eviction\n"
+                "  /unpin <id>             remove the pin from a row\n"
+                "  /pinned [label]         list pinned rows (optionally filter by label)\n"
                 "  /quit, /exit     exit\n"
                 "[b]Key bindings:[/b]\n"
                 "  Ctrl+Y           copy last assistant response to clipboard\n"
@@ -1059,6 +1064,18 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd == "/evict":
             self._slash_evict(arg, chat)
+            return
+
+        if cmd == "/pin":
+            self._slash_pin(arg, chat)
+            return
+
+        if cmd == "/unpin":
+            self._slash_unpin(arg, chat)
+            return
+
+        if cmd == "/pinned":
+            self._slash_pinned(arg, chat)
             return
 
         chat.write(f"[red]unknown command:[/red] {cmd}  (try /help)")
@@ -1312,32 +1329,132 @@ class MnemaraTUI(App):  # type: ignore[misc]
         chat.write(f"[green]⚑ marker '{name}' inserted at #{mid}[/green]")
         self._refresh_status()
 
+    def _slash_pin(self, arg: str, chat: "RichLog") -> None:
+        """`/pin <id> [label]` — pin a row against proactive eviction.
+
+        Default label is 'pinned'. Common labels: 'commit', 'finding',
+        'decision', 'summary', 'directive'. Pinned rows survive
+        evict_older_than, bulk-mode thinking surgery, and any future
+        auto-decay pass. Explicit /evict ids still drops them — pin is
+        advisory, not a lock.
+        """
+        parts = arg.split(None, 1)
+        if not parts:
+            chat.write("[red]usage: /pin <id> [label]  (label defaults to 'pinned')[/red]")
+            return
+        try:
+            row_id = int(parts[0].strip())
+        except ValueError:
+            chat.write("[red]row id must be an integer[/red]")
+            return
+        label = parts[1].strip() if len(parts) > 1 else "pinned"
+        if not label:
+            label = "pinned"
+        try:
+            matched = self.store.pin_row(row_id, label)
+        except (ValueError, TypeError) as exc:
+            chat.write(f"[red]{exc}[/red]")
+            return
+        if not matched:
+            chat.write(f"[yellow]no row #{row_id} (use /show ids to find ids)[/yellow]")
+            return
+        chat.write(f"[green]📌 pinned #{row_id} as '{label}'[/green]")
+        self._refresh_status()
+
+    def _slash_unpin(self, arg: str, chat: "RichLog") -> None:
+        """`/unpin <id>` — remove a row's pin so it becomes evictable again."""
+        raw = arg.strip()
+        if not raw:
+            chat.write("[red]usage: /unpin <id>[/red]")
+            return
+        try:
+            row_id = int(raw)
+        except ValueError:
+            chat.write("[red]row id must be an integer[/red]")
+            return
+        matched = self.store.unpin_row(row_id)
+        if not matched:
+            chat.write(
+                f"[yellow]row #{row_id} either doesn't exist or wasn't pinned[/yellow]"
+            )
+            return
+        chat.write(f"[green]unpinned #{row_id}[/green]")
+        self._refresh_status()
+
+    def _slash_pinned(self, arg: str, chat: "RichLog") -> None:
+        """`/pinned [label]` — list pinned rows, optionally filtered by label."""
+        label = arg.strip() or None
+        rows = self.store.list_pinned(label)
+        if not rows:
+            if label:
+                chat.write(f"[yellow]no pinned rows with label '{label}'[/yellow]")
+            else:
+                chat.write("[yellow]no pinned rows[/yellow]")
+            return
+        header = f"[green]{len(rows)} pinned row{'s' if len(rows) != 1 else ''}"
+        if label:
+            header += f" with label '{label}'"
+        chat.write(header + "[/green]")
+        for r in rows:
+            content = r.get("content")
+            preview = ""
+            if isinstance(content, list):
+                bits = []
+                for b in content[:2]:
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type")
+                    if bt == "text":
+                        bits.append((b.get("text") or "")[:50])
+                    elif bt == "tool_use":
+                        bits.append(f"[{b.get('name', '?')}]")
+                preview = " ".join(bits) if bits else f"({len(content)} blocks)"
+            elif isinstance(content, str):
+                preview = content[:60]
+            chat.write(
+                f"  [cyan]#{r['id']:>4}[/cyan] [{r['role']}] "
+                f"[yellow]{r['pin_label']}[/yellow]  {preview}"
+            )
+
     def _slash_evict(self, arg: str, chat: "RichLog") -> None:
-        """`/evict last N` | `/evict ids ...` | `/evict since <name>` | `/evict thinking ...`."""
+        """`/evict last N` | `/evict ids ...` | `/evict since <name>` | `/evict thinking ...` | `/evict older Xm`."""
         parts = arg.split(None, 1)
         if not parts:
             chat.write(
                 "[red]usage:[/red]\n"
-                "  /evict last N                       drop the N most-recent rows\n"
-                "  /evict ids 4,7,9                    drop specific rows by id\n"
-                "  /evict since <name>                 drop named marker + everything after\n"
+                "  /evict last N                       drop the N most-recent rows (skip pinned)\n"
+                "  /evict ids 4,7,9                    drop specific rows by id (ignores pin)\n"
+                "  /evict since <name>                 drop named marker + everything after (skip pinned)\n"
+                "  /evict older 10m                    drop rows older than 10 minutes (skip pinned)\n"
                 "  /evict thinking all                 strip thinking blocks from every row\n"
                 "  /evict thinking keep N              strip thinking from all but last N rows\n"
-                "  /evict thinking ids 4,7,9           strip thinking from specific rows"
+                "  /evict thinking older 10m           strip thinking from rows older than 10m\n"
+                "  /evict thinking ids 4,7,9           strip thinking from specific rows\n"
+                "  (append `force` to most modes to override skip_pinned)"
             )
             return
         sub = parts[0].lower()
         rest = parts[1] if len(parts) > 1 else ""
+
+        # Common pattern: any subcommand may end with the literal word
+        # "force" to override skip_pinned. Strip it once here.
+        rest_tokens = rest.split()
+        force = False
+        if rest_tokens and rest_tokens[-1].lower() == "force":
+            force = True
+            rest_tokens = rest_tokens[:-1]
+        rest = " ".join(rest_tokens)
+
         if sub == "last":
             try:
                 n = int(rest.strip())
             except ValueError:
-                chat.write("[red]usage: /evict last N  (N must be a positive integer)[/red]")
+                chat.write("[red]usage: /evict last N [force]  (N must be a positive integer)[/red]")
                 return
             if n <= 0:
                 chat.write("[red]N must be > 0[/red]")
                 return
-            deleted = self.store.evict_last(n)
+            deleted = self.store.evict_last(n, skip_pinned=not force)
             chat.write(f"[green]evicted {deleted} row{'s' if deleted != 1 else ''}[/green]")
             self._refresh_status()
             return
@@ -1360,33 +1477,59 @@ class MnemaraTUI(App):  # type: ignore[misc]
         if sub == "since":
             name = rest.strip()
             if not name:
-                chat.write("[red]usage: /evict since <name>[/red]")
+                chat.write("[red]usage: /evict since <name> [force][/red]")
                 return
-            deleted = self.store.evict_since(name)
+            deleted = self.store.evict_since(name, skip_pinned=not force)
             if deleted == 0:
-                chat.write(f"[yellow]no marker named '{name}' — use /marks to list[/yellow]")
+                chat.write(f"[yellow]no marker named '{name}' (or only pinned rows after it) — use /marks to list[/yellow]")
             else:
                 chat.write(
                     f"[green]evicted {deleted} row{'s' if deleted != 1 else ''} from marker '{name}' onward[/green]"
                 )
                 self._refresh_status()
             return
+        if sub == "older":
+            # /evict older 10m [force]
+            raw = rest.strip()
+            if not raw:
+                chat.write("[red]usage: /evict older <duration> [force]  e.g. 10m, 1h, 600[/red]")
+                return
+            try:
+                from .store import parse_duration_seconds
+                seconds = parse_duration_seconds(raw)
+            except ValueError as exc:
+                chat.write(f"[red]{exc}[/red]")
+                return
+            if seconds <= 0:
+                chat.write("[red]duration must be > 0[/red]")
+                return
+            result = self.store.evict_older_than(seconds, skip_pinned=not force)
+            n_evict = result["rows_evicted"]
+            n_skip = result["rows_skipped_pinned"]
+            chat.write(
+                f"[green]evicted {n_evict} row{'s' if n_evict != 1 else ''} older than {raw}[/green]"
+                + (f"  [dim](preserved {n_skip} pinned)[/dim]" if n_skip else "")
+            )
+            self._refresh_status()
+            return
         if sub == "thinking":
             # /evict thinking all                       — strip every row
             # /evict thinking keep N                    — preserve last N rows
             # /evict thinking ids 4,7,9 (or [4,7,9])    — explicit list
+            # /evict thinking older 10m                 — strip rows older than X
             sub_parts = rest.split(None, 1)
             if not sub_parts:
                 chat.write(
                     "[red]usage:[/red]\n"
                     "  /evict thinking all\n"
                     "  /evict thinking keep N\n"
-                    "  /evict thinking ids 4,7,9"
+                    "  /evict thinking ids 4,7,9\n"
+                    "  /evict thinking older 10m"
                 )
                 return
             mode = sub_parts[0].lower()
             mode_arg = sub_parts[1] if len(sub_parts) > 1 else ""
-            kw: dict = {}
+            kw: dict = {"skip_pinned": not force}
             try:
                 if mode == "all":
                     kw["all_rows"] = True
@@ -1409,8 +1552,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
                         chat.write("[red]no ids provided[/red]")
                         return
                     kw["ids"] = ids_list
+                elif mode == "older":
+                    raw = mode_arg.strip()
+                    if not raw:
+                        chat.write("[red]usage: /evict thinking older <duration>[/red]")
+                        return
+                    from .store import parse_duration_seconds
+                    kw["older_than_seconds"] = parse_duration_seconds(raw)
                 else:
-                    chat.write(f"[red]unknown thinking mode '{mode}'  (use all|keep|ids)[/red]")
+                    chat.write(f"[red]unknown thinking mode '{mode}'  (use all|keep|ids|older)[/red]")
                     return
             except (ValueError, TypeError) as exc:
                 chat.write(f"[red]parse error: {exc}[/red]")
@@ -1420,15 +1570,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
             except (ValueError, TypeError) as exc:
                 chat.write(f"[red]{exc}[/red]")
                 return
+            n_skip = result.get("rows_skipped_pinned", 0)
             chat.write(
                 f"[green]thinking surgery: {result['rows_modified']}/{result['rows_scanned']} "
                 f"row{'s' if result['rows_scanned'] != 1 else ''} modified, "
                 f"{result['blocks_evicted']} block{'s' if result['blocks_evicted'] != 1 else ''} "
                 f"evicted, ~{result['bytes_freed']:,} bytes freed[/green]"
+                + (f"  [dim](preserved {n_skip} pinned)[/dim]" if n_skip else "")
             )
             self._refresh_status()
             return
-        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since|thinking)[/red]")
+        chat.write(f"[red]unknown evict mode '{sub}'  (use last|ids|since|older|thinking)[/red]")
 
     async def _slash_copy(self, arg: str, chat: "RichLog") -> None:
         """/copy [all|N] — copy turns to clipboard."""

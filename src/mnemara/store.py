@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS turns (
     content TEXT NOT NULL,
     tool_uses TEXT,
     tokens_in INTEGER,
-    tokens_out INTEGER
+    tokens_out INTEGER,
+    pin_label TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ts ON turns(ts);
 """
@@ -35,6 +36,43 @@ class Store:
         self.conn = sqlite3.connect(self.path)
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Idempotent column adds for older DBs that pre-date a column.
+
+        Mirrors the architect-side ensure_*_schema PRAGMA pattern. Running on
+        every Store() construction is cheap (PRAGMA + dict membership). The
+        index creation MUST run after the ALTER TABLE on legacy DBs because
+        the column doesn't exist when SCHEMA's executescript runs the first
+        time on a pre-existing turns table.
+        """
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(turns)")}
+        for col, defn in [
+            # 2026-04-30 phase 1: pin_label preserves narrative-bearing rows
+            # against proactive eviction (time-based, bulk-mode block surgery,
+            # future auto-decay). NULL = unpinned (default). Free-form string
+            # value = pin category, e.g. 'commit', 'finding', 'decision' —
+            # query as `pin_label IS NOT NULL` for "all pinned" or filter by
+            # the specific category.
+            ("pin_label", "TEXT"),
+        ]:
+            if col not in cols:
+                try:
+                    self.conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {defn}")
+                    self.conn.commit()
+                except sqlite3.OperationalError:
+                    pass
+        # Index on pin_label MUST run after the ALTER TABLE — on a legacy DB
+        # the column didn't exist when SCHEMA ran. Idempotent CREATE INDEX
+        # IF NOT EXISTS handles re-runs.
+        try:
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pin_label ON turns(pin_label)"
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     def close(self) -> None:
         self.conn.close()
@@ -136,23 +174,106 @@ class Store:
         self.conn.execute("DELETE FROM turns")
         self.conn.commit()
 
+    # ------------------------------------------------------------------ pinning
+    # Pinning preserves narrative-bearing rows against proactive eviction.
+    # The mental model: pinning marks a row as "load-bearing — don't evict
+    # this in bulk operations". Time-based eviction, bulk-mode thinking
+    # surgery, and future auto-decay timers all skip pinned rows by default.
+    # Explicit-target eviction (evict_ids) ignores pin status because the
+    # caller is making an explicit choice — the pin is advisory, not a lock.
+
+    def pin_row(self, row_id: int, label: str = "pinned") -> bool:
+        """Pin a row with a free-form category label. Returns True if matched.
+
+        Label is free-form: 'commit', 'finding', 'decision', 'summary',
+        'directive', etc. Use `pin_label IS NOT NULL` for "all pinned" and
+        filter by specific label for "all commits", etc. An existing pin is
+        overwritten (idempotent re-pin with a new label is allowed).
+
+        Returns False if the row id doesn't exist.
+        """
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("label must be a non-empty string")
+        cur = self.conn.execute(
+            "UPDATE turns SET pin_label=? WHERE id=?",
+            (label.strip(), int(row_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def unpin_row(self, row_id: int) -> bool:
+        """Remove the pin from a row. Returns True if a previously-pinned row matched.
+
+        Returns False if the row didn't exist OR the row existed but was not
+        pinned. Idempotent: unpinning an unpinned row is a no-op.
+        """
+        cur = self.conn.execute(
+            "UPDATE turns SET pin_label=NULL WHERE id=? AND pin_label IS NOT NULL",
+            (int(row_id),),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def list_pinned(self, label: str | None = None) -> list[dict[str, Any]]:
+        """Return all pinned rows ordered by id ascending.
+
+        If `label` is provided, filters to rows with that exact pin_label.
+        Each row has the same shape as window() entries.
+        """
+        if label is not None:
+            q = (
+                "SELECT id, ts, role, content, tool_uses, tokens_in, tokens_out, pin_label "
+                "FROM turns WHERE pin_label=? ORDER BY id ASC"
+            )
+            params: tuple = (label,)
+        else:
+            q = (
+                "SELECT id, ts, role, content, tool_uses, tokens_in, tokens_out, pin_label "
+                "FROM turns WHERE pin_label IS NOT NULL ORDER BY id ASC"
+            )
+            params = ()
+        rows = []
+        for row in self.conn.execute(q, params):
+            rows.append({
+                "id": row[0],
+                "ts": row[1],
+                "role": row[2],
+                "content": _maybe_json(row[3]),
+                "tool_uses": json.loads(row[4]) if row[4] else None,
+                "tokens_in": row[5],
+                "tokens_out": row[6],
+                "pin_label": row[7],
+            })
+        return rows
+
     # ------------------------------------------------------------------ eviction
     # Manual-eviction primitives. Distinct from evict() above which is the
     # cap-driven FIFO eviction the agent loop calls every turn. These are the
     # *active forgetting* surface: producer/agent picks specific rows to drop.
 
-    def evict_last(self, n: int) -> int:
+    def evict_last(self, n: int, *, skip_pinned: bool = True) -> int:
         """Delete the N most-recent rows. Returns count actually deleted.
 
         Counts ALL rows including markers; if you want to drop the last N
         user/assistant turns specifically, filter first via window() and
         use evict_ids.
+
+        skip_pinned: if True (default) pinned rows are skipped over when
+            counting and selecting. Pass skip_pinned=False to ignore pins
+            and drop the most-recent N regardless of pin status.
         """
         if n <= 0:
             return 0
-        cur = self.conn.execute(
-            "SELECT id FROM turns ORDER BY id DESC LIMIT ?", (int(n),)
-        )
+        if skip_pinned:
+            cur = self.conn.execute(
+                "SELECT id FROM turns WHERE pin_label IS NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (int(n),),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT id FROM turns ORDER BY id DESC LIMIT ?", (int(n),)
+            )
         ids = [r[0] for r in cur.fetchall()]
         if not ids:
             return 0
@@ -219,12 +340,17 @@ class Store:
             rows.append({"id": row[0], "ts": row[1], "name": name})
         return rows
 
-    def evict_since(self, marker_name: str) -> int:
+    def evict_since(self, marker_name: str, *, skip_pinned: bool = True) -> int:
         """Delete the named marker AND every row appended after it.
 
         Resolves the marker by NAME picking the most recent (highest id)
         marker with that name. Deletes that marker plus all rows with
         id > marker_id. Returns count deleted, or 0 if no marker matched.
+
+        skip_pinned: if True (default) pinned rows in [marker_id, tail] are
+            preserved (the marker itself is also preserved if pinned, which
+            is unusual but consistent). Pass skip_pinned=False to drop
+            everything from the marker forward including pins.
         """
         cur = self.conn.execute(
             "SELECT id FROM turns WHERE role='marker' AND content=? ORDER BY id DESC LIMIT 1",
@@ -234,13 +360,96 @@ class Store:
         if not row:
             return 0
         marker_id = row[0]
-        cur = self.conn.execute(
-            "SELECT COUNT(*) FROM turns WHERE id >= ?", (marker_id,)
-        )
-        n = int(cur.fetchone()[0])
-        self.conn.execute("DELETE FROM turns WHERE id >= ?", (marker_id,))
+        if skip_pinned:
+            cur = self.conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE id >= ? AND pin_label IS NULL",
+                (marker_id,),
+            )
+            n = int(cur.fetchone()[0])
+            self.conn.execute(
+                "DELETE FROM turns WHERE id >= ? AND pin_label IS NULL",
+                (marker_id,),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE id >= ?", (marker_id,)
+            )
+            n = int(cur.fetchone()[0])
+            self.conn.execute("DELETE FROM turns WHERE id >= ?", (marker_id,))
         self.conn.commit()
         return n
+
+    def evict_older_than(
+        self,
+        seconds: int,
+        *,
+        skip_pinned: bool = True,
+    ) -> dict[str, int]:
+        """Delete rows whose ts is older than `seconds` ago. Row-level deletion.
+
+        Time-based proactive eviction. Designed for autonomous decay: an
+        agent can call `evict_older_than(600)` to drop everything from
+        more than 10 minutes ago, while pinned rows (commits, decisions,
+        load-bearing summaries) survive.
+
+        seconds: cutoff in seconds. Rows whose ts is older than now-seconds
+            are eligible. 0 or negative = nothing eligible.
+        skip_pinned: if True (default) pinned rows are preserved regardless
+            of age. Pass skip_pinned=False for hard time-based purges.
+
+        Returns:
+          {
+            "rows_evicted": rows actually deleted,
+            "rows_skipped_pinned": rows that matched the time cutoff but
+                                   were skipped because they were pinned
+                                   (only meaningful when skip_pinned=True),
+            "cutoff_ts":   the ISO timestamp used as cutoff.
+          }
+        """
+        if seconds <= 0:
+            return {
+                "rows_evicted": 0,
+                "rows_skipped_pinned": 0,
+                "cutoff_ts": _now(),
+            }
+        # Compute cutoff timestamp. Rows are stored with _now() ISO format
+        # in UTC, so string comparison on ts is monotonic and correct.
+        from datetime import timedelta
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=int(seconds))
+        cutoff_ts = cutoff_dt.isoformat()
+
+        # Count eligible rows by time + pin status for the report.
+        if skip_pinned:
+            cur = self.conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE ts < ? AND pin_label IS NULL",
+                (cutoff_ts,),
+            )
+            n_evict = int(cur.fetchone()[0])
+            cur = self.conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE ts < ? AND pin_label IS NOT NULL",
+                (cutoff_ts,),
+            )
+            n_skipped = int(cur.fetchone()[0])
+            self.conn.execute(
+                "DELETE FROM turns WHERE ts < ? AND pin_label IS NULL",
+                (cutoff_ts,),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE ts < ?", (cutoff_ts,)
+            )
+            n_evict = int(cur.fetchone()[0])
+            n_skipped = 0
+            self.conn.execute(
+                "DELETE FROM turns WHERE ts < ?", (cutoff_ts,)
+            )
+        if n_evict:
+            self.conn.commit()
+        return {
+            "rows_evicted": n_evict,
+            "rows_skipped_pinned": n_skipped,
+            "cutoff_ts": cutoff_ts,
+        }
 
     # ---------------------------------------------------- block-level surgery
     # The row-level eviction primitives above (evict_last/evict_ids/
@@ -256,6 +465,8 @@ class Store:
         ids: list[int] | None = None,
         keep_recent: int | None = None,
         all_rows: bool = False,
+        older_than_seconds: int | None = None,
+        skip_pinned: bool = True,
     ) -> dict[str, int]:
         """Strip 'thinking' blocks from selected rolling-window rows.
 
@@ -269,12 +480,21 @@ class Store:
 
         Selection (exactly one of these required):
 
-          ids          explicit row id list
-          keep_recent  strip from every row EXCEPT the most-recent N
-                       (preserves recent reasoning chains the model may
-                       still reference; 0 = strip from every row, same
-                       semantic as all_rows)
-          all_rows     strip from every row in the store
+          ids                 explicit row id list
+          keep_recent         strip from every row EXCEPT the most-recent N
+                              (preserves recent reasoning chains the model
+                              may still reference; 0 = strip from every row,
+                              same semantic as all_rows)
+          all_rows            strip from every row in the store
+          older_than_seconds  strip from every row whose ts is older than
+                              now-seconds (proactive time-based decay)
+
+        skip_pinned: if True (default) rows with pin_label IS NOT NULL are
+            excluded from the resolved target set after selector resolution.
+            Pass skip_pinned=False on explicit ids to override pin
+            protection (rare; agent making a deliberate choice). For bulk
+            modes (keep_recent, all_rows, older_than_seconds) the default
+            should almost always stay True.
 
         Rows whose stripping would leave 0 blocks are skipped without
         modification — the agent can `evict_ids` such rows separately
@@ -285,26 +505,31 @@ class Store:
 
         Returns:
           {
-            "rows_scanned":   rows examined (the selector's resolved set)
-            "rows_modified":  rows whose content was rewritten
-            "blocks_evicted": total thinking blocks removed
-            "bytes_freed":    sum of (old_content_len - new_content_len)
-                              across modified rows; rough estimate of
-                              context-budget savings (eviction enforces
-                              against bytes/4 per total_tokens()).
+            "rows_scanned":         rows examined after selector + pin filter
+            "rows_modified":        rows whose content was rewritten
+            "blocks_evicted":       total thinking blocks removed
+            "bytes_freed":          sum of (old_content_len - new_content_len)
+                                    across modified rows; rough estimate of
+                                    context-budget savings.
+            "rows_skipped_pinned":  rows that matched the selector but were
+                                    skipped because they were pinned (only
+                                    meaningful when skip_pinned=True).
           }
         """
         # Selector validation: exactly one path. `all_rows` defaults to
         # False so the explicit-True check is unambiguous; `keep_recent`
-        # uses None as the unset sentinel so 0 is a legal value.
+        # and `older_than_seconds` use None as the unset sentinel so 0 is
+        # a legal value (semantically a no-op for both).
         have_ids = ids is not None
         have_keep = keep_recent is not None
         have_all = all_rows is True
-        n_selected = sum([have_ids, have_keep, have_all])
+        have_older = older_than_seconds is not None
+        n_selected = sum([have_ids, have_keep, have_all, have_older])
         if n_selected != 1:
             raise ValueError(
-                "exactly one of ids, keep_recent, all_rows required "
-                f"(got ids={have_ids}, keep_recent={have_keep}, all_rows={have_all})"
+                "exactly one of ids, keep_recent, all_rows, older_than_seconds required "
+                f"(got ids={have_ids}, keep_recent={have_keep}, "
+                f"all_rows={have_all}, older_than_seconds={have_older})"
             )
 
         # Resolve the target id set.
@@ -320,9 +545,36 @@ class Store:
             all_ids_desc = [r[0] for r in cur.fetchall()]
             # Skip the first N (most recent); strip the rest.
             target_ids = all_ids_desc[n:]
+        elif have_older:
+            secs = int(older_than_seconds)  # type: ignore[arg-type]
+            if secs <= 0:
+                target_ids = []
+            else:
+                from datetime import timedelta
+                cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=secs)
+                cutoff_ts = cutoff_dt.isoformat()
+                cur = self.conn.execute(
+                    "SELECT id FROM turns WHERE ts < ? ORDER BY id ASC",
+                    (cutoff_ts,),
+                )
+                target_ids = [r[0] for r in cur.fetchall()]
         else:  # have_all
             cur = self.conn.execute("SELECT id FROM turns ORDER BY id ASC")
             target_ids = [r[0] for r in cur.fetchall()]
+
+        # Apply pin filter to the resolved id set.
+        rows_skipped_pinned = 0
+        if skip_pinned and target_ids:
+            placeholders = ",".join("?" * len(target_ids))
+            cur = self.conn.execute(
+                f"SELECT id FROM turns "
+                f"WHERE id IN ({placeholders}) AND pin_label IS NOT NULL",
+                target_ids,
+            )
+            pinned_ids = {r[0] for r in cur.fetchall()}
+            if pinned_ids:
+                target_ids = [i for i in target_ids if i not in pinned_ids]
+                rows_skipped_pinned = len(pinned_ids)
 
         if not target_ids:
             return {
@@ -330,6 +582,7 @@ class Store:
                 "rows_modified": 0,
                 "blocks_evicted": 0,
                 "bytes_freed": 0,
+                "rows_skipped_pinned": rows_skipped_pinned,
             }
 
         placeholders = ",".join("?" * len(target_ids))
@@ -381,6 +634,7 @@ class Store:
             "rows_modified": rows_modified,
             "blocks_evicted": blocks_evicted,
             "bytes_freed": bytes_freed,
+            "rows_skipped_pinned": rows_skipped_pinned,
         }
 
     def total_tokens(self) -> tuple[int, int]:
@@ -403,3 +657,35 @@ def _maybe_json(s: str):
         return json.loads(s)
     except Exception:
         return s
+
+
+def parse_duration_seconds(raw: str) -> int:
+    """Parse a duration string into seconds. Accepts 's', 'm', 'h', 'd' suffixes.
+
+    Examples:
+      '600'  -> 600  (bare integer = seconds)
+      '10s'  -> 10
+      '10m'  -> 600
+      '2h'   -> 7200
+      '1d'   -> 86400
+
+    Raises ValueError on unparseable input. Used by the /evict slash
+    command and the evict_older_than / evict_thinking_blocks MCP tools
+    so the parsing stays consistent across surfaces.
+    """
+    if raw is None:
+        raise ValueError("duration required")
+    s = str(raw).strip().lower()
+    if not s:
+        raise ValueError("duration required")
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s[-1] in multipliers:
+        try:
+            n = float(s[:-1])
+        except ValueError as exc:
+            raise ValueError(f"invalid duration: {raw!r}") from exc
+        return int(n * multipliers[s[-1]])
+    try:
+        return int(float(s))
+    except ValueError as exc:
+        raise ValueError(f"invalid duration: {raw!r}") from exc

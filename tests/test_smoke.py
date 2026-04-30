@@ -2662,6 +2662,7 @@ def test_evict_thinking_blocks_empty_ids_list_is_zero(home):
         "rows_modified": 0,
         "blocks_evicted": 0,
         "bytes_freed": 0,
+        "rows_skipped_pinned": 0,
     }
     # Original row untouched.
     rows = store.window()
@@ -2715,3 +2716,497 @@ def test_evict_thinking_blocks_messages_for_api_stays_valid(home):
             f"row produced empty content list: {m}"
         )
     store.close()
+
+
+# ---------------------------------------------------------------- pinning
+
+
+def test_pin_row_marks_row_with_label(home):
+    """pin_row sets pin_label and list_pinned surfaces the row."""
+    from mnemara.store import Store
+
+    store = Store("pin_basic_t")
+    rid = store.append_turn("assistant", [{"type": "text", "text": "hello"}])
+    matched = store.pin_row(rid, label="commit")
+    assert matched is True
+
+    pinned = store.list_pinned()
+    assert len(pinned) == 1
+    assert pinned[0]["id"] == rid
+    assert pinned[0]["pin_label"] == "commit"
+    store.close()
+
+
+def test_pin_row_unknown_id_returns_false(home):
+    """Pinning a non-existent row returns False (no error)."""
+    from mnemara.store import Store
+
+    store = Store("pin_unknown_t")
+    matched = store.pin_row(99999, label="commit")
+    assert matched is False
+    assert store.list_pinned() == []
+    store.close()
+
+
+def test_pin_row_idempotent_overwrites_label(home):
+    """Re-pinning a pinned row overwrites the label."""
+    from mnemara.store import Store
+
+    store = Store("pin_overwrite_t")
+    rid = store.append_turn("assistant", [{"type": "text", "text": "x"}])
+    store.pin_row(rid, label="finding")
+    store.pin_row(rid, label="decision")
+    pinned = store.list_pinned()
+    assert len(pinned) == 1
+    assert pinned[0]["pin_label"] == "decision"
+    store.close()
+
+
+def test_pin_row_rejects_empty_label(home):
+    """pin_row raises ValueError on empty/whitespace label."""
+    import pytest
+    from mnemara.store import Store
+
+    store = Store("pin_empty_label_t")
+    rid = store.append_turn("assistant", [{"type": "text", "text": "x"}])
+    with pytest.raises(ValueError, match="label must be"):
+        store.pin_row(rid, label="")
+    with pytest.raises(ValueError, match="label must be"):
+        store.pin_row(rid, label="   ")
+    store.close()
+
+
+def test_unpin_row_removes_pin(home):
+    """unpin_row clears pin_label and returns True only if row was pinned."""
+    from mnemara.store import Store
+
+    store = Store("unpin_basic_t")
+    rid = store.append_turn("assistant", [{"type": "text", "text": "x"}])
+    store.pin_row(rid, label="commit")
+    assert store.unpin_row(rid) is True
+    assert store.list_pinned() == []
+    # Idempotent: second unpin returns False (no longer pinned).
+    assert store.unpin_row(rid) is False
+    store.close()
+
+
+def test_unpin_row_unknown_id_returns_false(home):
+    """unpin_row on non-existent id is a no-op returning False."""
+    from mnemara.store import Store
+
+    store = Store("unpin_unknown_t")
+    assert store.unpin_row(99999) is False
+    store.close()
+
+
+def test_list_pinned_filters_by_label(home):
+    """list_pinned(label='X') returns only rows with that exact pin_label."""
+    from mnemara.store import Store
+
+    store = Store("list_filter_t")
+    a = store.append_turn("assistant", [{"type": "text", "text": "a"}])
+    b = store.append_turn("assistant", [{"type": "text", "text": "b"}])
+    c = store.append_turn("assistant", [{"type": "text", "text": "c"}])
+    store.pin_row(a, label="commit")
+    store.pin_row(b, label="commit")
+    store.pin_row(c, label="finding")
+
+    commits = store.list_pinned("commit")
+    assert sorted(r["id"] for r in commits) == sorted([a, b])
+    findings = store.list_pinned("finding")
+    assert [r["id"] for r in findings] == [c]
+    everything = store.list_pinned()
+    assert len(everything) == 3
+    none = store.list_pinned("nonexistent")
+    assert none == []
+    store.close()
+
+
+def test_list_pinned_empty_when_nothing_pinned(home):
+    """list_pinned() returns empty list when no rows are pinned."""
+    from mnemara.store import Store
+
+    store = Store("list_empty_t")
+    store.append_turn("assistant", [{"type": "text", "text": "x"}])
+    assert store.list_pinned() == []
+    store.close()
+
+
+def test_pin_label_survives_schema_migration_on_legacy_db(home, tmp_path, monkeypatch):
+    """A pre-existing turns table without pin_label gets the column added.
+
+    Regression guard: Store() on a legacy DB must not raise; it must add
+    the column via PRAGMA-driven ALTER TABLE and let pin/list operations
+    work afterwards.
+    """
+    import sqlite3
+    from mnemara import paths
+    from mnemara.store import Store
+
+    instance = "legacy_db_t"
+    db_path = paths.db_path(instance)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Pre-create the table with the OLD schema (no pin_label column).
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_uses TEXT,
+            tokens_in INTEGER,
+            tokens_out INTEGER
+        );
+    """)
+    conn.execute(
+        "INSERT INTO turns (ts, role, content, tool_uses, tokens_in, tokens_out) "
+        "VALUES ('2026-01-01T00:00:00+00:00', 'user', "
+        "'[{\"type\":\"text\",\"text\":\"legacy\"}]', NULL, NULL, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    # Now open via Store — must run the migration.
+    store = Store(instance)
+    cols = {row[1] for row in store.conn.execute("PRAGMA table_info(turns)")}
+    assert "pin_label" in cols, f"pin_label column missing after migration: {cols}"
+
+    # Pinning the legacy row must work.
+    cur = store.conn.execute("SELECT id FROM turns LIMIT 1")
+    row_id = cur.fetchone()[0]
+    assert store.pin_row(row_id, label="legacy_pin") is True
+    pinned = store.list_pinned()
+    assert len(pinned) == 1 and pinned[0]["pin_label"] == "legacy_pin"
+    store.close()
+
+
+# ---------------------------------------------------------------- evict_older_than
+
+
+def test_evict_older_than_drops_old_rows(home):
+    """Rows whose ts is older than the cutoff are deleted; recent rows survive."""
+    import sqlite3, time
+    from mnemara.store import Store
+
+    store = Store("eot_basic_t")
+    # Hand-build rows with crafted timestamps so the test is deterministic.
+    old_a = store.append_turn("user", [{"type": "text", "text": "old1"}])
+    old_b = store.append_turn("user", [{"type": "text", "text": "old2"}])
+    # Backdate by hand.
+    store.conn.execute(
+        "UPDATE turns SET ts='2020-01-01T00:00:00+00:00' WHERE id IN (?, ?)",
+        (old_a, old_b),
+    )
+    store.conn.commit()
+    fresh = store.append_turn("user", [{"type": "text", "text": "fresh"}])
+
+    result = store.evict_older_than(60)  # anything older than 1 minute
+    assert result["rows_evicted"] == 2
+    assert result["rows_skipped_pinned"] == 0
+
+    rows = store.window()
+    assert [r["id"] for r in rows] == [fresh]
+    store.close()
+
+
+def test_evict_older_than_skips_pinned_by_default(home):
+    """Pinned old rows are preserved; unpinned old rows are dropped."""
+    from mnemara.store import Store
+
+    store = Store("eot_skip_pinned_t")
+    pinned_old = store.append_turn("assistant", [{"type": "text", "text": "decision"}])
+    unpinned_old = store.append_turn("assistant", [{"type": "text", "text": "scratch"}])
+    store.conn.execute(
+        "UPDATE turns SET ts='2020-01-01T00:00:00+00:00' WHERE id IN (?, ?)",
+        (pinned_old, unpinned_old),
+    )
+    store.conn.commit()
+    store.pin_row(pinned_old, label="decision")
+
+    result = store.evict_older_than(60)
+    assert result["rows_evicted"] == 1
+    assert result["rows_skipped_pinned"] == 1
+    rows = store.window()
+    assert [r["id"] for r in rows] == [pinned_old]
+    store.close()
+
+
+def test_evict_older_than_force_drops_pinned(home):
+    """skip_pinned=False (force) drops pinned rows too."""
+    from mnemara.store import Store
+
+    store = Store("eot_force_t")
+    pinned_old = store.append_turn("assistant", [{"type": "text", "text": "x"}])
+    store.conn.execute(
+        "UPDATE turns SET ts='2020-01-01T00:00:00+00:00' WHERE id=?",
+        (pinned_old,),
+    )
+    store.conn.commit()
+    store.pin_row(pinned_old, label="commit")
+
+    result = store.evict_older_than(60, skip_pinned=False)
+    assert result["rows_evicted"] == 1
+    assert result["rows_skipped_pinned"] == 0
+    assert store.window() == []
+    store.close()
+
+
+def test_evict_older_than_zero_or_negative_is_noop(home):
+    """seconds <= 0 returns zero counts without touching the store."""
+    from mnemara.store import Store
+
+    store = Store("eot_zero_t")
+    rid = store.append_turn("assistant", [{"type": "text", "text": "x"}])
+    r0 = store.evict_older_than(0)
+    assert r0["rows_evicted"] == 0
+    r_neg = store.evict_older_than(-100)
+    assert r_neg["rows_evicted"] == 0
+    # Row still present.
+    assert [r["id"] for r in store.window()] == [rid]
+    store.close()
+
+
+def test_evict_older_than_recent_rows_not_evicted(home):
+    """A row created moments ago survives evict_older_than(600)."""
+    from mnemara.store import Store
+
+    store = Store("eot_recent_t")
+    rid = store.append_turn("assistant", [{"type": "text", "text": "x"}])
+    result = store.evict_older_than(600)
+    assert result["rows_evicted"] == 0
+    assert [r["id"] for r in store.window()] == [rid]
+    store.close()
+
+
+# ---------------------------------------------------------------- evict_thinking_blocks extensions
+
+
+def test_evict_thinking_blocks_older_than_strips_old_only(home):
+    """older_than_seconds selector strips thinking from time-old rows only."""
+    from mnemara.store import Store
+
+    store = Store("etb_older_t")
+    old_id = store.append_turn(
+        "assistant",
+        [{"type": "thinking", "text": "old"}, {"type": "text", "text": "answer"}],
+    )
+    store.conn.execute(
+        "UPDATE turns SET ts='2020-01-01T00:00:00+00:00' WHERE id=?",
+        (old_id,),
+    )
+    store.conn.commit()
+    fresh_id = store.append_turn(
+        "assistant",
+        [{"type": "thinking", "text": "fresh"}, {"type": "text", "text": "fresh ans"}],
+    )
+
+    result = store.evict_thinking_blocks(older_than_seconds=60)
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 1
+
+    rows = {r["id"]: r for r in store.window()}
+    # Old row had thinking stripped.
+    types_old = [b["type"] for b in rows[old_id]["content"]]
+    assert types_old == ["text"]
+    # Fresh row untouched.
+    types_fresh = [b["type"] for b in rows[fresh_id]["content"]]
+    assert types_fresh == ["thinking", "text"]
+    store.close()
+
+
+def test_evict_thinking_blocks_skips_pinned_in_bulk_modes(home):
+    """all_rows + keep_recent skip pinned rows by default."""
+    from mnemara.store import Store
+
+    store = Store("etb_pin_bulk_t")
+    pinned = store.append_turn(
+        "assistant",
+        [{"type": "thinking", "text": "important"}, {"type": "text", "text": "decision"}],
+    )
+    unpinned = store.append_turn(
+        "assistant",
+        [{"type": "thinking", "text": "scratch"}, {"type": "text", "text": "answer"}],
+    )
+    store.pin_row(pinned, label="decision")
+
+    result = store.evict_thinking_blocks(all_rows=True)
+    assert result["rows_modified"] == 1
+    assert result["rows_skipped_pinned"] == 1
+    assert result["blocks_evicted"] == 1
+
+    rows = {r["id"]: r for r in store.window()}
+    # Pinned row's thinking preserved.
+    assert [b["type"] for b in rows[pinned]["content"]] == ["thinking", "text"]
+    # Unpinned row's thinking stripped.
+    assert [b["type"] for b in rows[unpinned]["content"]] == ["text"]
+    store.close()
+
+
+def test_evict_thinking_blocks_skip_pinned_false_overrides(home):
+    """skip_pinned=False strips even pinned rows."""
+    from mnemara.store import Store
+
+    store = Store("etb_pin_force_t")
+    pinned = store.append_turn(
+        "assistant",
+        [{"type": "thinking", "text": "x"}, {"type": "text", "text": "y"}],
+    )
+    store.pin_row(pinned, label="commit")
+
+    result = store.evict_thinking_blocks(all_rows=True, skip_pinned=False)
+    assert result["rows_modified"] == 1
+    assert result["blocks_evicted"] == 1
+    assert result["rows_skipped_pinned"] == 0
+    rows = store.window()
+    assert [b["type"] for b in rows[0]["content"]] == ["text"]
+    store.close()
+
+
+def test_evict_thinking_blocks_explicit_ids_with_pin_skip(home):
+    """ids selector respects skip_pinned by default; a pinned id is preserved."""
+    from mnemara.store import Store
+
+    store = Store("etb_ids_pin_t")
+    pinned = store.append_turn(
+        "assistant",
+        [{"type": "thinking", "text": "x"}, {"type": "text", "text": "y"}],
+    )
+    store.pin_row(pinned, label="commit")
+
+    result = store.evict_thinking_blocks(ids=[pinned])
+    # Pinned row was filtered out before the strip pass.
+    assert result["rows_scanned"] == 0
+    assert result["rows_modified"] == 0
+    assert result["rows_skipped_pinned"] == 1
+    # With skip_pinned=False the same call strips it.
+    result2 = store.evict_thinking_blocks(ids=[pinned], skip_pinned=False)
+    assert result2["rows_modified"] == 1
+    store.close()
+
+
+def test_evict_thinking_blocks_selector_validation_includes_older(home):
+    """The 4-selector validation rejects zero or multiple selectors."""
+    import pytest
+    from mnemara.store import Store
+
+    store = Store("etb_sel_v2_t")
+    store.append_turn("assistant", [{"type": "text", "text": "x"}])
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks()
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks(older_than_seconds=60, all_rows=True)
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks(older_than_seconds=60, ids=[1])
+    with pytest.raises(ValueError, match="exactly one of"):
+        store.evict_thinking_blocks(older_than_seconds=60, keep_recent=2)
+    store.close()
+
+
+# ---------------------------------------------------------------- evict_last/evict_since with skip_pinned
+
+
+def test_evict_last_skips_pinned_by_default(home):
+    """evict_last(N) skips pinned rows when counting & deleting."""
+    from mnemara.store import Store
+
+    store = Store("el_pin_t")
+    a = store.append_turn("user", [{"type": "text", "text": "a"}])
+    b = store.append_turn("assistant", [{"type": "text", "text": "b"}])
+    c = store.append_turn("user", [{"type": "text", "text": "c"}])
+    store.pin_row(b, label="commit")
+
+    # evict_last(2) with skip_pinned=True should drop c and a (the two
+    # most-recent unpinned), leaving b alone.
+    deleted = store.evict_last(2)
+    assert deleted == 2
+    rows = store.window()
+    assert [r["id"] for r in rows] == [b]
+    store.close()
+
+
+def test_evict_last_force_drops_pinned(home):
+    """evict_last(N, skip_pinned=False) treats pinned rows like any other."""
+    from mnemara.store import Store
+
+    store = Store("el_force_t")
+    a = store.append_turn("user", [{"type": "text", "text": "a"}])
+    b = store.append_turn("assistant", [{"type": "text", "text": "b"}])
+    store.pin_row(b, label="commit")
+
+    deleted = store.evict_last(2, skip_pinned=False)
+    assert deleted == 2
+    assert store.window() == []
+    store.close()
+
+
+def test_evict_since_skips_pinned_by_default(home):
+    """evict_since preserves pinned rows in the deletion range."""
+    from mnemara.store import Store
+
+    store = Store("es_pin_t")
+    store.mark_segment("checkpoint")
+    pinned = store.append_turn(
+        "assistant", [{"type": "text", "text": "decision after marker"}]
+    )
+    unpinned = store.append_turn(
+        "user", [{"type": "text", "text": "stuff after marker"}]
+    )
+    store.pin_row(pinned, label="decision")
+
+    deleted = store.evict_since("checkpoint")
+    # Marker + unpinned dropped (2); pinned preserved.
+    assert deleted == 2
+    rows = store.window()
+    assert [r["id"] for r in rows] == [pinned]
+    store.close()
+
+
+def test_evict_since_force_drops_pinned(home):
+    """evict_since(skip_pinned=False) drops pinned rows too."""
+    from mnemara.store import Store
+
+    store = Store("es_force_t")
+    store.mark_segment("ckpt")
+    pinned = store.append_turn(
+        "assistant", [{"type": "text", "text": "x"}]
+    )
+    store.pin_row(pinned, label="commit")
+
+    deleted = store.evict_since("ckpt", skip_pinned=False)
+    assert deleted == 2  # marker + the pinned row
+    assert store.window() == []
+    store.close()
+
+
+# ---------------------------------------------------------------- parse_duration_seconds
+
+
+def test_parse_duration_seconds_basic_units():
+    """Bare integer + 's' / 'm' / 'h' / 'd' suffixes parse correctly."""
+    from mnemara.store import parse_duration_seconds
+
+    assert parse_duration_seconds("600") == 600
+    assert parse_duration_seconds("10s") == 10
+    assert parse_duration_seconds("10m") == 600
+    assert parse_duration_seconds("2h") == 7200
+    assert parse_duration_seconds("1d") == 86400
+    # Whitespace + uppercase tolerated.
+    assert parse_duration_seconds(" 10M ") == 600
+    # Float coefficient OK.
+    assert parse_duration_seconds("0.5m") == 30
+
+
+def test_parse_duration_seconds_invalid_raises():
+    """Empty, garbage, or unsupported-suffix input raises ValueError."""
+    import pytest
+    from mnemara.store import parse_duration_seconds
+
+    with pytest.raises(ValueError, match="duration required"):
+        parse_duration_seconds("")
+    with pytest.raises(ValueError, match="duration required"):
+        parse_duration_seconds("   ")
+    with pytest.raises(ValueError, match="invalid duration"):
+        parse_duration_seconds("abc")
+    with pytest.raises(ValueError, match="invalid duration"):
+        parse_duration_seconds("10x")  # unknown suffix falls through to int parse
