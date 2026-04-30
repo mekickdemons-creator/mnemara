@@ -1710,3 +1710,68 @@ def test_agent_eviction_tools_persist_to_store(home):
 
     _asyncio.run(_go())
     store.close()
+
+
+# ---------------------------------------------------------------- userinput paste
+
+
+def test_userinput_paste_collapses_multiline_atomically(home):
+    """_UserInput._on_paste joins multi-line content with spaces and inserts atomically.
+
+    Drives the Input via run_test() Pilot, posts a synthesized Paste event,
+    and asserts the resulting value is the collapsed single-line content
+    (not the first-line-only stock Textual behavior).
+    """
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+    from textual import events as _txt_events
+
+    config_mod.init_instance("paste_t")
+    app = tui_mod.MnemaraTUI("paste_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#userinput", tui_mod.Input)
+            inp.focus()
+            await pilot.pause()
+
+            # Plain single-line paste -> inserted as-is.
+            inp.value = ""
+            inp.cursor_position = 0
+            inp.post_message(_txt_events.Paste("hello world"))
+            await pilot.pause()
+            assert inp.value == "hello world"
+
+            # Multi-line paste -> collapsed with single spaces.
+            inp.value = ""
+            inp.cursor_position = 0
+            inp.post_message(_txt_events.Paste("line one\nline two\n\nline four"))
+            await pilot.pause()
+            assert inp.value == "line one line two line four"
+
+            # Paste at non-zero cursor preserves prefix/suffix.
+            inp.value = "AB CD"
+            inp.cursor_position = 3  # between 'B ' and 'CD'
+            inp.post_message(_txt_events.Paste("X\nY"))
+            await pilot.pause()
+            assert inp.value == "AB X YCD"
+
+            # Truncation cap: paste larger than _USERINPUT_PASTE_CAP gets clipped.
+            inp.value = ""
+            inp.cursor_position = 0
+            big = "a" * (tui_mod._USERINPUT_PASTE_CAP + 500)
+            inp.post_message(_txt_events.Paste(big))
+            await pilot.pause()
+            assert len(inp.value) == tui_mod._USERINPUT_PASTE_CAP
+
+            # Empty paste is a no-op.
+            inp.value = "preserved"
+            inp.cursor_position = len(inp.value)
+            inp.post_message(_txt_events.Paste(""))
+            await pilot.pause()
+            assert inp.value == "preserved"
+
+    _asyncio.run(_run())
+    app.store.close()

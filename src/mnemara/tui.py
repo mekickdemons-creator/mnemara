@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from textual import events as _txt_events
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Container, Horizontal, Vertical
@@ -36,6 +37,76 @@ try:
     _TEXTUAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _TEXTUAL_AVAILABLE = False
+
+
+# Ceiling on a single paste applied to the user input box. Beyond this, we
+# truncate and warn — keeps a runaway paste from stalling render or breaking
+# the rolling-window math when the next turn fires. Can be tuned later if
+# real-use pastes ever come close.
+_USERINPUT_PASTE_CAP = 16_000
+
+
+class _UserInput(Input):
+    """Input subclass with paste behavior tuned for Mnemara's userinput.
+
+    Stock Textual `Input._on_paste` (.venv/.../widgets/_input.py:746) discards
+    everything after the first line and inserts char-by-char via
+    `insert_text_at_cursor`. Two surprises producers reported on this widget:
+
+    1. **Ghosting + apparent freeze on multi-line paste.** Hypothesis: the
+       per-line / per-cursor-position write path during a paste burst races
+       with concurrent renders elsewhere on screen (status spinner ticking
+       at 150ms, chatlog auto-scroll). Visual signature: stale characters
+       linger near the input, terminal seems frozen until paste completes.
+    2. **Silent line drop.** `splitlines()[0]` means a 5-line paste shows
+       only the first line; producer assumes paste was incomplete. Single-
+       line input is by design (Enter submits) so we collapse the multi-
+       line content to one line by joining with spaces rather than dropping.
+
+    This subclass overrides `_on_paste` to:
+      - Join all lines with single spaces (collapse paragraphs, preserve word
+        boundaries).
+      - Truncate to `_USERINPUT_PASTE_CAP` chars to bound a runaway paste.
+      - Atomically reassign `self.value` (one assignment, one render) instead
+        of inserting char-by-char.
+      - Stop the event from propagating.
+      - Log the path taken so a future ghosting report can be diagnosed
+        from the debug log without instrumenting again.
+    """
+
+    def _on_paste(self, event: "_txt_events.Paste") -> None:  # type: ignore[name-defined]
+        # event.prevent_default() blocks the MRO walk in MessagePump from
+        # ever reaching the parent Input._on_paste; without it both run and
+        # the paste content gets inserted twice. event.stop() only stops
+        # bubbling up the widget tree, not the same-widget MRO chain.
+        event.prevent_default()
+        event.stop()
+        text = event.text or ""
+        if not text:
+            return
+        lines = text.splitlines()
+        # Multi-line collapse: join with single spaces, drop empty fragments
+        # so a "abc\n\ndef" paste becomes "abc def" not "abc  def".
+        collapsed = " ".join(part for part in (s.strip() for s in lines) if part)
+        truncated = False
+        if len(collapsed) > _USERINPUT_PASTE_CAP:
+            collapsed = collapsed[:_USERINPUT_PASTE_CAP]
+            truncated = True
+        # Atomic value replacement at cursor.
+        cur = self.cursor_position
+        old = self.value
+        self.value = old[:cur] + collapsed + old[cur:]
+        self.cursor_position = cur + len(collapsed)
+        try:
+            log(
+                "tui_paste",
+                bytes_in=len(text),
+                lines=len(lines),
+                bytes_inserted=len(collapsed),
+                truncated=truncated,
+            )
+        except Exception:
+            pass
 
 from . import config as config_mod
 from . import inbox as inbox_mod
@@ -277,7 +348,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             auto_scroll=True,
         )
         yield Static(self._status_text(), id="status")
-        yield Input(
+        yield _UserInput(
             placeholder="message  (Enter to send, /help for commands, Ctrl+C to quit)",
             id="userinput",
         )
@@ -726,7 +797,14 @@ class MnemaraTUI(App):  # type: ignore[misc]
     _paste_unavailable_warned: bool = False
 
     def action_paste(self) -> None:
-        """Insert clipboard text at the cursor of the focused Input widget."""
+        """Insert clipboard text at the cursor of the focused Input widget.
+
+        Behavior matches `_UserInput._on_paste` (terminal-bracketed-paste path)
+        when targeting the userinput widget: multi-line content collapses to
+        a single space-joined line, capped at `_USERINPUT_PASTE_CAP` chars.
+        For other Input widgets (modal note-text input) the raw text is
+        inserted as-is so multi-paragraph notes still work.
+        """
         try:
             import pyperclip  # type: ignore[import]
             paste_text: str = pyperclip.paste()
@@ -745,6 +823,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
         focused = self.focused
         if not isinstance(focused, Input):
             return
+
+        # Userinput-targeted paste mirrors the terminal-bracketed-paste path
+        # so producer experience is identical regardless of paste mechanism.
+        if getattr(focused, "id", None) == "userinput":
+            lines = paste_text.splitlines()
+            collapsed = " ".join(part for part in (s.strip() for s in lines) if part)
+            if len(collapsed) > _USERINPUT_PASTE_CAP:
+                collapsed = collapsed[:_USERINPUT_PASTE_CAP]
+            paste_text = collapsed
+            if not paste_text:
+                return
 
         cur = focused.cursor_position
         focused.value = focused.value[:cur] + paste_text + focused.value[cur:]
