@@ -553,7 +553,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
             db = getattr(self.cfg, "architect_db_path", "") or ""
             peers = getattr(self.cfg, "peer_roles", ["theseus", "majordomo"])
             if db:
-                n_inbox = inbox_mod.count_pending(db, peers, exclude_role=self.instance)
+                n_inbox = inbox_mod.count_pending(
+                    db, peers, exclude_role=self.instance, instance=self.instance
+                )
                 if n_inbox > 0:
                     base += f" | [yellow]I {n_inbox} pending[/yellow]"
         except Exception:
@@ -658,7 +660,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
         if not db or not peers:
             return
         try:
-            pings = inbox_mod.peek_pending_pings(db, peers, exclude_role=self.instance)
+            pings = inbox_mod.peek_pending_pings(
+                db, peers, exclude_role=self.instance, instance=self.instance
+            )
         except Exception:
             return
         if not pings:
@@ -775,7 +779,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "examine the payload, and:\n"
             f"  - If the payload requests action or expects a reply, "
             f"act on it and call submit_return(role=\"{self.instance}\", "
-            f"task_id=\"{task_id}\", payload={{...}}) to respond.\n"
+            f"task_id=\"{task_id}\", recipient_role=\"{sender}\", "
+            f"payload={{...}}) to respond. Always set recipient_role to the "
+            f"original sender so the reply routes back to them and ONLY them — "
+            f"omitting recipient_role broadcasts to every peer's inbox.\n"
             "  - Use payload.type='reply_final' or 'ack_final' on your "
             "reply if no further round-trip is needed (this prevents the "
             "peer's auto-respond loop, if they have one, from re-triggering).\n"
@@ -1007,7 +1014,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 chat.write("[dim]inbox: not configured (set architect_db_path in config)[/dim]")
                 return
             peers = getattr(self.cfg, "peer_roles", ["theseus", "majordomo"])
-            pings = inbox_mod.peek_pending_pings(db, peers, exclude_role=self.instance)
+            pings = inbox_mod.peek_pending_pings(
+                db, peers, exclude_role=self.instance, instance=self.instance
+            )
             chat.write(inbox_mod.format_inbox(pings))
             # Manual /inbox check counts as "seen" — update tracker so the
             # ambient poller doesn't re-notify on the next 5s tick.

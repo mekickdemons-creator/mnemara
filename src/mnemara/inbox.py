@@ -29,11 +29,26 @@ def peek_pending_pings(
     architect_db_path: "str | None",
     peer_roles: list[str],
     exclude_role: "str | None" = None,
+    instance: "str | None" = None,
 ) -> list[dict[str, Any]]:
-    """Return all pending pings from peer_roles, oldest-first.
+    """Return pending pings addressed to `instance`, oldest-first.
 
-    Reads `returns` table with status='pending' and agent_role IN peer_roles.
-    exclude_role is removed from the query set (caller's own instance/role).
+    Reads `returns` with status='pending' AND agent_role IN peer_roles. Then
+    applies recipient routing:
+
+      - If `instance` is given AND the row has a recipient_role set, the row
+        is visible only when recipient_role == instance.
+      - If `instance` is given AND recipient_role IS NULL, the row is treated
+        as broadcast (visible to all peers — preserves backward compat for
+        rows that pre-date the 2026-04-30 schema migration).
+      - If `instance` is None (legacy callers), no recipient filter is
+        applied at all and every row matching the sender filter returns.
+        This preserves pre-recipient-aware behavior; new callers should
+        always pass `instance`.
+
+    exclude_role is removed from the sender query set (caller's own role,
+    so we don't drain our own outbox).
+
     Returns [] on any error or if the DB is unconfigured. Never writes.
     """
     if not architect_db_path:
@@ -46,13 +61,28 @@ def peek_pending_pings(
         return []
     try:
         placeholders = ",".join("?" * len(roles))
-        rows = conn.execute(
-            f"SELECT id, agent_role, task_id, payload_json, submitted_at "
-            f"FROM returns "
-            f"WHERE status='pending' AND agent_role IN ({placeholders}) "
-            f"ORDER BY submitted_at ASC",
-            roles,
-        ).fetchall()
+        # Recipient filter: include rows addressed to us OR rows with no
+        # recipient (NULL = broadcast/legacy). When `instance` is None,
+        # skip the recipient predicate entirely (legacy callers).
+        if instance is not None:
+            sql = (
+                f"SELECT id, agent_role, task_id, payload_json, submitted_at "
+                f"FROM returns "
+                f"WHERE status='pending' "
+                f"  AND agent_role IN ({placeholders}) "
+                f"  AND (recipient_role = ? OR recipient_role IS NULL) "
+                f"ORDER BY submitted_at ASC"
+            )
+            params = [*roles, instance]
+        else:
+            sql = (
+                f"SELECT id, agent_role, task_id, payload_json, submitted_at "
+                f"FROM returns "
+                f"WHERE status='pending' AND agent_role IN ({placeholders}) "
+                f"ORDER BY submitted_at ASC"
+            )
+            params = list(roles)
+        rows = conn.execute(sql, params).fetchall()
         now = datetime.now(timezone.utc)
         result = []
         for row in rows:
@@ -88,10 +118,11 @@ def count_pending(
     architect_db_path: "str | None",
     peer_roles: list[str],
     exclude_role: "str | None" = None,
+    instance: "str | None" = None,
 ) -> int:
-    """Return the count of pending pings from peer_roles. Returns 0 on any error."""
+    """Return the count of pending pings addressed to `instance`. Returns 0 on any error."""
     try:
-        return len(peek_pending_pings(architect_db_path, peer_roles, exclude_role))
+        return len(peek_pending_pings(architect_db_path, peer_roles, exclude_role, instance=instance))
     except Exception:
         return 0
 

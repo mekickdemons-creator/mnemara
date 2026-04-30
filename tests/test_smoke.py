@@ -576,7 +576,8 @@ def test_inbox_peek_pending_pings_with_mocked_db(tmp_path):
             payload_json TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             processed_at TEXT,
-            completed_at TEXT
+            completed_at TEXT,
+            recipient_role TEXT
         )
     """)
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1896,7 +1897,8 @@ def test_check_inbox_ambient_notifies_on_new_pings(home, tmp_path):
         "  payload_json TEXT NOT NULL,"
         "  status TEXT NOT NULL DEFAULT 'pending',"
         "  processed_at TEXT,"
-        "  completed_at TEXT"
+        "  completed_at TEXT,"
+        "  recipient_role TEXT"
         ")"
     )
     conn.execute("CREATE INDEX idx_returns_status ON returns(status)")
@@ -2006,7 +2008,8 @@ def _build_returns_db(tmp_path):
         "  payload_json TEXT NOT NULL,"
         "  status TEXT NOT NULL DEFAULT 'pending',"
         "  processed_at TEXT,"
-        "  completed_at TEXT"
+        "  completed_at TEXT,"
+        "  recipient_role TEXT"
         ")"
     )
     conn.execute("CREATE INDEX idx_returns_status ON returns(status)")
@@ -2014,12 +2017,13 @@ def _build_returns_db(tmp_path):
     return db_path, conn
 
 
-def _seed_ping(conn, sender, task="tX", payload_type="hello"):
+def _seed_ping(conn, sender, task="tX", payload_type="hello", recipient=None):
     cur = conn.execute(
         "INSERT INTO returns (session_id, agent_role, task_id, "
-        "submitted_at, payload_json, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+        "submitted_at, payload_json, status, recipient_role) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
         ("sess1", sender, task, "2026-04-30T00:00:00+00:00",
-         '{"type":"' + payload_type + '","body":"x"}'),
+         '{"type":"' + payload_type + '","body":"x"}', recipient),
     )
     conn.commit()
     return cur.lastrowid
@@ -2256,4 +2260,146 @@ def test_inbox_auto_respond_boot_backlog_primes_both_trackers(home, tmp_path):
 
     _asyncio.run(_run())
     app.store.close()
+    conn.close()
+
+
+# ---------------------------------------------------------------- routing
+
+
+def test_peek_pending_pings_routes_to_recipient(home, tmp_path):
+    """Rows with recipient_role=X are visible only to instance X.
+
+    Producer-flagged 2026-04-30: a ping from substrate addressed to
+    cognition-researcher was visible to producer's poller because the
+    schema had no recipient column. Producer's auto-respond worker
+    drained the misroute. Schema fix: recipient_role column + filter
+    in peek_pending_pings.
+    """
+    from mnemara.inbox import peek_pending_pings
+
+    db_path, conn = _build_returns_db(tmp_path)
+    # Seed three rows from substrate addressed to different recipients.
+    to_researcher = _seed_ping(conn, "substrate", task="t1", recipient="cognition-researcher")
+    to_producer = _seed_ping(conn, "substrate", task="t2", recipient="producer")
+    broadcast = _seed_ping(conn, "substrate", task="t3", recipient=None)
+
+    peers = ["substrate", "majordomo", "producer"]
+
+    # Researcher's poller should see only the row addressed to it + broadcast.
+    pings = peek_pending_pings(
+        str(db_path), peers, exclude_role="cognition-researcher",
+        instance="cognition-researcher",
+    )
+    ids = sorted(p["id"] for p in pings)
+    assert ids == sorted([to_researcher, broadcast]), (
+        f"researcher should see {[to_researcher, broadcast]}, got {ids}"
+    )
+
+    # Producer's poller should see only the row addressed to it + broadcast.
+    pings = peek_pending_pings(
+        str(db_path), peers, exclude_role="producer", instance="producer",
+    )
+    ids = sorted(p["id"] for p in pings)
+    assert ids == sorted([to_producer, broadcast]), (
+        f"producer should see {[to_producer, broadcast]}, got {ids}"
+    )
+
+    # Majordomo's poller should see ONLY the broadcast row (nothing
+    # addressed to majordomo).
+    pings = peek_pending_pings(
+        str(db_path), peers, exclude_role="majordomo", instance="majordomo",
+    )
+    ids = sorted(p["id"] for p in pings)
+    assert ids == [broadcast], (
+        f"majordomo should see only [{broadcast}], got {ids}"
+    )
+
+    conn.close()
+
+
+def test_peek_pending_pings_no_instance_is_legacy_broadcast(home, tmp_path):
+    """When instance=None, no recipient filter applies (legacy callers).
+
+    Preserves backward compat for any callers that pre-date the recipient
+    parameter. They get every row matching the sender filter, same as
+    before the schema migration.
+    """
+    from mnemara.inbox import peek_pending_pings
+
+    db_path, conn = _build_returns_db(tmp_path)
+    a = _seed_ping(conn, "substrate", recipient="alice")
+    b = _seed_ping(conn, "substrate", recipient="bob")
+    c = _seed_ping(conn, "substrate", recipient=None)
+
+    pings = peek_pending_pings(
+        str(db_path), ["substrate"], exclude_role="anyone", instance=None,
+    )
+    ids = sorted(p["id"] for p in pings)
+    assert ids == sorted([a, b, c])
+
+    conn.close()
+
+
+def test_peek_pending_pings_excludes_self_outbox(home, tmp_path):
+    """exclude_role still filters out the caller's own authored rows.
+
+    Even with recipient routing, a panel must not drain its own outbox
+    (that would break the protocol: senders read their own replies via
+    next_return(agent_role=peer), not via inbox-poll).
+    """
+    from mnemara.inbox import peek_pending_pings
+
+    db_path, conn = _build_returns_db(tmp_path)
+    # producer's own outbound row (would be wrong to surface in producer's inbox).
+    own = _seed_ping(conn, "producer", recipient="substrate")
+    # incoming row addressed to producer.
+    incoming = _seed_ping(conn, "substrate", recipient="producer")
+
+    peers = ["substrate", "producer", "majordomo"]
+    pings = peek_pending_pings(
+        str(db_path), peers, exclude_role="producer", instance="producer",
+    )
+    ids = sorted(p["id"] for p in pings)
+    assert ids == [incoming], (
+        f"producer must not see its own outbox (#{own}); got {ids}"
+    )
+
+    conn.close()
+
+
+def test_count_pending_routes_to_recipient(home, tmp_path):
+    """count_pending honors the recipient filter (used by status bar).
+
+    Status bar's pending count must reflect what the panel will actually
+    auto-surface, not what's in the queue overall.
+    """
+    from mnemara.inbox import count_pending
+
+    db_path, conn = _build_returns_db(tmp_path)
+    _seed_ping(conn, "substrate", recipient="cognition-researcher")
+    _seed_ping(conn, "substrate", recipient="cognition-researcher")
+    _seed_ping(conn, "substrate", recipient="producer")
+    _seed_ping(conn, "substrate", recipient=None)  # broadcast: visible to all
+
+    n = count_pending(
+        str(db_path), ["substrate"], exclude_role="cognition-researcher",
+        instance="cognition-researcher",
+    )
+    # 2 addressed + 1 broadcast = 3
+    assert n == 3
+
+    n = count_pending(
+        str(db_path), ["substrate"], exclude_role="producer",
+        instance="producer",
+    )
+    # 1 addressed + 1 broadcast = 2
+    assert n == 2
+
+    n = count_pending(
+        str(db_path), ["substrate"], exclude_role="majordomo",
+        instance="majordomo",
+    )
+    # 0 addressed + 1 broadcast = 1
+    assert n == 1
+
     conn.close()
