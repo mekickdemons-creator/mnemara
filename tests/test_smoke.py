@@ -1865,3 +1865,123 @@ def test_on_input_submitted_returns_before_send_turn_completes(home, monkeypatch
 
     _asyncio.run(_run())
     app.store.close()
+
+
+# ---------------------------------------------------------------- ambient inbox
+
+
+def test_check_inbox_ambient_notifies_on_new_pings(home, tmp_path):
+    """_check_inbox_ambient walks boot -> new ping -> ack -> new ping cleanly.
+
+    Sets up a temp muninn.db with the returns schema, points the panel's
+    config at it, and exercises the state-tracker mutations across each
+    transition. Notification text is RichLog content (hard to introspect
+    cleanly in unit tests); _last_seen_inbox_id is the load-bearing
+    behavior we assert on.
+    """
+    import asyncio as _asyncio
+    import sqlite3 as _sqlite3
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    db_path = tmp_path / "muninn.db"
+    conn = _sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE returns ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  session_id TEXT NOT NULL,"
+        "  agent_role TEXT NOT NULL,"
+        "  task_id TEXT,"
+        "  submitted_at TEXT NOT NULL,"
+        "  payload_json TEXT NOT NULL,"
+        "  status TEXT NOT NULL DEFAULT 'pending',"
+        "  processed_at TEXT,"
+        "  completed_at TEXT"
+        ")"
+    )
+    conn.execute("CREATE INDEX idx_returns_status ON returns(status)")
+    conn.commit()
+
+    def _add_ping(sender: str, task: str = "tX", payload_type: str = "hello") -> int:
+        cur = conn.execute(
+            "INSERT INTO returns (session_id, agent_role, task_id, "
+            "submitted_at, payload_json, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+            ("sess1", sender, task, "2026-04-30T00:00:00+00:00",
+             '{"type":"' + payload_type + '","body":"x"}'),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    def _ack_all() -> None:
+        conn.execute("UPDATE returns SET status='completed' WHERE status='pending'")
+        conn.commit()
+
+    config_mod.init_instance("inbox_amb_t")
+    cfg = config_mod.load("inbox_amb_t")
+    cfg.architect_db_path = str(db_path)
+    cfg.peer_roles = ["substrate", "majordomo", "producer"]
+    config_mod.save("inbox_amb_t", cfg)
+
+    app = tui_mod.MnemaraTUI("inbox_amb_t")
+
+    async def _run() -> None:
+        # Pre-boot: one ping already pending.
+        boot_ping_id = _add_ping("substrate", task="ping_001")
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            # Boot path already ran in on_mount. Tracker should reflect
+            # the pre-existing ping.
+            assert app._last_seen_inbox_id == boot_ping_id
+
+            # Add a brand-new ping. _check_inbox_ambient should bump
+            # tracker forward.
+            new_id = _add_ping("majordomo", task="ping_002", payload_type="reply")
+            assert new_id > boot_ping_id
+            app._check_inbox_ambient(boot=False)
+            assert app._last_seen_inbox_id == new_id
+
+            # Calling again with no new rows is a no-op.
+            tracker_before = app._last_seen_inbox_id
+            app._check_inbox_ambient(boot=False)
+            assert app._last_seen_inbox_id == tracker_before
+
+            # Ack everything; next poll should reset the tracker to 0.
+            _ack_all()
+            app._check_inbox_ambient(boot=False)
+            assert app._last_seen_inbox_id == 0
+
+            # New ping after the ack: notifies again, tracker advances.
+            future_id = _add_ping("producer", task="ping_003")
+            app._check_inbox_ambient(boot=False)
+            assert app._last_seen_inbox_id == future_id
+
+    _asyncio.run(_run())
+    app.store.close()
+    conn.close()
+
+
+def test_check_inbox_ambient_no_db_is_noop(home):
+    """When architect_db_path is unset, the poller is a clean no-op."""
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    config_mod.init_instance("inbox_no_db_t")
+    cfg = config_mod.load("inbox_no_db_t")
+    cfg.architect_db_path = ""
+    cfg.peer_roles = ["substrate"]
+    config_mod.save("inbox_no_db_t", cfg)
+
+    app = tui_mod.MnemaraTUI("inbox_no_db_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._last_seen_inbox_id == 0
+            app._check_inbox_ambient(boot=False)
+            assert app._last_seen_inbox_id == 0
+
+    _asyncio.run(_run())
+    app.store.close()

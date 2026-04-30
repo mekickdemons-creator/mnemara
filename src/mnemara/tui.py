@@ -333,6 +333,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._cached_status_static = ""
         self._spinner_timer = None  # set in on_mount
 
+        # Ambient inbox state. Polls the architect returns table every 5s
+        # for new peer pings — surfaces a chatlog notification line when a
+        # new ping lands AND refreshes the status-bar pending count without
+        # waiting for a turn boundary. Producer-flagged 2026-04-30: pings
+        # arriving during idle weren't visible until the producer manually
+        # ran /inbox or took a turn (which is what triggers the existing
+        # turn-time auto-surface). _last_seen_inbox_id tracks the highest
+        # row id we've already notified about so re-polls don't spam.
+        self._last_seen_inbox_id = 0
+        self._inbox_ambient_timer = None  # set in on_mount
+
     # ------------------------------------------------------------- composition
 
     def compose(self) -> "ComposeResult":
@@ -444,6 +455,18 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._spinner_timer = self.set_interval(0.15, self._tick_spinner)
         except Exception:
             self._spinner_timer = None
+        # Boot inbox check + start the ambient poller. Synchronous boot
+        # check writes a one-line "N pending on boot" notice if any pings
+        # are waiting from peers, then primes _last_seen_inbox_id so the
+        # interval poller (5s cadence) only fires for NEW pings.
+        try:
+            self._check_inbox_ambient(boot=True)
+        except Exception:
+            pass
+        try:
+            self._inbox_ambient_timer = self.set_interval(5.0, self._check_inbox_ambient)
+        except Exception:
+            self._inbox_ambient_timer = None
         self._render_history()
         self._focus_input_after_refresh()
 
@@ -569,6 +592,86 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._spinner_was_busy = False
             self._spinner_idx = 0
             self._render_status_widget()
+
+    def _check_inbox_ambient(self, *, boot: bool = False) -> None:
+        """Interval-timer callback. Surfaces new peer pings ambiently.
+
+        Polls the architect returns table every 5s for pending pings from
+        any role in self.cfg.peer_roles (excluding self). On the first
+        call (boot=True) writes a single "N pending on boot" notice if
+        any pings exist, then primes _last_seen_inbox_id. Subsequent
+        calls fire one chatlog notification line per NEW ping (id >
+        _last_seen_inbox_id) and refresh the status-bar count.
+
+        Producer-flagged 2026-04-30: pings arriving during idle weren't
+        visible until /inbox or a turn was taken. The existing
+        inbox_auto_surface mechanism (agent.py) only fires at turn
+        time — prepending the notice to the user prompt — which means
+        the producer has to type something to be told a ping arrived.
+        That's wrong for a coordinator panel that's mostly idle. This
+        poller is the ambient-notification half of the same UX.
+
+        DB cost: count_pending is a single indexed query; running it at
+        0.2Hz is trivial. The poll lives entirely in this Mnemara
+        process; architect daemon is unaffected.
+        """
+        db = getattr(self.cfg, "architect_db_path", "") or ""
+        peers = getattr(self.cfg, "peer_roles", []) or []
+        if not db or not peers:
+            return
+        try:
+            pings = inbox_mod.peek_pending_pings(db, peers, exclude_role=self.instance)
+        except Exception:
+            return
+        if not pings:
+            # Inbox is empty. If we previously had pings tracked, clear
+            # the marker and refresh the status bar so the count drops.
+            if self._last_seen_inbox_id > 0:
+                self._last_seen_inbox_id = 0
+                self._refresh_status()
+            return
+        if boot:
+            # First check on mount: collapse all pending into one notice
+            # so a panel that boots with a backlog doesn't spam the
+            # chatlog with one line per row.
+            try:
+                chat = self._chat()
+                senders = sorted({p["agent_role"] for p in pings})
+                chat.write(
+                    f"[yellow]inbox: {len(pings)} pending ping"
+                    f"{'s' if len(pings) != 1 else ''} on boot from "
+                    f"{', '.join(senders)} — /inbox to read[/yellow]"
+                )
+            except Exception:
+                pass
+            self._last_seen_inbox_id = max(p["id"] for p in pings)
+            self._refresh_status()
+            return
+        new_pings = [p for p in pings if p["id"] > self._last_seen_inbox_id]
+        if not new_pings:
+            return
+        # New pings landed. One notification line each.
+        try:
+            chat = self._chat()
+            for p in new_pings:
+                sender = p["agent_role"]
+                row_id = p["id"]
+                task_id = p["task_id"]
+                ptype = p["payload_type"]
+                bits = [f"#{row_id}"]
+                if task_id:
+                    bits.append(f"task={task_id}")
+                if ptype:
+                    bits.append(f"type={ptype}")
+                chat.write(
+                    f"[yellow]📨 inbox: ping from {sender} ("
+                    + ", ".join(bits)
+                    + ") — /inbox to read[/yellow]"
+                )
+        except Exception:
+            pass
+        self._last_seen_inbox_id = max(p["id"] for p in pings)
+        self._refresh_status()
 
     def _render_history(self) -> None:
         log_widget = self._chat()
@@ -795,6 +898,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
             peers = getattr(self.cfg, "peer_roles", ["theseus", "majordomo"])
             pings = inbox_mod.peek_pending_pings(db, peers, exclude_role=self.instance)
             chat.write(inbox_mod.format_inbox(pings))
+            # Manual /inbox check counts as "seen" — update tracker so the
+            # ambient poller doesn't re-notify on the next 5s tick.
+            if pings:
+                self._last_seen_inbox_id = max(
+                    self._last_seen_inbox_id, max(p["id"] for p in pings)
+                )
             return
 
         if cmd == "/window":
