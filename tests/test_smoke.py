@@ -4838,7 +4838,6 @@ def test_tui_stop_slash_when_not_busy(home, monkeypatch):
 # /export slash command
 # ----------------------------------------------------------------------
 
-@pytest.mark.skip(reason="feature not in stable build")
 def test_slash_export_writes_temp_file(home, tmp_path):
     """/export writes the full window to a temp file and prints its path."""
     import asyncio as _asyncio
@@ -4882,7 +4881,6 @@ def test_slash_export_writes_temp_file(home, tmp_path):
     app.store.close()
 
 
-@pytest.mark.skip(reason="feature not in stable build")
 def test_slash_export_explicit_path(home, tmp_path):
     """/export N path writes last N turns to the explicit path."""
     import asyncio as _asyncio
@@ -4918,7 +4916,6 @@ def test_slash_export_explicit_path(home, tmp_path):
     app.store.close()
 
 
-@pytest.mark.skip(reason="feature not in stable build")
 def test_slash_export_empty_window(home):
     """/export on an empty window shows a 'nothing to export' message."""
     import asyncio as _asyncio
@@ -4942,7 +4939,6 @@ def test_slash_export_empty_window(home):
     app.store.close()
 
 
-@pytest.mark.skip(reason="feature not in stable build")
 def test_slash_export_last_n(home, tmp_path):
     """/export N (without explicit path) exports only last N turns."""
     import asyncio as _asyncio
@@ -4980,7 +4976,6 @@ def test_slash_export_last_n(home, tmp_path):
     app.store.close()
 
 
-@pytest.mark.skip(reason="feature not in stable build")
 def test_slash_export_bad_n_shows_usage(home):
     """/export with a non-integer non-path first token shows usage hint."""
     import asyncio as _asyncio

@@ -5,14 +5,17 @@ Three features, nothing else:
   2. Token-count eviction only             (row cap is not enforced here)
   3. Spinner during streaming turns
 
-Slash commands: /quit, /exit, /models, /swap, and /tokens.
-No inbox polling, no block surgery, no pin system, no copy/export, no /stop.
+Slash commands: /quit, /exit, /models, /swap, /tokens, and /export.
+No inbox polling, no block surgery, no pin system, no copy, no /stop.
 """
 from __future__ import annotations
 
 import asyncio
 import atexit
 import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 try:
@@ -171,6 +174,28 @@ def _flatten_text_blocks(content: Any) -> str:
         if isinstance(b, dict) and b.get("type") == "text":
             parts.append(b.get("text", ""))
     return "\n".join(p for p in parts if p)
+
+
+def _render_export_rows(rows: list[dict[str, Any]], instance: str) -> str:
+    ts = datetime.now(timezone.utc).isoformat()
+    lines = [
+        f"# Mnemara Export: {instance}",
+        "",
+        f"- exported_at: {ts}",
+        f"- turns: {len(rows)}",
+        "",
+    ]
+    for row in rows:
+        role = str(row.get("role", "unknown"))
+        row_ts = str(row.get("ts", ""))
+        lines.append(f"## {role} {row.get('id', '')}")
+        if row_ts:
+            lines.append(f"_ts: {row_ts}_")
+            lines.append("")
+        text = _flatten_text_blocks(row.get("content", ""))
+        lines.append(text or "(no text content)")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -522,9 +547,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self._slash_swap_model(arg, chat)
             return
 
+        if cmd == "/export":
+            await self._slash_export(arg, chat)
+            return
+
         chat.write(
             f"[dim]unknown command: {cmd} — /quit, /exit, /models, "
-            "/swap MODEL, or /tokens N[/dim]"
+            "/swap MODEL, /tokens N, or /export[/dim]"
         )
 
     def _slash_models(self, chat: "RichLog") -> None:
@@ -601,6 +630,54 @@ class MnemaraTUI(App):  # type: ignore[misc]
             persist_note = "(in-memory only — reverts on restart)"
         chat.write(f"[green]tokens: {old} → {n}[/green]  [dim]{persist_note}[/dim]")
         self._refresh_status()
+
+    async def _slash_export(self, arg: str, chat: "RichLog") -> None:
+        """/export [N] [path] — write rolling-window text to markdown."""
+        parts = arg.split()
+        n: int | None = None
+        out_path: Path | None = None
+        if parts:
+            first = parts[0]
+            if first.isdigit():
+                n = int(first)
+                if n <= 0:
+                    chat.write("[red]usage: /export [N] [path]  (N must be > 0)[/red]")
+                    return
+                if len(parts) > 1:
+                    out_path = Path(" ".join(parts[1:])).expanduser()
+            elif len(parts) == 1 and (
+                first.startswith("/")
+                or first.startswith("~")
+                or first.endswith(".md")
+                or "/" in first
+            ):
+                out_path = Path(first).expanduser()
+            else:
+                chat.write("[red]usage: /export [N] [path][/red]")
+                return
+        rows = self.store.window()
+        if n is not None:
+            rows = rows[-n:]
+        if not rows:
+            chat.write("[dim]window is empty; nothing to export[/dim]")
+            return
+        if out_path is None:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            safe_instance = "".join(
+                c if c.isalnum() or c in ("-", "_") else "_"
+                for c in self.instance
+            )
+            out_path = Path(tempfile.gettempdir()) / f"mnemara_{safe_instance}_{stamp}.md"
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                _render_export_rows(rows, self.instance),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            chat.write(f"[red]export failed: {exc}[/red]")
+            return
+        chat.write(f"[green]exported {len(rows)} turn(s):[/green] {out_path}")
 
     # ---------------------------------------------------------------- actions
 
