@@ -1,6 +1,6 @@
 # Mnemara
 
-A controlled rolling-context conversation runtime for Claude. Runs an
+A controlled rolling-context conversation runtime for Codex. Runs an
 interactive REPL with transparent context construction: a re-read-every-call
 role doc as the system prompt, a configurable rolling window of recent turns,
 native tool use (Bash, Read, Edit, Write, WriteMemory), and optional MCP
@@ -21,17 +21,14 @@ pip install -e .
 
 ### Auth
 
-Mnemara uses the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk-overview),
-which talks to your local `claude` CLI. It inherits your Claude Code
-subscription auth — no API key required. If you have not already authed:
+Mnemara shells out to your local `codex` CLI and inherits its auth. If you
+have not already authed:
 
 ```bash
-claude auth login
+codex login
 ```
 
-`ANTHROPIC_API_KEY` is **not** required. If it is set in your environment
-the underlying `claude` CLI may use it (billed against API credits); leave
-it unset to bill against your subscription.
+No Anthropic key or Claude SDK is required.
 
 ## Quick start
 
@@ -50,7 +47,7 @@ REPL — useful for scripting or non-TTY contexts.
 
 ```
 +------------------------------------------------------------+
-| mnemara: majordomo            model=opus-4-7  role=...     |   header
+| mnemara: majordomo            model=gpt-5.3-codex role=... |   header
 +------------------------------------------------------------+
 |                                                            |
 |  you: how do I check the lease timeout?                    |
@@ -59,7 +56,7 @@ REPL — useful for scripting or non-TTY contexts.
 |    result: ...                                             |
 |                                                            |   chat log
 +------------------------------------------------------------+
-| turns: 12/100 | tokens: 14K/200K | model: opus-4-7 | ...   |   status
+| turns: 12/100 | tokens: 14K/200K | model: gpt-5.3-codex | ... | status
 +------------------------------------------------------------+
 | > _                                                        |   input
 +------------------------------------------------------------+
@@ -105,7 +102,7 @@ Everything for an instance lives under `~/.mnemara/<instance>/`:
 | Field | Meaning |
 |---|---|
 | `role_doc_path` | Absolute path to the role doc. Re-read on every API call. Pinned as the system prompt. |
-| `model` | Anthropic model id (e.g. `claude-opus-4-5`). |
+| `model` | Codex/OpenAI model id (e.g. `gpt-5.3-codex`). |
 | `max_window_turns` | Rolling-window size (FIFO). Default 20. Counts both user and assistant turns. |
 | `allowed_tools` | List of `{tool, mode, allowed_patterns}` policies. `mode` ∈ `allow`/`ask`/`deny`. |
 | `mcp_servers` | List of stdio MCP servers wired through to the model. |
@@ -191,9 +188,9 @@ Add an entry to `mcp_servers` in `config.json`:
 ]
 ```
 
-Mnemara passes this to the Claude Agent SDK's `mcp_servers` option. The SDK
-launches the stdio process and exposes its tools to the model under the
-`mcp__<name>__*` namespace; Mnemara automatically allow-lists those.
+Mnemara records these servers in its runtime metadata and allow-lists their
+`mcp__<name>__*` namespace. Native Codex MCP wire-through is the next bridge
+step once the transport surface is finalized.
 
 ### v0.3 — Graph backend (kuzu) + sleep/replay primitive
 
@@ -316,18 +313,13 @@ tokens render live via new `on_token` / `on_tool_use` / `on_tool_result`
 callbacks on `AgentSession.turn_async()`. The bare prompt-toolkit REPL
 remains as the `--no-tui` / `MNEMARA_NO_TUI=1` fallback.
 
-### Architecture note (v0.1.1)
+### Architecture note (v0.4.0)
 
-Mnemara now uses the **Claude Agent SDK** (`claude-agent-sdk`) rather than
-the raw Anthropic API SDK. The SDK is a higher-level wrapper around the
-`claude` CLI: it does not accept a fabricated `messages=[...]` list with
-synthetic assistant turns. Mnemara therefore serialises the rolling-window
-transcript into a prefix prepended to each turn's user prompt, with the
-role doc still pinned as `system_prompt`. Bash/Read/Edit/Write are
-delegated to Claude Code's built-in tools (the SDK runs them in `cwd`);
-WriteMemory is registered as an in-process SDK MCP tool. Permissions still
-flow through Mnemara's `permissions.py` policy via the SDK's
-`can_use_tool` callback.
+Mnemara now uses the **Codex CLI** (`codex exec --json`) as its turn runner.
+The CLI is stateless per invocation, so Mnemara serialises the role doc and
+rolling-window transcript into each turn prompt. Bash/file operations are
+delegated to Codex's built-in tools. Mnemara still owns the persistent
+turn store, memory/wiki/RAG/graph backends, config, and eviction policy.
 
 ## Where state lives
 
@@ -346,13 +338,12 @@ flow through Mnemara's `permissions.py` policy via the SDK's
 
 ## Troubleshooting
 
-- **Auth errors / "claude CLI not found"** — install Claude Code and run
-  `claude auth login`. Mnemara delegates auth entirely to the `claude` CLI.
+- **Auth errors / "codex CLI not found"** — install Codex and run
+  `codex login`. Mnemara delegates auth entirely to the `codex` CLI.
 - **Role doc not loading** — Mnemara warns to stderr and uses an empty system
   prompt; the REPL stays alive. Check `debug.log` for the path that failed.
-- **MCP server crashes** — check `debug.log` and the server's own stderr; the
-  SDK propagates the launch failure. As a fallback, remove the entry from
-  `mcp_servers` and rely on native tools.
+- **MCP server crashes** — check `debug.log` and the server's own stderr.
+  As a fallback, remove the entry from `mcp_servers` and rely on native tools.
 - **Window eviction surprises** — `mnemara show --instance <name>` prints the
   current window. The rolling window keeps the last `max_window_turns` rows;
   long tool-use turns count as one row but can carry many content blocks.

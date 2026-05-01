@@ -8,7 +8,7 @@ from typing import Any
 
 from . import paths
 
-DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "gpt-5.3-codex"
 DEFAULT_MAX_TURNS = 100
 DEFAULT_MAX_TOKENS = 500_000  # matches observed productive ceiling — natural compaction sets in around 600K, 500K leaves 100K safety buffer
 
@@ -16,16 +16,16 @@ DEFAULT_MAX_TOKENS = 500_000  # matches observed productive ceiling — natural 
 def normalize_model_name(raw: str) -> str:
     """Validate and normalize a model name string. Returns the cleaned name.
 
-    Accepts Anthropic-style model identifiers: an alphabetic first character
+    Accepts Codex/OpenAI-style model identifiers: an alphabetic first character
     followed by letters, digits, dots, or hyphens. Strips outer whitespace
     but rejects any internal whitespace (the bug producer reported
-    2026-04-30 was `/swap claude sonnet 4 5` with spaces silently stored as
-    a literal model="claude sonnet 4 5" string, which the SDK then rejected
+    2026-04-30 was `/swap gpt 5 codex` with spaces silently stored as
+    a literal model="gpt 5 codex" string, which the transport then rejected
     on the next turn with an opaque error from deep in the transport).
 
-    Permissive about the model FAMILY by design — Anthropic adds new
-    families regularly ('claude-3-...', 'claude-3-5-...', 'claude-sonnet-4-5',
-    'claude-opus-4-7', etc.) and a hardcoded allowlist would drift. Format
+    Permissive about the model FAMILY by design — OpenAI/Codex model names
+    change over time ('gpt-5.3-codex', 'gpt-5.4-mini', future families), and
+    a hardcoded allowlist would drift. Format
     validation catches the common typo classes (whitespace, control chars,
     accidental quotes) and lets the API itself reject genuinely-unknown
     model names on first use with a clear error.
@@ -46,7 +46,7 @@ def normalize_model_name(raw: str) -> str:
     if any(c.isspace() for c in s):
         raise ValueError(
             f"model name contains whitespace: {raw!r} — "
-            "did you mean it without spaces? (e.g. 'claude-sonnet-4-5')"
+            "did you mean it without spaces? (e.g. 'gpt-5.3-codex')"
         )
     if not s[0].isalpha():
         raise ValueError(
@@ -192,7 +192,16 @@ class Config:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Config":
         tools = [ToolPolicy(**t) for t in d.get("allowed_tools", [])]
-        servers = [McpServer(**s) for s in d.get("mcp_servers", [])]
+        servers = [
+            McpServer(
+                name=str(s.get("name", "")),
+                command=str(s.get("command", "")),
+                args=list(s.get("args", [])),
+                env=dict(s.get("env", {})),
+            )
+            for s in d.get("mcp_servers", [])
+            if isinstance(s, dict)
+        ]
         return cls(
             role_doc_path=d.get("role_doc_path", ""),
             model=d.get("model", DEFAULT_MODEL),

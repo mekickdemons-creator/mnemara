@@ -308,7 +308,7 @@ class Store:
         return rows
 
     def messages_for_api(self) -> list[dict]:
-        """Build the messages= list for the Anthropic API from stored turns.
+        """Build a generic messages-style list from stored turns.
 
         Only user/assistant rows are emitted. Marker rows (role='marker')
         and any future non-conversational rows are filtered out.
@@ -710,7 +710,7 @@ class Store:
           - non-list content (legacy strings, marker JSON strings) is
             scanned but skipped (no blocks to strip)
           - rows whose strip would leave 0 blocks are skipped without
-            modification (Anthropic API rejects empty content lists)
+            modification (empty content lists are not useful context)
           - returns {rows_scanned, rows_modified, blocks_evicted,
             bytes_freed, rows_skipped_pinned}
         """
@@ -747,8 +747,7 @@ class Store:
             if n_evicted == 0:
                 continue
             if not new_blocks:
-                # Don't leave a row with empty content — Anthropic's API
-                # rejects messages with empty content lists. Agent can
+                # Don't leave a row with empty content. Agent can
                 # evict_ids this row separately if they want it gone.
                 continue
             new_str = json.dumps(new_blocks)
@@ -856,20 +855,12 @@ class Store:
         strings) — far more than thinking. Stripping them is the highest-
         impact context budget intervention available.
 
-        Pairing safety note: in the standard SDK pattern, tool_use blocks
-        in assistant turns pair with tool_result blocks in the next user
-        turn. Anthropic's API rejects orphaned pairs in the LAST assistant
-        message (the one being continued). However, mnemara's agent ONLY
-        persists assistant_blocks — tool_result blocks from the SDK come
-        back via callback only and are never stored. So all tool_use blocks
-        in our store are already orphaned by design, and stripping them
-        from HISTORICAL rows is safe (the API tolerates orphaned tool_use
-        in non-final assistant messages because the model already
-        incorporated the result into its continuation text/thinking before
-        producing the stored assistant_blocks). The skip-empty-row rule
-        prevents accidentally leaving an empty content list on the most-
-        recent assistant turn if it happened to consist entirely of
-        tool_use blocks.
+        Pairing safety note: Mnemara persists assistant-facing blocks as an
+        audit trail, while tool results are surfaced live and summarized by
+        the model's final text. Historical tool_use blocks are therefore
+        safe to strip when they become context bloat. The skip-empty-row rule
+        prevents accidentally leaving an empty content list on a turn that
+        consisted entirely of tool_use blocks.
 
         Selectors and behavior identical to evict_thinking_blocks.
 
@@ -912,8 +903,8 @@ class Store:
     # marks them as superseded for audit clarity. The major savings come
     # from the Edit/Write side.
 
-    # Tool-name conventions. Anthropic's built-in toolset uses these
-    # names; mnemara's MCP-spawned tools never collide because they're
+    # Tool-name conventions. Built-in file tools use these names;
+    # mnemara's MCP-spawned tools never collide because they're
     # prefixed with mcp__. NotebookEdit uses 'edits' or 'cell_source'
     # depending on cell type; we strip both. MultiEdit stores 'edits'
     # (a list of dicts with old_string/new_string per edit).
