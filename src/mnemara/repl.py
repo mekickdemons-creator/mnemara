@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sys
-import shutil
+import os
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
@@ -13,7 +13,7 @@ from rich.markdown import Markdown
 from . import config as config_mod
 from . import inbox as inbox_mod
 from . import paths
-from .agent import AgentSession
+from .agent import AgentSession, _codex_bin
 from .config import Config
 from .logging_util import log, set_log_path
 from .permissions import PermissionStore
@@ -54,7 +54,8 @@ def run(instance: str) -> None:
     perms = PermissionStore(instance)
     log("repl_start", instance=instance, model=cfg.model)
 
-    if shutil.which("codex") is None:
+    codex_bin = _codex_bin()
+    if not (Path(codex_bin).is_file() and os.access(codex_bin, os.X_OK)):
         console.print("[red]codex CLI not found. Install Codex and authenticate first.[/red]")
         sys.exit(1)
 
