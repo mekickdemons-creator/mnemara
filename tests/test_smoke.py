@@ -206,6 +206,36 @@ def test_tui_imports_and_instantiates(home):
     app.store.close()
 
 
+def test_tui_models_and_swap_commands(home):
+    """TUI exposes the Codex model list and can swap by index."""
+    import asyncio as _asyncio
+    from mnemara import config
+    config.init_instance("tui_models_t")
+    from mnemara import tui as tui_mod
+
+    app = tui_mod.MnemaraTUI("tui_models_t")
+
+    class _Chat:
+        def __init__(self):
+            self.lines: list[str] = []
+
+        def write(self, line: str) -> None:
+            self.lines.append(line)
+
+    chat = _Chat()
+    app._chat = lambda: chat  # type: ignore[method-assign]
+
+    async def _run():
+        await app._handle_slash("/models")
+        await app._handle_slash("/swap 1")
+
+    _asyncio.run(_run())
+    assert any("gpt-5.5" in line for line in chat.lines)
+    assert app.cfg.model == "gpt-5.5"
+    assert config.load("tui_models_t").model == "gpt-5.5"
+    app.store.close()
+
+
 def test_on_token_callback_invoked(home, monkeypatch):
     """Streaming on_token callback receives text deltas during turn_async."""
     import asyncio as _asyncio
@@ -3301,6 +3331,23 @@ def test_normalize_model_name_idempotent_on_clean_input():
     from mnemara.config import normalize_model_name
 
     assert normalize_model_name("gpt-5.3-codex") == "gpt-5.3-codex"
+
+
+def test_resolve_model_choice_accepts_indexes_aliases_and_exact_names():
+    from mnemara.config import resolve_model_choice
+
+    assert resolve_model_choice("1") == "gpt-5.5"
+    assert resolve_model_choice("codex") == "gpt-5.3-codex"
+    assert resolve_model_choice("mini") == "gpt-5.4-mini"
+    assert resolve_model_choice("gpt-5.2") == "gpt-5.2"
+
+
+def test_resolve_model_choice_rejects_bad_index():
+    import pytest
+    from mnemara.config import resolve_model_choice
+
+    with pytest.raises(ValueError, match="out of range"):
+        resolve_model_choice("99")
 
 
 # ---------------------------------------------------------------- tool_use surgery

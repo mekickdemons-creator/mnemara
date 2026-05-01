@@ -9,6 +9,20 @@ from typing import Any
 from . import paths
 
 DEFAULT_MODEL = "gpt-5.3-codex"
+AVAILABLE_MODELS = [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+]
+MODEL_ALIASES = {
+    "latest": "gpt-5.5",
+    "frontier": "gpt-5.5",
+    "default": DEFAULT_MODEL,
+    "codex": "gpt-5.3-codex",
+    "mini": "gpt-5.4-mini",
+}
 DEFAULT_MAX_TURNS = 100
 DEFAULT_MAX_TOKENS = 500_000  # matches observed productive ceiling — natural compaction sets in around 600K, 500K leaves 100K safety buffer
 
@@ -60,6 +74,31 @@ def normalize_model_name(raw: str) -> str:
                 "(allowed: letters, digits, '.', '-')"
             )
     return s
+
+
+def resolve_model_choice(raw: str) -> str:
+    """Resolve /swap input to a model id.
+
+    Accepts exact model ids, 1-based indexes from AVAILABLE_MODELS, and a
+    small alias set for fast TUI use.
+    """
+    if raw is None:
+        raise ValueError("model name required")
+    s = str(raw).strip()
+    if not s:
+        raise ValueError("model name required")
+    if s.isdigit():
+        idx = int(s)
+        if 1 <= idx <= len(AVAILABLE_MODELS):
+            return AVAILABLE_MODELS[idx - 1]
+        raise ValueError(
+            f"model index out of range: {idx} "
+            f"(choose 1-{len(AVAILABLE_MODELS)})"
+        )
+    alias = MODEL_ALIASES.get(s.lower())
+    if alias:
+        return alias
+    return normalize_model_name(s)
 
 
 @dataclass
