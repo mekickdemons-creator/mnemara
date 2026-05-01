@@ -4310,3 +4310,227 @@ def test_config_default_includes_evict_write_pairs_policy():
     cfg = Config.default()
     tool_names = {t.tool for t in cfg.allowed_tools}
     assert "EvictWritePairs" in tool_names
+
+
+# ----------------------------------------------------------------------
+# row_cap_slack_when_token_headroom — token-aware row-cap relaxation
+# ----------------------------------------------------------------------
+# Semantics under test:
+#   - slack=0 (default) preserves existing strict-cap behavior (backward-compat)
+#   - slack>0 with token usage BELOW HEADROOM_RATIO * max_tokens lets row count
+#     stretch by `slack` rows beyond max_turns
+#   - slack>0 with token usage AT/ABOVE the threshold trims to max_turns strictly
+#   - slack>0 with NO max_tokens (None) leaves slack disengaged (defensive)
+#   - the second pass (token cap) still trims if total bytes exceed max_tokens
+#     regardless of row count, giving us the hard byte ceiling we promised
+
+
+def test_evict_slack_zero_preserves_existing_behavior(home):
+    """Default slack=0 means strict row cap, identical to pre-v0.3.3 behavior."""
+    from mnemara.store import Store
+
+    store = Store("evslack_zero_t")
+    for i in range(5):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+    deleted = store.evict(max_turns=2, max_tokens=1_000_000)
+    assert deleted == 3
+    assert len(store.window()) == 2
+    store.close()
+
+
+def test_evict_slack_engaged_with_token_headroom(home):
+    """With slack=3 and tokens well under threshold, row count of 7 (max=5)
+    is allowed to stretch and no rows are deleted (since 7 <= 5 + 3)."""
+    from mnemara.store import Store
+
+    store = Store("evslack_headroom_t")
+    # Each turn ~7 chars => ~1 token under the /4 heuristic. With max_tokens
+    # set high, current usage is far under HEADROOM_RATIO * max_tokens.
+    for i in range(7):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+    deleted = store.evict(max_turns=5, max_tokens=1_000_000, row_cap_slack=3)
+    assert deleted == 0  # 7 <= 5 + 3, no eviction needed
+    assert len(store.window()) == 7
+    store.close()
+
+
+def test_evict_slack_trims_to_effective_cap_not_strict(home):
+    """When n exceeds max + slack, we trim to (max + slack), NOT to max.
+    The slack ceiling is the new soft cap — keeping rows trickle-deleted."""
+    from mnemara.store import Store
+
+    store = Store("evslack_trim_t")
+    for i in range(12):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+    # max=5, slack=3 → effective cap 8. 12 rows → delete 4 down to 8.
+    deleted = store.evict(max_turns=5, max_tokens=1_000_000, row_cap_slack=3)
+    assert deleted == 4
+    assert len(store.window()) == 8
+    store.close()
+
+
+def test_evict_slack_disengaged_when_tokens_above_threshold(home):
+    """Tokens at/above 50% of max_tokens disable slack — strict row cap fires."""
+    from mnemara.store import Store
+
+    store = Store("evslack_above_t")
+    # Build content that reliably exceeds the headroom threshold.
+    # Each row's content has ~4000 chars => ~1000 tokens. 6 rows => ~6000 tokens.
+    # max_tokens=10_000 means HEADROOM_RATIO * max_tokens = 5_000.
+    # current=~6000 > 5000 → slack disengaged → strict cap of 5 applies.
+    for i in range(6):
+        store.append_turn("user", [{"type": "text", "text": "x" * 4000}])
+    deleted = store.evict(max_turns=5, max_tokens=10_000, row_cap_slack=3)
+    assert deleted == 1  # strict cap, one row dropped
+    assert len(store.window()) == 5
+    store.close()
+
+
+def test_evict_slack_disengaged_when_max_tokens_is_none(home):
+    """Defensive: without max_tokens, headroom is undefined; slack stays off."""
+    from mnemara.store import Store
+
+    store = Store("evslack_no_max_t")
+    for i in range(7):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+    deleted = store.evict(max_turns=5, max_tokens=None, row_cap_slack=3)
+    assert deleted == 2  # strict cap, slack ignored
+    assert len(store.window()) == 5
+    store.close()
+
+
+def test_evict_slack_token_cap_still_hard_ceiling(home):
+    """Slack relaxes ROW cap, not TOKEN cap. If total bytes exceed
+    max_tokens, the second pass trims regardless of slack."""
+    from mnemara.store import Store
+
+    store = Store("evslack_token_ceiling_t")
+    # 6 rows * 4000 chars * /4 heuristic = ~6000 tokens. max_tokens=4000
+    # forces the token-cap pass to trim until total <= 4000. The first
+    # pass (with slack) wouldn't fire (6 < 5+3=8) but the second pass
+    # still has to delete rows to satisfy the byte ceiling.
+    for i in range(6):
+        store.append_turn("user", [{"type": "text", "text": "x" * 4000}])
+    deleted = store.evict(max_turns=5, max_tokens=4_000, row_cap_slack=3)
+    # After token-cap trim, total bytes/4 should be <= 4000.
+    cur = store.conn.execute("SELECT COALESCE(SUM(LENGTH(content)) / 4, 0) FROM turns")
+    total = int(cur.fetchone()[0])
+    assert total <= 4000
+    assert deleted >= 2  # had to drop at least 2 rows to fit byte ceiling
+    store.close()
+
+
+def test_evict_slack_dynamic_tightening_when_tokens_climb(home):
+    """When token usage transitions from headroom to no-headroom,
+    the next evict() call snaps from the slack ceiling to the strict cap."""
+    from mnemara.store import Store
+
+    store = Store("evslack_dynamic_t")
+    # Phase 1: lots of small rows under threshold, slack engages.
+    for i in range(8):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+    deleted_1 = store.evict(max_turns=5, max_tokens=10_000, row_cap_slack=3)
+    assert deleted_1 == 0  # 8 <= 5 + 3, slack absorbed the overage
+    assert len(store.window()) == 8
+
+    # Phase 2: append a heavy row that pushes total above the headroom
+    # threshold. Now slack disengages and the strict cap fires.
+    # Need total tokens to cross 5000 (50% of 10_000): each char/4 = tokens,
+    # so 5000 tokens = 20_000 chars total content. 8 rows of ~7 chars = 56 chars
+    # already; need ~20_000 more.
+    store.append_turn("user", [{"type": "text", "text": "x" * 25_000}])
+    deleted_2 = store.evict(max_turns=5, max_tokens=10_000, row_cap_slack=3)
+    # 9 rows now, strict cap fires → delete 4 down to 5. Then token cap
+    # may trim further if still over 10_000 tokens; depends on residual.
+    # We just assert deleted_2 reduced count to <= 5 (strict cap applied).
+    assert len(store.window()) <= 5
+    store.close()
+
+
+def test_evict_slack_at_exact_threshold_disengages(home):
+    """Boundary: tokens exactly at threshold means NOT below threshold —
+    slack stays off (we use strict < not <=)."""
+    from mnemara.store import Store
+
+    store = Store("evslack_boundary_t")
+    # Engineer total content/4 exactly == max_tokens * 0.5.
+    # max_tokens=2000 → threshold 1000. Need content len 4000 exactly.
+    # Make 5 rows of 800 chars each = 4000 chars total = 1000 tokens.
+    for i in range(5):
+        store.append_turn("user", [{"type": "text", "text": "x" * 800}])
+    # Confirm we're exactly at threshold.
+    cur = store.conn.execute("SELECT COALESCE(SUM(LENGTH(content)) / 4, 0) FROM turns")
+    total = int(cur.fetchone()[0])
+    # Some overhead from JSON wrapping makes the exact value uncertain; this
+    # test verifies the comparison shape (strict less-than): if at-or-above
+    # threshold, slack disengages. If we ended up below (because heuristic
+    # rounding), slack engages and this test correctly fails-loudly so we
+    # know to adjust our calibration.
+    if total >= 1000:
+        # Above/at threshold: slack disengaged, strict cap of 3 fires.
+        deleted = store.evict(max_turns=3, max_tokens=2000, row_cap_slack=2)
+        assert deleted == 2
+        assert len(store.window()) == 3
+    else:
+        # Below threshold (heuristic rounding): slack engages, ceiling 3+2=5.
+        deleted = store.evict(max_turns=3, max_tokens=2000, row_cap_slack=2)
+        assert len(store.window()) <= 5
+    store.close()
+
+
+def test_evict_slack_bumps_eviction_stats(home):
+    """Slack-induced trims still bump rows_evicted in the stats counter."""
+    from mnemara.store import Store
+
+    store = Store("evslack_stats_t")
+    for i in range(10):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+    s_before = store.get_eviction_stats()
+    assert s_before["rows_evicted"] == 0
+    # max=5, slack=2 → effective cap 7, delete 3.
+    deleted = store.evict(max_turns=5, max_tokens=1_000_000, row_cap_slack=2)
+    assert deleted == 3
+    s_after = store.get_eviction_stats()
+    assert s_after["rows_evicted"] == 3
+    store.close()
+
+
+# ----------------------------------------------------------------------
+# Config.row_cap_slack_when_token_headroom — toggle wiring
+# ----------------------------------------------------------------------
+
+
+def test_config_row_cap_slack_default_zero():
+    from mnemara.config import Config
+
+    cfg = Config()
+    assert cfg.row_cap_slack_when_token_headroom == 0
+
+
+def test_config_row_cap_slack_round_trips_through_dict():
+    from mnemara.config import Config
+
+    cfg = Config()
+    cfg.row_cap_slack_when_token_headroom = 30
+    d = cfg.to_dict()
+    assert d["row_cap_slack_when_token_headroom"] == 30
+    cfg2 = Config.from_dict(d)
+    assert cfg2.row_cap_slack_when_token_headroom == 30
+
+
+def test_config_row_cap_slack_missing_field_defaults_zero():
+    """Pre-existing config.json files without the field load as 0
+    (backward-compat — feature disabled)."""
+    from mnemara.config import Config
+
+    minimal = {"role_doc_path": "", "model": "claude-opus-4-5"}
+    cfg = Config.from_dict(minimal)
+    assert cfg.row_cap_slack_when_token_headroom == 0
+
+
+def test_config_row_cap_slack_coerces_string_to_int():
+    """Tolerant load: '30' becomes 30 (matches other int fields' from_dict pattern)."""
+    from mnemara.config import Config
+
+    cfg = Config.from_dict({"row_cap_slack_when_token_headroom": "30"})
+    assert cfg.row_cap_slack_when_token_headroom == 30

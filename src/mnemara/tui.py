@@ -548,8 +548,20 @@ class MnemaraTUI(App):  # type: ignore[misc]
         if ev_stats["blocks_evicted"]:
             kb = ev_stats["bytes_freed"] / 1024
             ev_str += f" {ev_stats['blocks_evicted']}b ~{kb:.0f}KB"
+        # Displayed row cap reflects the absolute upper bound: when
+        # row_cap_slack_when_token_headroom > 0, the cap can stretch by
+        # that many rows when token usage is below the headroom threshold.
+        # We show the maximum (max + slack) as the displayed cap; the
+        # dynamic-tightening (slack disappears when tokens climb) happens
+        # internally in Store.evict() and isn't surfaced in the bar. This
+        # keeps the display monotonic — Major sees a stable ceiling and
+        # the count climbs toward it.
+        slack = getattr(self.cfg, "row_cap_slack_when_token_headroom", 0) or 0
+        cap_str = f"{self.cfg.max_window_turns}"
+        if slack > 0:
+            cap_str = f"{self.cfg.max_window_turns}+{slack}"
         base = (
-            f"turns: {n_turns}/{self.cfg.max_window_turns} | "
+            f"turns: {n_turns}/{cap_str} | "
             f"tokens: {tin}/{self.cfg.max_window_tokens} (out: {tout} cum) | "
             f"model: {self.cfg.model} | evicted: {ev_str}"
         )

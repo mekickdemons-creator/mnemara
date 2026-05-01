@@ -139,22 +139,65 @@ class Store:
         self.conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
 
-    def evict(self, max_turns: int, max_tokens: int | None = None) -> int:
+    # Headroom threshold for row-cap slack. When current token usage is below
+    # this fraction of max_tokens, the row cap can be exceeded by up to
+    # row_cap_slack rows. Hardcoded at 0.5 (50%) for the v0.3.3 ship; if
+    # operators need to tune the threshold separately from the slack count,
+    # promote this to a Config field. The single-knob brief was deliberate —
+    # one config field (row_cap_slack_when_token_headroom) tunes the magnitude
+    # of the slack; the threshold below tunes when it engages and stays a
+    # constant unless we get evidence otherwise.
+    HEADROOM_RATIO: float = 0.5
+
+    def evict(
+        self,
+        max_turns: int,
+        max_tokens: int | None = None,
+        *,
+        row_cap_slack: int = 0,
+    ) -> int:
         """Evict oldest turns until both caps are satisfied. Returns number deleted.
 
-        max_turns: hard cap on row count.
+        max_turns: hard cap on row count (the strict ceiling).
         max_tokens: optional cap on estimated stored context size in tokens.
             Estimated as sum(LENGTH(content)) // 4 across all rows — the API's
             tokens_in column compounds the entire prior window per call so
             summing it would N-count the same content. The content-length /4
-            heuristic is rough but bounded and additive.
+            heuristic is rough but bounded and additive — and crucially, it's
+            BYTE-AWARE, so block surgery's bytes_freed naturally registers
+            here without any extra accounting.
+        row_cap_slack: when > 0 AND max_tokens is set AND current estimated
+            tokens are below max_tokens * HEADROOM_RATIO, the effective row
+            cap is (max_turns + row_cap_slack) instead of max_turns. This
+            lets the row count "breathe" with the byte budget — heavy block
+            surgery (evict_thinking_blocks, evict_tool_use_blocks,
+            evict_write_pairs) frees bytes without dropping rows, so the
+            row cap could otherwise fire too early. Default 0 = no slack
+            (backward-compat with all callers that don't pass the kwarg).
+            The token cap (second pass below) remains the hard ceiling and
+            trims regardless of slack.
+
+        The dynamic-tightening guarantee: when token usage rises back above
+        the headroom threshold, slack disappears immediately. Rows above
+        max_turns get FIFO-trimmed on the next turn that triggers evict().
         """
         deleted = 0
-        # First pass: enforce turn-count cap.
+        # Compute effective row cap. Slack engages only when there's
+        # measurable headroom against max_tokens — without max_tokens we
+        # can't define headroom and slack stays disengaged (defensive).
+        effective_max_turns = max_turns
+        if row_cap_slack > 0 and max_tokens is not None and max_tokens > 0:
+            cur = self.conn.execute(
+                "SELECT COALESCE(SUM(LENGTH(content)) / 4, 0) FROM turns"
+            )
+            current_tokens = int(cur.fetchone()[0])
+            if current_tokens < int(max_tokens * self.HEADROOM_RATIO):
+                effective_max_turns = max_turns + int(row_cap_slack)
+        # First pass: enforce effective turn-count cap.
         cur = self.conn.execute("SELECT COUNT(*) FROM turns")
         n = cur.fetchone()[0]
-        if n > max_turns:
-            to_delete = n - max_turns
+        if n > effective_max_turns:
+            to_delete = n - effective_max_turns
             self.conn.execute(
                 "DELETE FROM turns WHERE id IN (SELECT id FROM turns ORDER BY id ASC LIMIT ?)",
                 (to_delete,),
@@ -162,6 +205,7 @@ class Store:
             self.conn.commit()
             deleted += to_delete
         # Second pass: enforce token cap (content-size estimate, not API counts).
+        # Unaffected by slack: this is the hard byte ceiling.
         if max_tokens is not None and max_tokens > 0:
             while True:
                 cur = self.conn.execute(

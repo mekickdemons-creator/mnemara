@@ -244,7 +244,17 @@ class AgentSession:
                 # Eviction failures must never crash a turn; audit-trail
                 # eviction is opportunistic.
                 log("auto_evict_pairs_error", error=str(exc))
-        evicted = self.store.evict(self.cfg.max_window_turns, self.cfg.max_window_tokens)
+        # Pass row_cap_slack so the row cap can "breathe" with the byte
+        # budget after heavy block surgery. The slack is configured per
+        # panel via cfg.row_cap_slack_when_token_headroom (default 0 =
+        # strict row cap). Slack only engages when current tokens are
+        # under HEADROOM_RATIO * max_window_tokens; the token cap remains
+        # the hard ceiling regardless.
+        evicted = self.store.evict(
+            self.cfg.max_window_turns,
+            self.cfg.max_window_tokens,
+            row_cap_slack=getattr(self.cfg, "row_cap_slack_when_token_headroom", 0),
+        )
         if evicted:
             log("eviction", deleted=evicted)
 

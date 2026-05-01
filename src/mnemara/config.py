@@ -121,6 +121,26 @@ class Config:
     # Off by default; opt-in per panel. Same agent-decides-primitive-
     # stays-clean pattern as inbox_auto_respond.
     auto_evict_after_write: bool = False
+    # v0.3.3 — token-aware row-cap slack
+    # When > 0, the cap-FIFO eviction loop allows n_turns to exceed
+    # max_window_turns by up to this many rows, BUT only when current
+    # token usage is well under max_window_tokens (under 50% — see
+    # Store.HEADROOM_RATIO). When tokens climb back above the threshold
+    # the slack disappears and FIFO trims down to max_window_turns.
+    #
+    # Motivation: heavy block surgery (evict_thinking_blocks, evict_
+    # tool_use_blocks, evict_write_pairs) can free 80% of stored bytes
+    # without dropping any rows. Without slack, the row cap then fires
+    # too early — Major hits 100/100 turns with 50KB of actual context
+    # and watches an old row get evicted despite massive token headroom.
+    # Slack lets the row cap "breathe" with the byte budget: under
+    # token pressure the row cap is strict; with token headroom it
+    # gives extra room. The token cap (max_window_tokens) remains the
+    # hard ceiling and trims regardless of slack.
+    #
+    # Default 0 = feature off (backward-compat). A reasonable starting
+    # value is 30 (30% slack on a 100-turn cap). Set in config.json.
+    row_cap_slack_when_token_headroom: int = 0
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7
@@ -193,6 +213,9 @@ class Config:
             inbox_auto_surface=bool(d.get("inbox_auto_surface", True)),
             inbox_auto_respond=bool(d.get("inbox_auto_respond", False)),
             auto_evict_after_write=bool(d.get("auto_evict_after_write", False)),
+            row_cap_slack_when_token_headroom=int(
+                d.get("row_cap_slack_when_token_headroom", 0)
+            ),
             graph_enabled=bool(d.get("graph_enabled", True)),
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),
