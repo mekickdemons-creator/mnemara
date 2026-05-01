@@ -123,6 +123,30 @@ Screen {
 # ---------------------------------------------------------------------------
 
 
+def _parse_size(s: str) -> int:
+    """Parse a human-readable integer size: '500', '500k', '1m', '1_000_000'.
+
+    Used by /tokens. Returns the parsed int. Raises ValueError on bad input.
+    Suffixes are case-insensitive: k=1_000, m=1_000_000.
+    Underscores and commas in the digit portion are ignored.
+    """
+    if not s:
+        raise ValueError("empty value")
+    raw = s.strip().lower().replace("_", "").replace(",", "")
+    if not raw:
+        raise ValueError("empty value")
+    mult = 1
+    if raw.endswith("k"):
+        mult = 1_000
+        raw = raw[:-1]
+    elif raw.endswith("m"):
+        mult = 1_000_000
+        raw = raw[:-1]
+    if not raw or not raw.lstrip("-").isdigit():
+        raise ValueError("not a number")
+    return int(raw) * mult
+
+
 def _is_tty() -> bool:
     import sys
     try:
@@ -479,13 +503,55 @@ class MnemaraTUI(App):  # type: ignore[misc]
     async def _handle_slash(self, line: str) -> None:
         parts = line.split(maxsplit=1)
         cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
         chat = self._chat()
 
         if cmd in ("/quit", "/exit"):
             self.exit()
             return
 
-        chat.write(f"[dim]unknown command: {cmd} — /quit or /exit to leave[/dim]")
+        if cmd == "/tokens":
+            await self._slash_set_window(arg, chat)
+            return
+
+        chat.write(f"[dim]unknown command: {cmd} — /quit, /exit, or /tokens N[/dim]")
+
+    async def _slash_set_window(self, arg: str, chat: "RichLog") -> None:
+        """/tokens N [--temp] — set max_window_tokens.
+
+        Accepts plain integers or shorthand: 500k, 1m, 200_000.
+        Persists to config.json by default; pass --temp to keep in-memory only.
+        Bounds: 1000 – 10_000_000.
+        """
+        parts = arg.split()
+        if not parts:
+            chat.write(
+                "[red]usage: /tokens N [--temp]  "
+                "(N accepts 500k, 1m, 200000, etc.)[/red]"
+            )
+            return
+        raw = parts[0]
+        temp = len(parts) > 1 and parts[1].lower() in ("--temp", "-t", "temp")
+        try:
+            n = _parse_size(raw)
+        except ValueError as e:
+            chat.write(f"[red]invalid value '{raw}': {e}[/red]")
+            return
+        if not 1000 <= n <= 10_000_000:
+            chat.write("[red]tokens must be between 1000 and 10000000 (10M)[/red]")
+            return
+        old = self.cfg.max_window_tokens
+        self.cfg.max_window_tokens = n
+        if not temp:
+            try:
+                config_mod.save(self.instance, self.cfg)
+                persist_note = "(persisted to config.json)"
+            except Exception as exc:
+                persist_note = f"[red](persist failed: {exc})[/red]"
+        else:
+            persist_note = "(in-memory only — reverts on restart)"
+        chat.write(f"[green]tokens: {old} → {n}[/green]  [dim]{persist_note}[/dim]")
+        self._refresh_status()
 
     # ---------------------------------------------------------------- actions
 
