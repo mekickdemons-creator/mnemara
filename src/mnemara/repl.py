@@ -128,6 +128,7 @@ def _handle_slash(line: str, instance: str, cfg: Config, store: Store) -> bool:
             "  /role <path>     swap role doc (also persists to config)\n"
             "  /show            print the rolling window\n"
             "  /clear           wipe the rolling window (with confirm)\n"
+            "  /models          list available model shortcuts\n"
             "  /swap <model>    switch model for this and future sessions\n"
             "  /note <text>     append to today's memory file\n"
             "  /proposals       list pending role-amendment proposals\n"
@@ -180,12 +181,22 @@ def _handle_slash(line: str, instance: str, cfg: Config, store: Store) -> bool:
             console.print("[green]window cleared[/green]")
         return True
 
+    if cmd == "/models":
+        for i, model in enumerate(config_mod.AVAILABLE_MODELS, start=1):
+            marker = " (current)" if model == cfg.model else ""
+            console.print(f"  {i}. {model}{marker}")
+        aliases = ", ".join(
+            f"{k}={v}" for k, v in sorted(config_mod.MODEL_ALIASES.items())
+        )
+        console.print(f"[dim]aliases: {aliases}[/dim]")
+        return True
+
     if cmd == "/swap":
         if not arg:
-            console.print("[red]usage: /swap <model>  e.g. /swap gpt-5.3-codex[/red]")
+            console.print("[red]usage: /swap <model|number>  e.g. /swap 4[/red]")
             return True
         try:
-            normalized = config_mod.normalize_model_name(arg)
+            normalized = config_mod.resolve_model_choice(arg)
         except ValueError as exc:
             console.print(f"[red]{exc}[/red]")
             return True

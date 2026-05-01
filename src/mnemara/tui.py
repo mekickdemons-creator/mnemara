@@ -5,7 +5,7 @@ Three features, nothing else:
   2. Token-count eviction only             (row cap is not enforced here)
   3. Spinner during streaming turns
 
-Slash commands: /quit and /exit only.
+Slash commands: /quit, /exit, /models, /swap, and /tokens.
 No inbox polling, no block surgery, no pin system, no copy/export, no /stop.
 """
 from __future__ import annotations
@@ -514,7 +514,56 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self._slash_set_window(arg, chat)
             return
 
-        chat.write(f"[dim]unknown command: {cmd} — /quit, /exit, or /tokens N[/dim]")
+        if cmd == "/models":
+            self._slash_models(chat)
+            return
+
+        if cmd == "/swap":
+            await self._slash_swap_model(arg, chat)
+            return
+
+        chat.write(
+            f"[dim]unknown command: {cmd} — /quit, /exit, /models, "
+            "/swap MODEL, or /tokens N[/dim]"
+        )
+
+    def _slash_models(self, chat: "RichLog") -> None:
+        lines = ["[bold]available models[/bold]"]
+        for i, model in enumerate(config_mod.AVAILABLE_MODELS, start=1):
+            marker = " [green](current)[/green]" if model == self.cfg.model else ""
+            lines.append(f"  {i}. {model}{marker}")
+        aliases = ", ".join(
+            f"{k}={v}" for k, v in sorted(config_mod.MODEL_ALIASES.items())
+        )
+        lines.append(f"[dim]aliases: {aliases}[/dim]")
+        lines.append("[dim]usage: /swap 1  or  /swap gpt-5.3-codex[/dim]")
+        chat.write("\n".join(lines))
+
+    async def _slash_swap_model(self, arg: str, chat: "RichLog") -> None:
+        parts = arg.split()
+        if not parts:
+            chat.write("[red]usage: /swap MODEL|NUMBER  (try /models)[/red]")
+            return
+        raw = parts[0]
+        temp = len(parts) > 1 and parts[1].lower() in ("--temp", "-t", "temp")
+        try:
+            model = config_mod.resolve_model_choice(raw)
+        except ValueError as exc:
+            chat.write(f"[red]{exc}[/red]")
+            return
+        old = self.cfg.model
+        self.cfg.model = model
+        if not temp:
+            try:
+                config_mod.save(self.instance, self.cfg)
+                persist_note = "(persisted to config.json)"
+            except Exception as exc:
+                persist_note = f"[red](persist failed: {exc})[/red]"
+        else:
+            persist_note = "(in-memory only — reverts on restart)"
+        chat.write(f"[green]model: {old} -> {model}[/green]  [dim]{persist_note}[/dim]")
+        self.sub_title = f"model={self.cfg.model}  role={self.cfg.role_doc_path or '(none)'}"
+        self._refresh_status()
 
     async def _slash_set_window(self, arg: str, chat: "RichLog") -> None:
         """/tokens N [--temp] — set max_window_tokens.

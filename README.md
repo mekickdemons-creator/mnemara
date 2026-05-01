@@ -71,9 +71,9 @@ Keybindings:
 | Ctrl+C | Quit |
 | `/help` | Slash-command list (same as the REPL) |
 
-Slash commands (`/role`, `/show`, `/clear`, `/swap`, `/note`, `/quit`,
-`/help`) are accepted in either UI. The `/note` command opens a small
-modal in the TUI when invoked without text.
+The TUI accepts `/models`, `/swap`, `/tokens`, `/quit`, and `/exit`.
+`/models` lists the available Codex models and numbered shortcuts;
+`/swap 1` or `/swap gpt-5.3-codex` switches the active model.
 
 ## State layout
 
@@ -130,7 +130,8 @@ mnemara replay --instance <name> [--days N] [--threshold N] [--apply]  # consoli
 /role <path>     swap role doc (also persists to config)
 /show            print the rolling window
 /clear           wipe the window (with confirm)
-/swap <model>    switch model for this and future sessions
+/models          list available Codex model shortcuts
+/swap <model|n>  switch model for this and future sessions
 /note <text>     append to today's memory file
 /quit, /exit     save state and exit
 /help            show this list
