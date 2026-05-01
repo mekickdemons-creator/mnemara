@@ -250,10 +250,12 @@ class AgentSession:
         # strict row cap). Slack only engages when current tokens are
         # under HEADROOM_RATIO * max_window_tokens; the token cap remains
         # the hard ceiling regardless.
+        # STABLE build: row cap is disabled — evict on token count only.
+        # The effective row cap is set to a number large enough to never fire
+        # in practice; the token cap (max_window_tokens) is the sole enforcer.
         evicted = self.store.evict(
-            self.cfg.max_window_turns,
+            999_999,
             self.cfg.max_window_tokens,
-            row_cap_slack=getattr(self.cfg, "row_cap_slack_when_token_headroom", 0),
         )
         if evicted:
             log("eviction", deleted=evicted)
