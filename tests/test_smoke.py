@@ -4799,7 +4799,6 @@ def test_tui_cancelled_error_shows_partial_stream_if_any(home):
     app.store.close()
 
 
-@pytest.mark.skip(reason="feature not in stable build")
 def test_tui_stop_slash_when_not_busy(home, monkeypatch):
     """/stop when nothing is in flight shows 'nothing in flight' message."""
     import asyncio as _asyncio
@@ -4831,6 +4830,39 @@ def test_tui_stop_slash_when_not_busy(home, monkeypatch):
     # cancel_group should have been called once with the "turn" group.
     assert len(cancel_calls) == 1
     assert cancel_calls[0][1] == "turn"
+    app.store.close()
+
+
+def test_tui_stop_slash_when_busy_sends_signal(home, monkeypatch):
+    """/stop while a turn is active signals the turn worker group.
+
+    Mainline behavior leaves _busy set until _send_turn catches cancellation
+    and runs its cleanup/finally path.
+    """
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("stop_busy_t")
+    app = tui_mod.MnemaraTUI("stop_busy_t")
+    app._busy = True
+
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    class _FakeWorker:
+        pass
+
+    app._chat = lambda: _FakeChat()  # type: ignore[method-assign]
+    app._refresh_status = lambda: None
+    monkeypatch.setattr(app.workers, "cancel_group", lambda dom, grp: [_FakeWorker()])
+
+    _asyncio.run(app._handle_slash("/stop"))
+    assert app._busy is True
+    assert any("stop signal sent" in m.lower() for m in chat_msgs), chat_msgs
     app.store.close()
 
 
