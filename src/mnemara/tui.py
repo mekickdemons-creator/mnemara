@@ -25,6 +25,8 @@ goes via repl-style permission_prompt by default; the TUI shows a modal).
 from __future__ import annotations
 
 import asyncio
+import atexit
+import os
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,40 @@ except ImportError:  # pragma: no cover
 # the rolling-window math when the next turn fires. Can be tuned later if
 # real-use pastes ever come close.
 _USERINPUT_PASTE_CAP = 16_000
+
+# All mouse-tracking modes that Mnemara may enable during a session.  Written
+# to /dev/tty at process exit as a last-resort safety net in case Textual's
+# driver cleanup is skipped (true SIGINT delivery, unhandled exception in the
+# shutdown path, etc.).  The sequences are idempotent — disabling a mode that
+# was never enabled is a no-op for every common terminal emulator.
+_MOUSE_RESET_BYTES = (
+    b"\x1b[?1000l"  # basic click tracking
+    b"\x1b[?1002l"  # button-event motion  (we add; Textual's disabler omits)
+    b"\x1b[?1003l"  # any-event motion
+    b"\x1b[?1005l"  # UTF-8 extended encoding
+    b"\x1b[?1006l"  # SGR extended encoding
+    b"\x1b[?1015l"  # urxvt extended encoding
+)
+
+
+def _tty_mouse_reset() -> None:
+    """Atexit hook: reset all mouse-tracking modes on /dev/tty.
+
+    This runs even when the process exits abnormally (Ctrl+C generating a true
+    SIGINT, crash in the Textual shutdown path).  Writing directly to the tty
+    fd bypasses any stdout/stderr redirection in use by the hosting shell.
+    """
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
+        try:
+            os.write(fd, _MOUSE_RESET_BYTES)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass  # /dev/tty not available (headless / piped); nothing to reset
+
+
+atexit.register(_tty_mouse_reset)
 
 
 class _UserInput(Input):
@@ -467,6 +503,30 @@ class MnemaraTUI(App):  # type: ignore[misc]
                         except Exception:
                             pass
                     drv._enable_mouse_support = _safe_reenable  # type: ignore[method-assign]
+                # Patch _disable_mouse_support so Textual's shutdown sequence
+                # also disables mode 1002 (button-event motion) which we add
+                # in _MOUSE_ENABLE_SAFE above.  Textual's built-in disabler
+                # only covers 1000/1003/1015/1006 — it was written against
+                # Textual's own enable set which never touches 1002.  Without
+                # this patch, mode 1002 survives every exit and the terminal
+                # keeps emitting raw X10 mouse bytes after the panel closes,
+                # which the shell renders as garbage characters on click.
+                if hasattr(drv, "_disable_mouse_support"):
+                    drv_ref_d = drv
+                    def _safe_disable() -> None:
+                        try:
+                            # All modes we may have enabled + Textual's set,
+                            # in the same order Textual uses for consistency.
+                            drv_ref_d.write("\x1b[?1000l")
+                            drv_ref_d.write("\x1b[?1002l")  # our addition
+                            drv_ref_d.write("\x1b[?1003l")
+                            drv_ref_d.write("\x1b[?1005l")
+                            drv_ref_d.write("\x1b[?1006l")
+                            drv_ref_d.write("\x1b[?1015l")
+                            drv_ref_d.flush()
+                        except Exception:
+                            pass
+                    drv._disable_mouse_support = _safe_disable  # type: ignore[method-assign]
         except Exception:
             pass
         # Prime the cached status text so the first paint has full content.
