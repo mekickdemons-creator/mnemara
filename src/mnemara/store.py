@@ -47,6 +47,7 @@ class Store:
             "rows_evicted": 0,
             "blocks_evicted": 0,
             "bytes_freed": 0,
+            "pinned_rows_force_evicted": 0,  # last-resort cap-FIFO evictions of pinned rows
         }
 
     def _migrate_schema(self) -> None:
@@ -105,6 +106,7 @@ class Store:
         rows: int = 0,
         blocks: int = 0,
         bytes_: int = 0,
+        pinned_force: int = 0,
     ) -> None:
         if rows:
             self._eviction_stats["rows_evicted"] += int(rows)
@@ -112,6 +114,8 @@ class Store:
             self._eviction_stats["blocks_evicted"] += int(blocks)
         if bytes_:
             self._eviction_stats["bytes_freed"] += int(bytes_)
+        if pinned_force:
+            self._eviction_stats["pinned_rows_force_evicted"] += int(pinned_force)
 
     def get_eviction_stats(self) -> dict[str, int]:
         """Return a snapshot of session-scoped eviction counters.
@@ -168,20 +172,35 @@ class Store:
             here without any extra accounting.
         row_cap_slack: when > 0 AND max_tokens is set AND current estimated
             tokens are below max_tokens * HEADROOM_RATIO, the effective row
-            cap is (max_turns + row_cap_slack) instead of max_turns. This
-            lets the row count "breathe" with the byte budget — heavy block
-            surgery (evict_thinking_blocks, evict_tool_use_blocks,
-            evict_write_pairs) frees bytes without dropping rows, so the
-            row cap could otherwise fire too early. Default 0 = no slack
-            (backward-compat with all callers that don't pass the kwarg).
-            The token cap (second pass below) remains the hard ceiling and
-            trims regardless of slack.
+            cap is (max_turns + row_cap_slack) instead of max_turns. Default
+            0 = no slack (backward-compat). The token cap remains the hard
+            ceiling regardless of slack.
+
+        Pin semantics (Option B — soft protection):
+            Both the row-cap and token-cap passes try unpinned rows first.
+            If the cap cannot be satisfied by evicting unpinned rows alone
+            (all remaining rows are pinned), pinned rows are evicted oldest-
+            first as a last resort, and the count is recorded separately in
+            _eviction_stats["pinned_rows_force_evicted"] so the status bar
+            can warn. "Pin protects proactively, not absolutely" — pins resist
+            the cap until the window is otherwise empty, then yield.
+
+        Pin coverage by eviction path:
+            evict()           → pin-aware (this function; Option B semantics)
+            evict_last()      → pin-aware (skip_pinned=True by default)
+            evict_ids()       → NOT pin-aware (explicit IDs = explicit choice)
+            evict_since()     → pin-aware (skip_pinned=True by default)
+            evict_older_than()→ pin-aware (skip_pinned=True by default)
+            _strip_blocks_by_type() → pin-aware (skip_pinned kwarg)
+            evict_write_pairs() → pin-aware (skip_pinned=True by default)
 
         The dynamic-tightening guarantee: when token usage rises back above
         the headroom threshold, slack disappears immediately. Rows above
         max_turns get FIFO-trimmed on the next turn that triggers evict().
         """
         deleted = 0
+        pinned_force = 0
+
         # Compute effective row cap. Slack engages only when there's
         # measurable headroom against max_tokens — without max_tokens we
         # can't define headroom and slack stays disengaged (defensive).
@@ -193,19 +212,48 @@ class Store:
             current_tokens = int(cur.fetchone()[0])
             if current_tokens < int(max_tokens * self.HEADROOM_RATIO):
                 effective_max_turns = max_turns + int(row_cap_slack)
+
         # First pass: enforce effective turn-count cap.
+        # Strategy: delete unpinned rows oldest-first until either the cap is
+        # satisfied or no unpinned rows remain; then, if the cap still isn't
+        # met, delete pinned rows oldest-first (last resort).
         cur = self.conn.execute("SELECT COUNT(*) FROM turns")
         n = cur.fetchone()[0]
         if n > effective_max_turns:
             to_delete = n - effective_max_turns
-            self.conn.execute(
-                "DELETE FROM turns WHERE id IN (SELECT id FROM turns ORDER BY id ASC LIMIT ?)",
+            # Phase A: try unpinned rows first.
+            cur = self.conn.execute(
+                "SELECT id FROM turns WHERE pin_label IS NULL ORDER BY id ASC LIMIT ?",
                 (to_delete,),
             )
-            self.conn.commit()
-            deleted += to_delete
+            unpinned_ids = [r[0] for r in cur.fetchall()]
+            if unpinned_ids:
+                placeholders = ",".join("?" * len(unpinned_ids))
+                self.conn.execute(
+                    f"DELETE FROM turns WHERE id IN ({placeholders})", unpinned_ids
+                )
+                self.conn.commit()
+                deleted += len(unpinned_ids)
+                to_delete -= len(unpinned_ids)
+            # Phase B: last resort — evict pinned rows if cap still not met.
+            if to_delete > 0:
+                cur = self.conn.execute(
+                    "SELECT id FROM turns WHERE pin_label IS NOT NULL ORDER BY id ASC LIMIT ?",
+                    (to_delete,),
+                )
+                pinned_ids = [r[0] for r in cur.fetchall()]
+                if pinned_ids:
+                    placeholders = ",".join("?" * len(pinned_ids))
+                    self.conn.execute(
+                        f"DELETE FROM turns WHERE id IN ({placeholders})", pinned_ids
+                    )
+                    self.conn.commit()
+                    deleted += len(pinned_ids)
+                    pinned_force += len(pinned_ids)
+
         # Second pass: enforce token cap (content-size estimate, not API counts).
         # Unaffected by slack: this is the hard byte ceiling.
+        # Same unpinned-first, pinned-last-resort ordering as the row-cap pass.
         if max_tokens is not None and max_tokens > 0:
             while True:
                 cur = self.conn.execute(
@@ -214,15 +262,30 @@ class Store:
                 total = int(cur.fetchone()[0])
                 if total <= max_tokens:
                     break
-                cur = self.conn.execute("SELECT id FROM turns ORDER BY id ASC LIMIT 1")
+                # Try oldest unpinned row first.
+                cur = self.conn.execute(
+                    "SELECT id FROM turns WHERE pin_label IS NULL ORDER BY id ASC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    self.conn.execute("DELETE FROM turns WHERE id = ?", (row[0],))
+                    self.conn.commit()
+                    deleted += 1
+                    continue
+                # No unpinned rows left — last resort: oldest pinned row.
+                cur = self.conn.execute(
+                    "SELECT id FROM turns WHERE pin_label IS NOT NULL ORDER BY id ASC LIMIT 1"
+                )
                 row = cur.fetchone()
                 if not row:
-                    break
+                    break  # store is empty, nothing more to do
                 self.conn.execute("DELETE FROM turns WHERE id = ?", (row[0],))
                 self.conn.commit()
                 deleted += 1
+                pinned_force += 1
+
         if deleted:
-            self._bump_eviction_stats(rows=deleted)
+            self._bump_eviction_stats(rows=deleted, pinned_force=pinned_force)
         return deleted
 
     def window(self, limit: int | None = None) -> list[dict[str, Any]]:

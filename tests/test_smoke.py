@@ -3670,7 +3670,12 @@ def test_eviction_stats_starts_zeroed(home):
 
     store = Store("evstats_zero_t")
     s = store.get_eviction_stats()
-    assert s == {"rows_evicted": 0, "blocks_evicted": 0, "bytes_freed": 0}
+    assert s == {
+        "rows_evicted": 0,
+        "blocks_evicted": 0,
+        "bytes_freed": 0,
+        "pinned_rows_force_evicted": 0,
+    }
     store.close()
 
 
@@ -3829,6 +3834,7 @@ def test_eviction_stats_reset_on_new_store_instance(home):
         "rows_evicted": 0,
         "blocks_evicted": 0,
         "bytes_freed": 0,
+        "pinned_rows_force_evicted": 0,
     }
     store2.close()
 
@@ -4911,3 +4917,138 @@ def test_slash_export_bad_n_shows_usage(home):
         f"expected usage message; got {chat_msgs}"
     )
     app.store.close()
+
+
+# ----------------------------------------------------------------------
+# evict() pin-awareness — Option B: skip pinned first, last-resort evict
+# ----------------------------------------------------------------------
+
+def test_evict_preserves_pins_under_row_cap(home):
+    """Cap-FIFO skips pinned rows and deletes unpinned first.
+    When enough unpinned rows exist to satisfy the cap, pinned rows survive."""
+    from mnemara.store import Store
+
+    store = Store("evpinrow_t")
+    pinned = store.append_turn("user", [{"type": "text", "text": "keep me"}])
+    store.pin_row(pinned, "important")
+    store.append_turn("user", [{"type": "text", "text": "evict me 1"}])
+    store.append_turn("user", [{"type": "text", "text": "evict me 2"}])
+
+    # 3 rows total, cap=1 -> need to delete 2. 2 unpinned rows available.
+    deleted = store.evict(max_turns=1, max_tokens=1_000_000)
+    assert deleted == 2
+
+    rows = store.window()
+    assert len(rows) == 1
+    assert rows[0]["id"] == pinned  # pinned row survived
+    assert store.get_eviction_stats()["pinned_rows_force_evicted"] == 0
+    store.close()
+
+
+def test_evict_preserves_pins_under_token_cap(home):
+    """Token-cap pass skips pinned rows; unpinned rows trimmed first."""
+    from mnemara.store import Store
+
+    store = Store("evpintok_t")
+    pinned = store.append_turn(
+        "user", [{"type": "text", "text": "x" * 2000}]
+    )
+    store.pin_row(pinned, "critical")
+    store.append_turn("user", [{"type": "text", "text": "x" * 2000}])
+
+    # Both rows ~500 tokens each (2000 chars / 4). Token cap = 600 forces
+    # deletion of 1 row. The unpinned row should go first.
+    deleted = store.evict(max_turns=1_000, max_tokens=600)
+    assert deleted == 1
+
+    rows = store.window()
+    assert len(rows) == 1
+    assert rows[0]["id"] == pinned
+    assert store.get_eviction_stats()["pinned_rows_force_evicted"] == 0
+    store.close()
+
+
+def test_evict_last_resort_evicts_pinned_when_no_unpinned(home):
+    """When all remaining rows are pinned and the cap still isn't met,
+    pinned rows are evicted oldest-first (last resort) and the
+    pinned_rows_force_evicted counter is bumped."""
+    from mnemara.store import Store
+
+    store = Store("evpinlast_t")
+    r1 = store.append_turn("user", [{"type": "text", "text": "a"}])
+    r2 = store.append_turn("user", [{"type": "text", "text": "b"}])
+    r3 = store.append_turn("user", [{"type": "text", "text": "c"}])
+    for rid in (r1, r2, r3):
+        store.pin_row(rid, "all pinned")
+
+    # cap=1, all 3 rows pinned -> no unpinned to evict; last resort fires.
+    deleted = store.evict(max_turns=1, max_tokens=1_000_000)
+    assert deleted == 2
+    assert len(store.window()) == 1
+
+    s = store.get_eviction_stats()
+    assert s["rows_evicted"] == 2
+    assert s["pinned_rows_force_evicted"] == 2
+    store.close()
+
+
+def test_evict_token_cap_last_resort_evicts_pinned(home):
+    """When token cap requires eviction but only pinned rows remain,
+    pinned rows are evicted and the force counter is bumped."""
+    from mnemara.store import Store
+
+    store = Store("evpintokforce_t")
+    r1 = store.append_turn("user", [{"type": "text", "text": "x" * 3000}])
+    store.pin_row(r1, "pinned")
+
+    # Token cap at 100 tokens — far below the ~750 tokens this row costs.
+    # No unpinned rows exist; last resort fires.
+    deleted = store.evict(max_turns=1_000, max_tokens=100)
+    assert deleted == 1
+
+    s = store.get_eviction_stats()
+    assert s["pinned_rows_force_evicted"] == 1
+    store.close()
+
+
+def test_evict_mixed_pin_status_respects_order(home):
+    """With mixed pinned/unpinned rows, unpinned are always deleted before
+    pinned, regardless of insertion order."""
+    from mnemara.store import Store
+
+    store = Store("evpinmixed_t")
+    r1 = store.append_turn("user", [{"type": "text", "text": "old-unpinned"}])
+    r2 = store.append_turn("user", [{"type": "text", "text": "old-pinned"}])
+    r3 = store.append_turn("user", [{"type": "text", "text": "new-unpinned"}])
+    store.pin_row(r2, "keep")
+
+    # cap=1, need to delete 2. Only 2 unpinned (r1, r3) — pinned r2 survives.
+    deleted = store.evict(max_turns=1, max_tokens=1_000_000)
+    assert deleted == 2
+    rows = store.window()
+    assert len(rows) == 1
+    assert rows[0]["id"] == r2
+
+    s = store.get_eviction_stats()
+    assert s["pinned_rows_force_evicted"] == 0
+    store.close()
+
+
+def test_evict_pin_protection_leaves_no_force_eviction_when_enough_unpinned(home):
+    """Regression: when there are always enough unpinned rows to satisfy the
+    cap, pinned_rows_force_evicted must stay 0 across many evict() calls."""
+    from mnemara.store import Store
+
+    store = Store("evpinreg_t")
+    pinned = store.append_turn("user", [{"type": "text", "text": "anchor"}])
+    store.pin_row(pinned, "anchor")
+
+    for i in range(10):
+        store.append_turn("user", [{"type": "text", "text": f"u{i}"}])
+        store.evict(max_turns=3, max_tokens=1_000_000)
+
+    # Pinned anchor row should still be in the store.
+    ids = {r["id"] for r in store.window()}
+    assert pinned in ids, "pinned anchor evicted when it should have survived"
+    assert store.get_eviction_stats()["pinned_rows_force_evicted"] == 0
+    store.close()

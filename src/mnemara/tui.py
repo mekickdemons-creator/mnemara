@@ -549,6 +549,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
         if ev_stats["blocks_evicted"]:
             kb = ev_stats["bytes_freed"] / 1024
             ev_str += f" {ev_stats['blocks_evicted']}b ~{kb:.0f}KB"
+        # Warn when cap-FIFO force-evicted pinned rows (last-resort Option B
+        # semantics). Rare — only fires when unpinned rows can't satisfy the
+        # cap alone. Surfaced as "⚠Np" so the operator knows pins were broken.
+        pinned_force = ev_stats.get("pinned_rows_force_evicted", 0)
+        if pinned_force:
+            ev_str += f" ⚠{pinned_force}p"
         # Displayed row cap reflects the absolute upper bound: when
         # row_cap_slack_when_token_headroom > 0, the cap can stretch by
         # that many rows when token usage is below the headroom threshold.
