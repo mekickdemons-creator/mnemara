@@ -2013,6 +2013,33 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self.exit()
 
     def on_unmount(self) -> None:
+        # --- Step 1: cancel timers and workers BEFORE touching the store ---
+        # The ambient inbox timer and spinner timer are still registered with
+        # Textual's event loop at quit time. If either fires after store.close()
+        # below, they touch a dead SQLite connection and raise exceptions that
+        # put Textual's shutdown into an error path — which skips the terminal
+        # driver cleanup (mouse-mode reset, cursor restore, etc.), leaving the
+        # terminal in raw mouse-tracking mode after exit ("T6#T6" on click).
+        # Cancel everything first so no timer or worker can race the store close.
+        try:
+            if self._inbox_ambient_timer is not None:
+                self._inbox_ambient_timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._spinner_timer is not None:
+                self._spinner_timer.stop()
+        except Exception:
+            pass
+        try:
+            # Cancel any in-flight streaming turn workers. CancelledError is
+            # caught inside _send_turn's finally block so _busy is cleared
+            # cleanly even though we're exiting.
+            self.workers.cancel_group(self, "turn")
+        except Exception:
+            pass
+
+        # --- Step 2: flush session state ---
         try:
             self.session.write_session_stats()
         except Exception as e:
@@ -2027,6 +2054,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 )
         except Exception:
             pass
+
+        # --- Step 3: close the store (safe now — no timers or workers live) ---
         try:
             self.store.close()
         except Exception:
