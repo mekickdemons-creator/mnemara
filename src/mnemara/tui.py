@@ -24,6 +24,7 @@ goes via repl-style permission_prompt by default; the TUI shows a modal).
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -855,14 +856,29 @@ class MnemaraTUI(App):  # type: ignore[misc]
         if event.input.id != "userinput":
             return
         text = (event.value or "").strip()
-        if not text or self._busy:
+        if not text:
             return
         inp = self.query_one("#userinput", Input)
         inp.value = ""
 
         if text.startswith("/"):
+            # Slash commands run even while a turn is in progress.
+            # They're meta-operations (evict, pin, stop, etc.) that don't
+            # start new turns and don't conflict with the streaming worker.
+            # The /stop command specifically relies on this to cancel the
+            # in-flight worker — if we gated it behind _busy it couldn't fire.
             await self._handle_slash(text)
             self._refresh_status()
+            return
+
+        if self._busy:
+            # Non-slash input while busy: let the operator type, but don't
+            # submit a new conversational turn while one is in progress.
+            # If they want to interrupt, /stop is the mechanism.
+            self._chat().write(
+                "[dim]⏸ turn in progress — use [b]/stop[/b] to interrupt, "
+                "or wait for it to complete[/dim]"
+            )
             return
 
         # Spawn streaming as a Textual worker so this handler returns
@@ -921,6 +937,34 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._evicted_total += int(usage.get("evicted", 0) or 0)
             if self._stream_buffer:
                 chat.write(f"[b green]assistant:[/b green] {self._stream_buffer}")
+        except asyncio.CancelledError:
+            # Clean interrupt from /stop (or exclusive=True worker cancellation
+            # if a new turn was submitted while this one was in flight).
+            #
+            # Store consistency: the user turn was already persisted in
+            # agent.py before _run_turn was called. Write a stub assistant
+            # turn so the rolling window stays well-formed — the model sees
+            # "[interrupted]" in its history rather than a bare user message
+            # with no response, which could cause it to re-answer the prior
+            # prompt on the next turn.
+            #
+            # Re-raise so Textual marks the worker as cancelled (not done),
+            # which is the honest state. The finally block still fires.
+            try:
+                self.store.append_turn(
+                    "assistant",
+                    [{"type": "text", "text": "[interrupted]"}],
+                )
+            except Exception:
+                pass  # Don't let stub write failure mask the cancellation
+            if self._stream_buffer:
+                # Partial response received before cancel — show it so the
+                # operator knows how far the turn got.
+                chat.write(
+                    f"[b green]assistant:[/b green] [dim]{self._stream_buffer}[/dim]"
+                )
+            chat.write("[dim]⏹ turn interrupted — type to continue[/dim]")
+            raise
         except Exception as exc:
             log("tui_turn_error", error=str(exc))
             chat.write(f"[red]error:[/red] {exc}")
@@ -939,6 +983,21 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd in ("/quit", "/exit"):
             self.exit()
+            return
+
+        if cmd == "/stop":
+            # Cancel the in-flight streaming turn (if any). Fires at the next
+            # asyncio checkpoint inside the SDK message loop — between tool
+            # calls at worst, not mid-text-block. _send_turn catches the
+            # CancelledError, writes a stub "[interrupted]" assistant turn for
+            # store consistency, and re-raises so the worker exits cleanly.
+            # If no turn is in flight, this is a no-op (cancel_group on an
+            # empty group does nothing).
+            self.workers.cancel_group(self, "turn")
+            if self._busy:
+                chat.write("[dim]⏹ stop signal sent — finishing current operation…[/dim]")
+            else:
+                chat.write("[dim]nothing in flight[/dim]")
             return
 
         if cmd == "/help":
@@ -972,6 +1031,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /pin <id> [label]       pin a row to preserve against proactive eviction\n"
                 "  /unpin <id>             remove the pin from a row\n"
                 "  /pinned [label]         list pinned rows (optionally filter by label)\n"
+                "  /stop            interrupt the current turn (clean cancel, panel stays alive)\n"
                 "  /quit, /exit     exit\n"
                 "[b]Key bindings:[/b]\n"
                 "  Ctrl+Y           copy last assistant response to clipboard\n"

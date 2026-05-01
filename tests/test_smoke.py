@@ -4534,3 +4534,215 @@ def test_config_row_cap_slack_coerces_string_to_int():
 
     cfg = Config.from_dict({"row_cap_slack_when_token_headroom": "30"})
     assert cfg.row_cap_slack_when_token_headroom == 30
+
+
+# ----------------------------------------------------------------------
+# TUI: /stop slash command + live input while busy + CancelledError stub
+# ----------------------------------------------------------------------
+
+def test_tui_slash_cmd_routes_through_when_busy(home):
+    """Slash commands bypass the _busy guard — on_input_submitted dispatches
+    to _handle_slash regardless of _busy state."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("slash_busy_t")
+    app = tui_mod.MnemaraTUI("slash_busy_t")
+    app._busy = True  # Simulate a turn in flight
+
+    slash_cmds_seen: list[str] = []
+
+    async def _fake_handle_slash(line: str) -> None:
+        slash_cmds_seen.append(line)
+
+    app._handle_slash = _fake_handle_slash  # type: ignore[method-assign]
+    app._refresh_status = lambda: None  # suppress widget call
+
+    # Patch query_one so clearing inp.value doesn't trigger a DOM lookup.
+    _fake_inp = type("FakeInp", (), {"value": ""})()
+    app.query_one = lambda *a, **kw: _fake_inp  # type: ignore[method-assign]
+
+    class _FakeInput:
+        id = "userinput"
+        value = "/stop"
+
+    class _FakeEvent:
+        input = _FakeInput()
+        value = "/stop"
+
+    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
+    assert slash_cmds_seen == ["/stop"], "slash commands must bypass _busy guard"
+    app.store.close()
+
+
+def test_tui_non_slash_blocked_when_busy(home):
+    """Non-slash text submitted while _busy shows the 'use /stop' hint
+    and does NOT enqueue a turn."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("busy_block_t")
+    app = tui_mod.MnemaraTUI("busy_block_t")
+    app._busy = True
+
+    turns_sent: list[str] = []
+
+    async def _fake_send_turn(text: str) -> None:
+        turns_sent.append(text)
+
+    app._send_turn = _fake_send_turn  # type: ignore[method-assign]
+
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    app._chat = lambda: _FakeChat()  # type: ignore[method-assign]
+
+    class _FakeInput:
+        id = "userinput"
+        value = "hello"
+
+    class _FakeEvent:
+        input = _FakeInput()
+        value = "hello"
+
+    # Patch query_one so clearing the input doesn't crash.
+    _fake_inp = type("FakeInp", (), {"value": ""})()
+    app.query_one = lambda *a, **kw: _fake_inp  # type: ignore[method-assign]
+
+    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
+    assert turns_sent == [], "no turn should be queued while busy"
+    assert any("/stop" in m for m in chat_msgs), "hint message should mention /stop"
+    app.store.close()
+
+
+def test_tui_cancelled_error_writes_stub_assistant_turn(home):
+    """`_send_turn` catches CancelledError, writes a stub [interrupted] assistant
+    turn so the rolling window stays well-formed, then re-raises."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("cancel_stub_t")
+    app = tui_mod.MnemaraTUI("cancel_stub_t")
+    app._stream_buffer = ""
+    app._stream_chars = 0
+    app._busy = False
+
+    # Stub turn_async to raise CancelledError immediately.
+    async def _raise_cancel(*args, **kwargs):
+        raise _asyncio.CancelledError()
+
+    app.session.turn_async = _raise_cancel  # type: ignore[method-assign]
+
+    # Stub chat widget.
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    app._chat = lambda: _FakeChat()  # type: ignore[method-assign]
+    app._refresh_status = lambda: None
+    app._focus_input_after_refresh = lambda: None
+
+    # _send_turn should propagate CancelledError after cleanup.
+    with __import__("pytest").raises(_asyncio.CancelledError):
+        _asyncio.run(app._send_turn("do something long"))
+
+    # _busy must be cleared in finally block.
+    assert app._busy is False
+
+    # A stub "[interrupted]" assistant turn must be in the store.
+    rows = app.store.window()
+    assistant_rows = [r for r in rows if r["role"] == "assistant"]
+    assert assistant_rows, "expected at least one assistant row in store"
+    last_content = assistant_rows[-1]["content"]
+    assert any(
+        isinstance(b, dict) and b.get("text") == "[interrupted]"
+        for b in last_content
+    ), f"expected [interrupted] stub turn; got {last_content}"
+
+    # Chat should show the interrupt notice.
+    assert any("interrupted" in m.lower() for m in chat_msgs)
+    app.store.close()
+
+
+def test_tui_cancelled_error_shows_partial_stream_if_any(home):
+    """When cancelled mid-stream, the partial buffer is shown in dim before
+    the interrupt notice — operator knows how far the turn got."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("partial_stream_t")
+    app = tui_mod.MnemaraTUI("partial_stream_t")
+    app._stream_buffer = ""
+    app._stream_chars = 0
+    app._busy = False
+
+    async def _partial_then_cancel(*args, **kwargs):
+        # Simulate partial streaming: call on_token with some text, then cancel.
+        on_tok = kwargs.get("on_token")
+        if on_tok is not None:
+            await on_tok("The answer is")
+        raise _asyncio.CancelledError()
+
+    app.session.turn_async = _partial_then_cancel  # type: ignore[method-assign]
+
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    app._chat = lambda: _FakeChat()  # type: ignore[method-assign]
+    app._refresh_status = lambda: None
+    app._focus_input_after_refresh = lambda: None
+
+    with __import__("pytest").raises(_asyncio.CancelledError):
+        _asyncio.run(app._send_turn("tell me about X"))
+
+    # The partial buffer should appear in the log (dimmed).
+    assert any("The answer is" in m for m in chat_msgs), (
+        f"partial stream buffer not shown; messages: {chat_msgs}"
+    )
+    app.store.close()
+
+
+def test_tui_stop_slash_when_not_busy(home, monkeypatch):
+    """/stop when nothing is in flight shows 'nothing in flight' message."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("stop_idle_t")
+    app = tui_mod.MnemaraTUI("stop_idle_t")
+    app._busy = False
+
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    app._chat = lambda: _FakeChat()  # type: ignore[method-assign]
+    app._refresh_status = lambda: None
+
+    # workers is a read-only Textual App property; monkeypatch cancel_group
+    # on the existing WorkerManager instance.
+    cancel_calls: list[tuple] = []
+    monkeypatch.setattr(app.workers, "cancel_group", lambda dom, grp: cancel_calls.append((dom, grp)))
+
+    _asyncio.run(app._handle_slash("/stop"))
+    assert any("nothing in flight" in m for m in chat_msgs), (
+        f"expected 'nothing in flight' message; got {chat_msgs}"
+    )
+    # cancel_group should have been called once with the "turn" group.
+    assert len(cancel_calls) == 1
+    assert cancel_calls[0][1] == "turn"
+    app.store.close()
