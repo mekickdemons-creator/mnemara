@@ -5,8 +5,8 @@ Three features, nothing else:
   2. Token-count eviction only             (row cap is not enforced here)
   3. Spinner during streaming turns
 
-Slash commands: /quit, /exit, /models, /swap, /tokens, and /export.
-No inbox polling, no block surgery, no pin system, no copy, no /stop.
+Slash commands: /quit, /exit, /models, /swap, /tokens, /export, and /stop.
+No inbox polling, no block surgery, no pin system, no copy.
 """
 from __future__ import annotations
 
@@ -468,7 +468,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             return
 
         if self._busy:
-            self._chat().write("[dim]⏸ turn in progress — wait for it to complete[/dim]")
+            self._chat().write(
+                "[dim]⏸ turn in progress — use [b]/stop[/b] to interrupt, "
+                "or wait for it to complete[/dim]"
+            )
             return
 
         self.run_worker(
@@ -551,9 +554,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self._slash_export(arg, chat)
             return
 
+        if cmd == "/stop":
+            await self._slash_stop(chat)
+            return
+
         chat.write(
             f"[dim]unknown command: {cmd} — /quit, /exit, /models, "
-            "/swap MODEL, /tokens N, or /export[/dim]"
+            "/swap MODEL, /tokens N, /export, or /stop[/dim]"
         )
 
     def _slash_models(self, chat: "RichLog") -> None:
@@ -630,6 +637,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
             persist_note = "(in-memory only — reverts on restart)"
         chat.write(f"[green]tokens: {old} → {n}[/green]  [dim]{persist_note}[/dim]")
         self._refresh_status()
+
+    async def _slash_stop(self, chat: "RichLog") -> None:
+        """Cancel the active turn worker, if any."""
+        # Copied from mainline behavior: cancel the in-flight streaming turn
+        # and let _send_turn's CancelledError handler write the interrupt stub
+        # and clear _busy in its finally block.
+        self.workers.cancel_group(self, "turn")
+        if self._busy:
+            chat.write("[dim]⏹ stop signal sent — finishing current operation…[/dim]")
+        else:
+            chat.write("[dim]nothing in flight[/dim]")
 
     async def _slash_export(self, arg: str, chat: "RichLog") -> None:
         """/export [N] [path] — write rolling-window text to markdown."""
