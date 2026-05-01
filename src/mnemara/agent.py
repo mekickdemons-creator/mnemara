@@ -1868,7 +1868,18 @@ def _codex_bin() -> str:
     exe = os.environ.get("MNEMARA_CODEX_BIN", "codex")
     if os.path.isabs(exe):
         return exe
-    return shutil.which(exe) or exe
+    found = shutil.which(exe)
+    if found:
+        return found
+    home = Path.home()
+    candidates = sorted(
+        home.glob(".vscode/extensions/openai.chatgpt-*/bin/linux-x86_64/codex"),
+        reverse=True,
+    )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return exe
 
 
 def _codex_model_name(model: str) -> str:
