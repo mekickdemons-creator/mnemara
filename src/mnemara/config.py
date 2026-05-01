@@ -9,6 +9,7 @@ from typing import Any
 from . import paths
 
 DEFAULT_MODEL = "gpt-5.3-codex"
+SENTINEL_DEFAULT_MODEL = "gpt-5.4-mini"
 AVAILABLE_MODELS = [
     "gpt-5.5",
     "gpt-5.4",
@@ -284,7 +285,14 @@ def load(instance: str) -> Config:
     if not path.exists():
         raise FileNotFoundError(f"No config at {path} — run `mnemara init --instance {instance}`")
     with path.open() as f:
-        return Config.from_dict(json.load(f))
+        raw = json.load(f)
+    cfg = Config.from_dict(raw)
+    # Backward-compat: older configs may not carry an explicit model key.
+    # Keep existing behavior for all instances except sentinel, which should
+    # default to mini on stable per product policy.
+    if "model" not in raw and instance == "sentinel":
+        cfg.model = SENTINEL_DEFAULT_MODEL
+    return cfg
 
 
 def save(instance: str, cfg: Config) -> None:
@@ -304,6 +312,8 @@ def init_instance(instance: str, role_doc_path: str = "") -> Path:
     paths.rag_index_dir(instance).mkdir(exist_ok=True)
     cfg = Config.default()
     cfg.role_doc_path = role_doc_path
+    if instance == "sentinel":
+        cfg.model = SENTINEL_DEFAULT_MODEL
     save(instance, cfg)
     # touch permissions file
     paths.permissions_path(instance).write_text("{}\n")
