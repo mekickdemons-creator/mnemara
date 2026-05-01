@@ -9,3 +9,4 @@ build/
 dist/
 *.log
 .DS_Store
+branch.md
