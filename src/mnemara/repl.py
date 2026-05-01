@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import shutil
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
@@ -53,10 +54,8 @@ def run(instance: str) -> None:
     perms = PermissionStore(instance)
     log("repl_start", instance=instance, model=cfg.model)
 
-    try:
-        import claude_agent_sdk  # noqa: F401
-    except ImportError:
-        console.print("[red]claude-agent-sdk not installed. pip install claude-agent-sdk[/red]")
+    if shutil.which("codex") is None:
+        console.print("[red]codex CLI not found. Install Codex and authenticate first.[/red]")
         sys.exit(1)
 
     runner = ToolRunner(instance, cfg, perms, permission_prompt)
@@ -182,7 +181,7 @@ def _handle_slash(line: str, instance: str, cfg: Config, store: Store) -> bool:
 
     if cmd == "/swap":
         if not arg:
-            console.print("[red]usage: /swap <model>  e.g. /swap claude-sonnet-4-5[/red]")
+            console.print("[red]usage: /swap <model>  e.g. /swap gpt-5.3-codex[/red]")
             return True
         try:
             normalized = config_mod.normalize_model_name(arg)

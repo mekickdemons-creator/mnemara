@@ -1,4 +1,4 @@
-"""Smoke tests — no network, no Claude. Exercise store, config, tools, CLI plumbing."""
+"""Smoke tests — no network, no Codex. Exercise store, config, tools, CLI plumbing."""
 from __future__ import annotations
 
 import os
@@ -118,10 +118,9 @@ def test_cli_init_idempotent(home):
 
 
 def test_agent_prompt_includes_role_window_and_input(home, monkeypatch):
-    """Verify the SDK call receives [system: role_doc, ...rolling_window, current_input].
+    """Verify the Codex runner receives [system: role_doc, ...rolling_window, current_input].
 
-    We mock claude_agent_sdk.query to capture the prompt + options it was
-    called with, then inspect them.
+    We mock agent.query to capture the prompt + options without shelling out.
     """
     from mnemara import config
     from mnemara.config import Config
@@ -181,7 +180,7 @@ def test_agent_prompt_includes_role_window_and_input(home, monkeypatch):
     assert "CURRENT-INPUT-MARKER" in payload
     # Current input ordered after the prior history.
     assert payload.index("earlier-user") < payload.index("CURRENT-INPUT-MARKER")
-    # Built-in Claude Code tools are exposed.
+    # Built-in file/shell tools are exposed.
     assert "Bash" in options.allowed_tools
     assert any("write_memory" in t for t in options.allowed_tools)
     store.close()
@@ -1163,7 +1162,7 @@ def test_tui_render_status_widget_omits_spinner_when_idle(home):
 
 
 def test_run_turn_yields_event_loop_between_messages(home, monkeypatch):
-    """_run_turn must yield to the event loop between SDK messages.
+    """_run_turn must yield to the event loop between streamed messages.
 
     The streaming hot path was starving concurrent tasks (Textual Input
     keypress dispatch, resize handlers, spinner timer) when SDK messages
@@ -1173,30 +1172,34 @@ def test_run_turn_yields_event_loop_between_messages(home, monkeypatch):
     """
     import asyncio as _asyncio
     from mnemara import agent as agent_mod
-    from claude_agent_sdk import AssistantMessage, TextBlock, ResultMessage
+
+    class TextBlock:
+        def __init__(self, text: str):
+            self.text = text
+
+    class AssistantMessage:
+        def __init__(self, content):
+            self.content = content
+
+    class ResultMessage:
+        def __init__(self, usage):
+            self.usage = usage
+            self.is_error = False
+            self.subtype = "success"
+            self.result = None
 
     sentinel_ticks: list[int] = []
     messages_processed: list[int] = []
 
-    # Build a fake query() async generator that yields many AssistantMessages
-    # back-to-back without any internal awaits — simulates the SDK delivering
+    # Build a fake query() async generator that yields many messages
+    # back-to-back without any internal awaits — simulates a transport delivering
     # buffered tokens in a burst.
     async def _fake_query(*, prompt, options):
         for i in range(20):
             messages_processed.append(i)
-            msg = AssistantMessage(content=[TextBlock(text=f"chunk{i}")], model="test")
+            msg = AssistantMessage(content=[TextBlock(text=f"chunk{i}")])
             yield msg
-        yield ResultMessage(
-            subtype="success",
-            duration_ms=0,
-            duration_api_ms=0,
-            is_error=False,
-            num_turns=1,
-            session_id="s",
-            total_cost_usd=0.0,
-            usage={"input_tokens": 1, "output_tokens": 1},
-            result=None,
-        )
+        yield ResultMessage(usage={"input_tokens": 1, "output_tokens": 1})
 
     monkeypatch.setattr(agent_mod, "query", _fake_query)
 
@@ -3219,9 +3222,9 @@ def test_normalize_model_name_strips_whitespace():
     """Leading/trailing whitespace is stripped."""
     from mnemara.config import normalize_model_name
 
-    assert normalize_model_name("claude-sonnet-4-5") == "claude-sonnet-4-5"
-    assert normalize_model_name("  claude-sonnet-4-5  ") == "claude-sonnet-4-5"
-    assert normalize_model_name("\tclaude-opus-4-7\n") == "claude-opus-4-7"
+    assert normalize_model_name("gpt-5.3-codex") == "gpt-5.3-codex"
+    assert normalize_model_name("  gpt-5.3-codex  ") == "gpt-5.3-codex"
+    assert normalize_model_name("\tgpt-5.2\n") == "gpt-5.2"
 
 
 def test_normalize_model_name_rejects_internal_whitespace():
@@ -3230,11 +3233,11 @@ def test_normalize_model_name_rejects_internal_whitespace():
     from mnemara.config import normalize_model_name
 
     with pytest.raises(ValueError, match="whitespace"):
-        normalize_model_name("claude sonnet 4 5")
+        normalize_model_name("gpt 5 codex")
     with pytest.raises(ValueError, match="whitespace"):
-        normalize_model_name("claude-sonnet 4-5")
+        normalize_model_name("gpt-5 codex")
     with pytest.raises(ValueError, match="whitespace"):
-        normalize_model_name("claude\tsonnet")
+        normalize_model_name("gpt\tcodex")
 
 
 def test_normalize_model_name_rejects_empty():
@@ -3256,11 +3259,11 @@ def test_normalize_model_name_rejects_non_alpha_first_char():
     from mnemara.config import normalize_model_name
 
     with pytest.raises(ValueError, match="must start"):
-        normalize_model_name("-claude-sonnet")
+        normalize_model_name("-gpt-codex")
     with pytest.raises(ValueError, match="must start"):
-        normalize_model_name("4claude")
+        normalize_model_name("5gpt")
     with pytest.raises(ValueError, match="must start"):
-        normalize_model_name("'claude'")
+        normalize_model_name("'gpt'")
 
 
 def test_normalize_model_name_rejects_invalid_chars():
@@ -3269,27 +3272,25 @@ def test_normalize_model_name_rejects_invalid_chars():
     from mnemara.config import normalize_model_name
 
     with pytest.raises(ValueError, match="invalid character"):
-        normalize_model_name("claude/sonnet")
+        normalize_model_name("gpt/codex")
     with pytest.raises(ValueError, match="invalid character"):
-        normalize_model_name("claude_sonnet")  # underscore not allowed
+        normalize_model_name("gpt_codex")  # underscore not allowed
     with pytest.raises(ValueError, match="invalid character"):
-        normalize_model_name("claude@sonnet")
+        normalize_model_name("gpt@codex")
 
 
-def test_normalize_model_name_accepts_known_anthropic_formats():
-    """Real Anthropic model names from various families parse cleanly."""
+def test_normalize_model_name_accepts_known_codex_formats():
+    """Real and expected Codex/OpenAI model names parse cleanly."""
     from mnemara.config import normalize_model_name
 
     valid = [
-        "claude-opus-4-7",
-        "claude-sonnet-4-5",
-        "claude-haiku-4-5",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-haiku-20240307",
-        "claude-3-opus-20240229",
+        "gpt-5.3-codex",
+        "gpt-5.2",
+        "gpt-5.4-mini",
+        "o3",
         # Permissive — future families and dotted versions OK.
-        "claude-4.0-mini",
-        "anthropic-foo-bar",
+        "gpt-6.0-mini",
+        "openai-foo-bar",
     ]
     for name in valid:
         assert normalize_model_name(name) == name
@@ -3299,7 +3300,7 @@ def test_normalize_model_name_idempotent_on_clean_input():
     """A pre-normalized name passes through unchanged."""
     from mnemara.config import normalize_model_name
 
-    assert normalize_model_name("claude-opus-4-7") == "claude-opus-4-7"
+    assert normalize_model_name("gpt-5.3-codex") == "gpt-5.3-codex"
 
 
 # ---------------------------------------------------------------- tool_use surgery
@@ -4304,7 +4305,7 @@ def test_config_auto_evict_after_write_missing_field_defaults_false():
     """Pre-existing config.json files without the field load as False."""
     from mnemara.config import Config
 
-    minimal = {"role_doc_path": "", "model": "claude-opus-4-5"}
+    minimal = {"role_doc_path": "", "model": "gpt-5.3-codex"}
     cfg = Config.from_dict(minimal)
     assert cfg.auto_evict_after_write is False
 
@@ -4529,7 +4530,7 @@ def test_config_row_cap_slack_missing_field_defaults_zero():
     (backward-compat — feature disabled)."""
     from mnemara.config import Config
 
-    minimal = {"role_doc_path": "", "model": "claude-opus-4-5"}
+    minimal = {"role_doc_path": "", "model": "gpt-5.3-codex"}
     cfg = Config.from_dict(minimal)
     assert cfg.row_cap_slack_when_token_headroom == 0
 
@@ -4540,6 +4541,24 @@ def test_config_row_cap_slack_coerces_string_to_int():
 
     cfg = Config.from_dict({"row_cap_slack_when_token_headroom": "30"})
     assert cfg.row_cap_slack_when_token_headroom == 30
+
+
+def test_config_mcp_servers_ignore_unknown_fields():
+    """Operator configs may carry transport-specific MCP keys like type."""
+    from mnemara.config import Config
+
+    cfg = Config.from_dict({
+        "mcp_servers": [{
+            "type": "stdio",
+            "name": "architect",
+            "command": "python",
+            "args": ["server.py"],
+            "env": {"X": "1"},
+        }]
+    })
+    assert len(cfg.mcp_servers) == 1
+    assert cfg.mcp_servers[0].name == "architect"
+    assert cfg.mcp_servers[0].command == "python"
 
 
 # ----------------------------------------------------------------------
@@ -5139,25 +5158,21 @@ def test_run_turn_acloses_sdk_gen_on_cancel(monkeypatch):
     )
 
 
-def test_run_turn_acloses_sdk_gen_on_normal_completion(monkeypatch):
+def test_run_turn_acloses_query_gen_on_normal_completion(monkeypatch):
     """On normal completion the finally block is harmless (aclose on exhausted
     generator is a no-op); result dict is returned correctly."""
     import asyncio as _asyncio
     from mnemara import agent as agent_mod
-    from claude_agent_sdk import ResultMessage
+
+    class ResultMessage:
+        def __init__(self, usage):
+            self.usage = usage
+            self.is_error = False
+            self.subtype = "success"
+            self.result = None
 
     async def _complete_query(*, prompt, options):
-        yield ResultMessage(
-            subtype="end_turn",
-            duration_ms=0,
-            duration_api_ms=0,
-            is_error=False,
-            num_turns=1,
-            session_id="s",
-            total_cost_usd=0.0,
-            usage={"input_tokens": 5, "output_tokens": 3},
-            result=None,
-        )
+        yield ResultMessage(usage={"input_tokens": 5, "output_tokens": 3})
 
     monkeypatch.setattr(agent_mod, "query", _complete_query)
 

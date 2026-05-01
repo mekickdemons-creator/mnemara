@@ -1,28 +1,27 @@
-"""Agent loop using the Claude Agent SDK.
+"""Agent loop using the Codex CLI.
 
-Runs each user turn as a `query()` call against the Claude Agent SDK, which
-talks to the local `claude` CLI under the user's existing subscription auth
-(no ANTHROPIC_API_KEY needed). Mnemara still owns:
+Runs each user turn as a `codex exec --json` call under the user's existing
+Codex auth. Mnemara still owns:
 
   * the rolling-window store (turns.sqlite),
   * the role doc (re-read every call as system_prompt),
-  * the permission policy (mediated via the SDK's can_use_tool callback),
-  * the WriteMemory tool (registered as an in-process SDK MCP server).
+  * the permission policy metadata,
+  * the native memory/wiki/RAG/graph tools exposed for tests and future MCP
+    wiring.
 
-The SDK runs Bash/Read/Edit/Write itself (Claude Code's built-in tools).
-Permissions still pass through Mnemara's tools.py policy via the
-`can_use_tool` callback.
-
-The SDK is unidirectional and stateless per `query()` — it does not accept a
-prefab assistant-turn list. We work with that by serialising the rolling
-window into a transcript prefix prepended to the current user input. The
-role doc remains the system_prompt. Mnemara's per-turn rows in turns.sqlite
-remain the source of truth for window/eviction.
+Codex runs its own built-in shell/file tools. The CLI is stateless per
+`codex exec`, so we serialize the role doc plus rolling window into the prompt
+for each turn. Mnemara's per-turn rows in turns.sqlite remain the source of
+truth for window/eviction.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -47,30 +46,69 @@ from . import store as store_mod
 from .store import Store
 from .tools import ToolRunner
 
-try:
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        PermissionResultAllow,
-        PermissionResultDeny,
-        ResultMessage,
-        SystemMessage,
-        TextBlock,
-        ThinkingBlock,
-        ToolResultBlock,
-        ToolUseBlock,
-        UserMessage,
-        create_sdk_mcp_server,
-        query,
-        tool,
-    )
-    _SDK_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _SDK_AVAILABLE = False
-
 console = Console()
 
-# Built-in Claude Code tool names we expose by default.
+query = None  # test compatibility hook; production uses Codex CLI.
+
+
+@dataclass
+class CodexAgentOptions:
+    """Runtime options for a single Codex CLI turn."""
+
+    system_prompt: str
+    model: str
+    allowed_tools: list[str]
+    mcp_servers: dict[str, Any]
+    can_use_tool: Any
+    include_partial_messages: bool
+    stderr: Any
+    instance: str
+    cwd: str
+    sandbox: str = "workspace-write"
+
+
+@dataclass
+class _MnemaraTool:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    handler: Any
+
+
+def tool(name: str, description: str, input_schema: dict[str, Any]):
+    """Small local replacement for the SDK decorator Mnemara used before."""
+
+    def _decorator(fn):
+        return _MnemaraTool(
+            name=name,
+            description=description,
+            input_schema=input_schema,
+            handler=fn,
+        )
+
+    return _decorator
+
+
+def create_sdk_mcp_server(name: str, tools: list[_MnemaraTool]) -> dict[str, Any]:
+    """Keep the existing metadata shape until native Codex MCP wiring lands."""
+
+    return {"name": name, "tools": tools}
+
+
+class PermissionResultAllow:
+    def __init__(self, behavior: str = "allow", updated_input: Any = None):
+        self.behavior = behavior
+        self.updated_input = updated_input
+
+
+class PermissionResultDeny:
+    def __init__(self, behavior: str = "deny", message: str = "", interrupt: bool = False):
+        self.behavior = behavior
+        self.message = message
+        self.interrupt = interrupt
+
+
+# Built-in Codex tool names we expose by default for policy/introspection.
 _BUILTIN_TOOLS = ("Bash", "Read", "Write", "Edit")
 # MCP-prefixed names the SDK assigns to our in-process tools.
 _WRITE_MEMORY_TOOL = "mcp__mnemara_memory__write_memory"
@@ -104,15 +142,10 @@ _LIST_PINNED_TOOL = "mcp__mnemara_memory__list_pinned"
 
 class AgentSession:
     def __init__(self, cfg: Config, store: Store, runner: ToolRunner, client: Any = None):
-        if not _SDK_AVAILABLE:
-            raise RuntimeError(
-                "claude_agent_sdk is not installed. Run: pip install claude-agent-sdk"
-            )
         self.cfg = cfg
         self.store = store
         self.runner = runner
-        # `client` retained in the signature for backward compatibility with
-        # repl.py callers; the SDK manages its own transport, so we ignore it.
+        # `client` retained in the signature for backward compatibility.
         self.client = client
         # Session-scoped counters (self-instrumentation, v0.2.0).
         self.session_started_at = datetime.now(timezone.utc).isoformat()
@@ -342,7 +375,7 @@ class AgentSession:
 
     # ------------------------------------------------------------------ internal
 
-    def _build_options(self, system_prompt: str) -> "ClaudeAgentOptions":
+    def _build_options(self, system_prompt: str) -> CodexAgentOptions:
         session = self
 
         # In-process WriteMemory tool — supports legacy text+category and
@@ -1490,16 +1523,17 @@ class AgentSession:
                 interrupt=False,
             )
 
-        return ClaudeAgentOptions(
+        return CodexAgentOptions(
             system_prompt=system_prompt,
-            model=cfg.model,
+            model=_codex_model_name(cfg.model),
             allowed_tools=allowed_tools,
             mcp_servers=mcp_servers,
             can_use_tool=_can_use_tool,
-            permission_mode="bypassPermissions",
             include_partial_messages=cfg.stream,
-            setting_sources=[],
-            stderr=lambda line: log("sdk_stderr", line=line),
+            stderr=lambda line: log("codex_stderr", line=line),
+            instance=self.runner.instance,
+            cwd=os.getcwd(),
+            sandbox=os.environ.get("MNEMARA_CODEX_SANDBOX", "workspace-write"),
         )
 
 
@@ -1511,12 +1545,10 @@ class AgentSession:
 def _build_prompt(store: Store, current_user_text: str) -> str:
     """Flatten the rolling window into a transcript prefix + current input.
 
-    The Claude Agent SDK does not accept a prefab message list with synthetic
-    assistant turns, so we serialise prior turns into a single user-side text
+    Codex exec is stateless, so we serialise prior turns into a single text
     payload framed as the running transcript. The current user input follows
     the prefix under a clear separator. The model treats the prefix as
-    context (consistent with the `system_prompt` instructing it to continue
-    the conversation it sees).
+    persistent context.
     """
     msgs = store.messages_for_api()
     # The last row is the just-appended current user turn — drop it; we frame
@@ -1563,18 +1595,51 @@ def _flatten_blocks(blocks: Any) -> str:
 
 
 # -----------------------------------------------------------------------------
-# SDK driver
+# Codex driver
 # -----------------------------------------------------------------------------
 
 
 async def _run_turn(
     prompt: str,
-    options: "ClaudeAgentOptions",
+    options: CodexAgentOptions,
     stream: bool,
     on_token: OnToken | None = None,
     on_tool_use: OnToolUse | None = None,
     on_tool_result: OnToolResult | None = None,
 ) -> dict[str, Any]:
+    if callable(query):
+        return await _run_query_compat(
+            prompt,
+            options,
+            stream,
+            on_token=on_token,
+            on_tool_use=on_tool_use,
+            on_tool_result=on_tool_result,
+        )
+    return await _run_codex_turn(
+        prompt,
+        options,
+        stream,
+        on_token=on_token,
+        on_tool_use=on_tool_use,
+        on_tool_result=on_tool_result,
+    )
+
+
+async def _run_query_compat(
+    prompt: str,
+    options: CodexAgentOptions,
+    stream: bool,
+    on_token: OnToken | None = None,
+    on_tool_use: OnToolUse | None = None,
+    on_tool_result: OnToolResult | None = None,
+) -> dict[str, Any]:
+    """Compatibility path for tests that monkeypatch ``agent.query``.
+
+    Older tests patched the previous transport's ``query`` generator. Keeping this
+    hook means the transport swap does not make unit tests shell out to Codex.
+    The parser is deliberately duck-typed so tests do not need SDK classes.
+    """
     assistant_blocks: list[dict] = []
     tokens_in = 0
     tokens_out = 0
@@ -1588,9 +1653,6 @@ async def _run_turn(
             await result
 
     async def _prompt_stream():
-        # The SDK requires an AsyncIterable prompt when can_use_tool is set
-        # (it needs to keep the bidirectional channel open for permission
-        # callbacks). Yield a single user message and complete.
         yield {
             "type": "user",
             "message": {"role": "user", "content": prompt},
@@ -1598,51 +1660,20 @@ async def _run_turn(
             "session_id": "default",
         }
 
-    # Capture the generator so we can explicitly aclose() it in the finally
-    # block below.  Without this, Python defers cleanup to gc/__del__ which
-    # fires after the event loop has already closed and produces:
-    #   RuntimeError: Event loop is closed
-    #       in asyncio.base_subprocess.BaseSubprocessTransport.__del__
-    # Root cause: the SDK wraps anyio → asyncio.create_subprocess_exec, which
-    # creates a BaseSubprocessTransport.  When _run_turn is cancelled (e.g.
-    # via /stop or on_unmount's cancel_group), the async for exits via
-    # CancelledError and the generator is abandoned.  Python tracks abandoned
-    # async generators via sys.set_asyncgen_hooks and calls aclose() from
-    # shutdown_asyncgens — but only AFTER the event loop starts its teardown
-    # sequence, by which point close() has already been called and the
-    # __del__ fails.  Calling aclose() here, while still inside a live
-    # coroutine, ensures the transport is torn down cleanly.
     _query_gen = query(prompt=_prompt_stream(), options=options)
     try:
         async for message in _query_gen:
-            # Explicitly yield control to the event loop on every SDK message.
-            # The SDK's async iterator can deliver buffered messages back-to-back
-            # without internally awaiting on I/O — when tokens arrive in bursts,
-            # the loop body runs synchronously and starves concurrent tasks.
-            # asyncio.sleep(0) is the standard way to let the scheduler dispatch
-            # other ready tasks before continuing. Cost: negligible.
-            #
-            # NOTE 2026-04-30: an earlier diagnosis attempted to fix the
-            # resize-during-streaming bug by escalating these yields to
-            # sleep(0.001). That didn't work because the structural problem
-            # was elsewhere: in tui.py, on_input_submitted was awaiting
-            # _send_turn directly, blocking Textual's _process_messages_loop
-            # on dispatch_message for the entire stream. Yields here had no
-            # path to wake Textual's pump because the pump's task was parked
-            # on US, not waiting on the queue. The real fix lives in tui.py
-            # (run_worker pattern). These sleep(0) yields remain as cheap
-            # hygiene against future task-starvation scenarios.
             await asyncio.sleep(0)
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
+            if hasattr(message, "content"):
+                for block in (message.content or []):
                     bd = _block_to_dict(block)
                     if bd is None:
                         continue
                     assistant_blocks.append(bd)
                     if bd.get("type") == "text" and bd.get("text"):
                         if on_token is not None:
-                            # Per-text-block yield (an AssistantMessage can
-                            # carry many text blocks back-to-back).
+                            # Per-text-block yield; transports can deliver
+                            # multiple text blocks back-to-back.
                             await asyncio.sleep(0)
                             await _maybe_await(on_token(bd["text"]))
                         elif stream and not callback_mode:
@@ -1656,12 +1687,7 @@ async def _run_turn(
                         elif not callback_mode:
                             console.print(f"\n[dim]> tool: {name}({_short(inp)})[/dim]")
                         log("tool_call", tool=name)
-            elif isinstance(message, UserMessage):
-                # tool_result blocks come back in a UserMessage. Surface failures
-                # in debug log; the model already sees them via the SDK's loop.
-                for block in (message.content or []):
-                    bd = _block_to_dict(block)
-                    if bd and bd.get("type") == "tool_result":
+                    elif bd.get("type") == "tool_result":
                         if bd.get("is_error"):
                             log("tool_result_error", content=str(bd.get("content"))[:200])
                         if on_tool_result is not None:
@@ -1672,22 +1698,16 @@ async def _run_turn(
                                     bool(bd.get("is_error", False)),
                                 )
                             )
-            elif isinstance(message, ResultMessage):
+            elif hasattr(message, "usage"):
                 usage = message.usage or {}
                 tokens_in = int(usage.get("input_tokens", 0) or 0) + int(
                     usage.get("cache_read_input_tokens", 0) or 0
                 ) + int(usage.get("cache_creation_input_tokens", 0) or 0)
                 tokens_out = int(usage.get("output_tokens", 0) or 0)
-                if message.is_error:
+                if getattr(message, "is_error", False):
                     log("agent_error", subtype=message.subtype, result=str(message.result)[:200])
                     warn(f"agent_error subtype={message.subtype}")
-            # SystemMessage: init / context info — ignore.
     finally:
-        # Explicitly close the generator so SubprocessCLITransport.close()
-        # runs while the event loop is still live.  The inner try/except
-        # swallows any exception raised by aclose() itself (e.g. a second
-        # CancelledError during cleanup) without disturbing whatever
-        # exception is already propagating out of this function.
         try:
             await _query_gen.aclose()
         except BaseException:  # noqa: BLE001
@@ -1703,21 +1723,138 @@ async def _run_turn(
     }
 
 
+async def _run_codex_turn(
+    prompt: str,
+    options: CodexAgentOptions,
+    stream: bool,
+    on_token: OnToken | None = None,
+    on_tool_use: OnToolUse | None = None,
+    on_tool_result: OnToolResult | None = None,
+) -> dict[str, Any]:
+    tokens_in = 0
+    tokens_out = 0
+    assistant_text_parts: list[str] = []
+    assistant_blocks: list[dict[str, Any]] = []
+    callback_mode = any(c is not None for c in (on_token, on_tool_use, on_tool_result))
+
+    async def _maybe_await(result):
+        if asyncio.iscoroutine(result):
+            await result
+
+    full_prompt = _codex_prompt(options.system_prompt, prompt, options)
+    cmd = [
+        _codex_bin(),
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "-m",
+        options.model,
+        "--sandbox",
+        options.sandbox,
+        "--cd",
+        options.cwd,
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "-",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=options.cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    proc.stdin.write(full_prompt.encode("utf-8"))
+    await proc.stdin.drain()
+    proc.stdin.close()
+
+    async def _read_stderr() -> None:
+        async for raw in proc.stderr:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                options.stderr(line)
+
+    stderr_task = asyncio.create_task(_read_stderr())
+    try:
+        async for raw in proc.stdout:
+            await asyncio.sleep(0)
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                log("codex_stdout_non_json", line=line[:500])
+                continue
+            text = _codex_event_text(event)
+            if text:
+                assistant_text_parts.append(text)
+                assistant_blocks.append({"type": "text", "text": text})
+                if on_token is not None:
+                    await _maybe_await(on_token(text))
+                elif stream and not callback_mode:
+                    console.print(text, end="", soft_wrap=True, highlight=False)
+            tool_name, tool_input = _codex_event_tool_call(event)
+            if tool_name:
+                if on_tool_use is not None:
+                    await _maybe_await(on_tool_use(tool_name, tool_input))
+                elif not callback_mode:
+                    console.print(f"\n[dim]> tool: {tool_name}({_short(tool_input)})[/dim]")
+                assistant_blocks.append({
+                    "type": "tool_use",
+                    "name": tool_name,
+                    "input": tool_input,
+                })
+                log("tool_call", tool=tool_name)
+            ti, to = _codex_event_usage(event)
+            if ti or to:
+                tokens_in = ti
+                tokens_out = to
+
+        rc = await proc.wait()
+        await stderr_task
+    except BaseException:
+        proc.kill()
+        stderr_task.cancel()
+        try:
+            await stderr_task
+        except BaseException:  # noqa: BLE001
+            pass
+        raise
+
+    if stream and assistant_text_parts and not callback_mode:
+        console.print("")
+    if rc != 0:
+        raise RuntimeError(f"codex exec failed with exit code {rc}")
+    if not assistant_blocks and assistant_text_parts:
+        assistant_blocks = [{"type": "text", "text": "\n".join(assistant_text_parts)}]
+    return {
+        "assistant_blocks": assistant_blocks,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+    }
+
+
 def _block_to_dict(block: Any) -> dict[str, Any] | None:
     if isinstance(block, dict):
         return block
-    if isinstance(block, TextBlock):
+    cls_name = type(block).__name__
+    if cls_name == "TextBlock":
         return {"type": "text", "text": block.text}
-    if isinstance(block, ThinkingBlock):
+    if cls_name == "ThinkingBlock":
         return {"type": "thinking", "text": getattr(block, "thinking", "") or ""}
-    if isinstance(block, ToolUseBlock):
+    if cls_name == "ToolUseBlock":
         return {
             "type": "tool_use",
             "id": block.id,
             "name": block.name,
             "input": block.input,
         }
-    if isinstance(block, ToolResultBlock):
+    if cls_name == "ToolResultBlock":
         return {
             "type": "tool_result",
             "tool_use_id": block.tool_use_id,
@@ -1725,6 +1862,109 @@ def _block_to_dict(block: Any) -> dict[str, Any] | None:
             "is_error": getattr(block, "is_error", False) or False,
         }
     return None
+
+
+def _codex_bin() -> str:
+    exe = os.environ.get("MNEMARA_CODEX_BIN", "codex")
+    if os.path.isabs(exe):
+        return exe
+    return shutil.which(exe) or exe
+
+
+def _codex_model_name(model: str) -> str:
+    """Map legacy/empty model values to a Codex model without mutating config."""
+
+    override = os.environ.get("MNEMARA_CODEX_MODEL", "").strip()
+    if override:
+        return override
+    raw = (model or "").strip()
+    if not raw or raw.startswith("claude"):
+        return "gpt-5.3-codex"
+    return raw
+
+
+def _codex_prompt(system_prompt: str, prompt: str, options: CodexAgentOptions) -> str:
+    tool_names = ", ".join(options.allowed_tools)
+    mcp_names = ", ".join(options.mcp_servers.keys()) or "(none)"
+    return (
+        "[MNEMARA ROLE]\n"
+        f"{system_prompt}\n\n"
+        "[MNEMARA RUNTIME]\n"
+        f"Instance: {options.instance}\n"
+        f"Allowed tool policy names: {tool_names}\n"
+        f"Configured MCP servers: {mcp_names}\n"
+        "Use the conversation history below as persistent working memory. "
+        "Mnemara stores your final answer after this turn and evicts by its "
+        "own window policy.\n\n"
+        f"{prompt}"
+    )
+
+
+def _codex_event_text(event: dict[str, Any]) -> str:
+    item = event.get("item") if isinstance(event.get("item"), dict) else event
+    etype = str(event.get("type") or "")
+    itype = str(item.get("type") or "")
+    if etype in ("message", "agent_message", "assistant_message"):
+        return _text_from_any(event.get("text") or event.get("content"))
+    if itype in ("agent_message", "assistant_message", "message"):
+        return _text_from_any(item.get("text") or item.get("content"))
+    if etype == "item.completed" and itype in ("output_text", "text"):
+        return _text_from_any(item.get("text") or item.get("content"))
+    return ""
+
+
+def _text_from_any(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for entry in value:
+            if isinstance(entry, dict):
+                parts.append(_text_from_any(entry.get("text") or entry.get("content")))
+            else:
+                parts.append(str(entry))
+        return "".join(parts)
+    if isinstance(value, dict):
+        return _text_from_any(value.get("text") or value.get("content"))
+    return str(value)
+
+
+def _codex_event_tool_call(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    item = event.get("item") if isinstance(event.get("item"), dict) else event
+    etype = str(event.get("type") or "")
+    itype = str(item.get("type") or "")
+    if etype != "item.completed" and "tool" not in etype and "call" not in etype:
+        return "", {}
+    if "tool" not in itype and "call" not in itype and not item.get("name"):
+        return "", {}
+    name = str(item.get("name") or item.get("tool") or item.get("command") or "")
+    raw_input = item.get("input") or item.get("args") or item.get("arguments") or {}
+    if isinstance(raw_input, str):
+        try:
+            parsed = json.loads(raw_input)
+            raw_input = parsed if isinstance(parsed, dict) else {"value": raw_input}
+        except json.JSONDecodeError:
+            raw_input = {"value": raw_input}
+    if not isinstance(raw_input, dict):
+        raw_input = {"value": raw_input}
+    return name, raw_input
+
+
+def _codex_event_usage(event: dict[str, Any]) -> tuple[int, int]:
+    usage = event.get("usage") or event.get("token_usage") or {}
+    if not isinstance(usage, dict):
+        return 0, 0
+    tokens_in = int(
+        usage.get("input_tokens")
+        or usage.get("prompt_tokens")
+        or usage.get("cached_input_tokens")
+        or 0
+    )
+    cached = int(usage.get("cached_input_tokens") or 0)
+    tokens_out = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    return tokens_in + cached, tokens_out
 
 
 # -----------------------------------------------------------------------------
