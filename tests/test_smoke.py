@@ -5052,3 +5052,119 @@ def test_evict_pin_protection_leaves_no_force_eviction_when_enough_unpinned(home
     assert pinned in ids, "pinned anchor evicted when it should have survived"
     assert store.get_eviction_stats()["pinned_rows_force_evicted"] == 0
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# _run_turn subprocess cleanup — explicit aclose() on query generator
+# ---------------------------------------------------------------------------
+# These tests verify that _run_turn explicitly closes the SDK async generator
+# (and therefore the underlying subprocess transport) via its finally block,
+# rather than relying on gc/__del__ which fires after the event loop closes
+# and produces RuntimeError: Event loop is closed.
+
+def test_run_turn_acloses_sdk_gen_on_cancel(monkeypatch):
+    """_run_turn's finally block calls aclose() on the query generator when the
+    task is cancelled, regardless of whether the cancellation fires inside or
+    between __anext__() calls.
+
+    We verify this by wrapping the underlying generator in a regular-class proxy.
+    Regular classes are NOT async generators, so Python's "auto-finalize on
+    unhandled exception" rule does NOT apply to them — only to actual async
+    generator objects.  This means:
+
+    * When CancelledError propagates out of _TrackAclose.__anext__(), the
+      PROXY OBJECT is not finalized.  _run_turn's finally: await aclose() is
+      still meaningful.
+    * The inner async generator (_query_that_yields_once) may be auto-finalized,
+      making the subsequent _TrackAclose.aclose() → inner.aclose() a no-op at
+      that level — but we still observe the call on the proxy, confirming that
+      _run_turn does call aclose() as promised.
+
+    Without the explicit _query_gen.aclose() in _run_turn's finally, the proxy's
+    aclose() would never fire and aclose_called would remain empty.
+    """
+    import asyncio as _asyncio
+    from mnemara import agent as agent_mod
+
+    async def _run():
+        aclose_called: list[bool] = []
+
+        class _TrackAclose:
+            """Async-iterator proxy that records aclose() calls.
+
+            NOT an async generator class, so Python's exception-based
+            auto-finalization doesn't apply to it.
+            """
+
+            def __init__(self, gen):
+                self._gen = gen
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await self._gen.__anext__()
+
+            async def aclose(self):
+                aclose_called.append(True)
+                await self._gen.aclose()
+
+        async def _query_that_yields_once(*, prompt, options):
+            yield {}
+            await _asyncio.sleep(60)  # hang after first message
+
+        def _mock_query(*, prompt, options):
+            return _TrackAclose(
+                _query_that_yields_once(prompt=prompt, options=options)
+            )
+
+        monkeypatch.setattr(agent_mod, "query", _mock_query)
+
+        task = _asyncio.create_task(
+            agent_mod._run_turn("hello", options=None, stream=False)
+        )
+        await _asyncio.sleep(0.05)  # let the task enter the second __anext__()
+        task.cancel()
+        try:
+            await task
+        except _asyncio.CancelledError:
+            pass
+
+        return aclose_called
+
+    result = _asyncio.run(_run())
+    assert result == [True], (
+        "_run_turn did not call aclose() on the query generator after cancellation; "
+        "subprocess transport would have leaked past event loop close"
+    )
+
+
+def test_run_turn_acloses_sdk_gen_on_normal_completion(monkeypatch):
+    """On normal completion the finally block is harmless (aclose on exhausted
+    generator is a no-op); result dict is returned correctly."""
+    import asyncio as _asyncio
+    from mnemara import agent as agent_mod
+    from claude_agent_sdk import ResultMessage
+
+    async def _complete_query(*, prompt, options):
+        yield ResultMessage(
+            subtype="end_turn",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            total_cost_usd=0.0,
+            usage={"input_tokens": 5, "output_tokens": 3},
+            result=None,
+        )
+
+    monkeypatch.setattr(agent_mod, "query", _complete_query)
+
+    async def _go():
+        return await agent_mod._run_turn("hi", options=None, stream=False)
+
+    result = _asyncio.run(_go())
+    assert result["tokens_in"] == 5
+    assert result["tokens_out"] == 3
+    assert result["assistant_blocks"] == []

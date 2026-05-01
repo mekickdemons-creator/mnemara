@@ -1598,74 +1598,100 @@ async def _run_turn(
             "session_id": "default",
         }
 
-    async for message in query(prompt=_prompt_stream(), options=options):
-        # Explicitly yield control to the event loop on every SDK message.
-        # The SDK's async iterator can deliver buffered messages back-to-back
-        # without internally awaiting on I/O — when tokens arrive in bursts,
-        # the loop body runs synchronously and starves concurrent tasks.
-        # asyncio.sleep(0) is the standard way to let the scheduler dispatch
-        # other ready tasks before continuing. Cost: negligible.
-        #
-        # NOTE 2026-04-30: an earlier diagnosis attempted to fix the
-        # resize-during-streaming bug by escalating these yields to
-        # sleep(0.001). That didn't work because the structural problem
-        # was elsewhere: in tui.py, on_input_submitted was awaiting
-        # _send_turn directly, blocking Textual's _process_messages_loop
-        # on dispatch_message for the entire stream. Yields here had no
-        # path to wake Textual's pump because the pump's task was parked
-        # on US, not waiting on the queue. The real fix lives in tui.py
-        # (run_worker pattern). These sleep(0) yields remain as cheap
-        # hygiene against future task-starvation scenarios.
-        await asyncio.sleep(0)
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                bd = _block_to_dict(block)
-                if bd is None:
-                    continue
-                assistant_blocks.append(bd)
-                if bd.get("type") == "text" and bd.get("text"):
-                    if on_token is not None:
-                        # Per-text-block yield (an AssistantMessage can
-                        # carry many text blocks back-to-back).
-                        await asyncio.sleep(0)
-                        await _maybe_await(on_token(bd["text"]))
-                    elif stream and not callback_mode:
-                        console.print(bd["text"], end="", soft_wrap=True, highlight=False)
-                        printed_any = True
-                elif bd.get("type") == "tool_use":
-                    name = bd.get("name", "?")
-                    inp = bd.get("input") or {}
-                    if on_tool_use is not None:
-                        await _maybe_await(on_tool_use(name, inp if isinstance(inp, dict) else {}))
-                    elif not callback_mode:
-                        console.print(f"\n[dim]> tool: {name}({_short(inp)})[/dim]")
-                    log("tool_call", tool=name)
-        elif isinstance(message, UserMessage):
-            # tool_result blocks come back in a UserMessage. Surface failures
-            # in debug log; the model already sees them via the SDK's loop.
-            for block in (message.content or []):
-                bd = _block_to_dict(block)
-                if bd and bd.get("type") == "tool_result":
-                    if bd.get("is_error"):
-                        log("tool_result_error", content=str(bd.get("content"))[:200])
-                    if on_tool_result is not None:
-                        await _maybe_await(
-                            on_tool_result(
-                                bd.get("tool_use_id", ""),
-                                bd.get("content"),
-                                bool(bd.get("is_error", False)),
+    # Capture the generator so we can explicitly aclose() it in the finally
+    # block below.  Without this, Python defers cleanup to gc/__del__ which
+    # fires after the event loop has already closed and produces:
+    #   RuntimeError: Event loop is closed
+    #       in asyncio.base_subprocess.BaseSubprocessTransport.__del__
+    # Root cause: the SDK wraps anyio → asyncio.create_subprocess_exec, which
+    # creates a BaseSubprocessTransport.  When _run_turn is cancelled (e.g.
+    # via /stop or on_unmount's cancel_group), the async for exits via
+    # CancelledError and the generator is abandoned.  Python tracks abandoned
+    # async generators via sys.set_asyncgen_hooks and calls aclose() from
+    # shutdown_asyncgens — but only AFTER the event loop starts its teardown
+    # sequence, by which point close() has already been called and the
+    # __del__ fails.  Calling aclose() here, while still inside a live
+    # coroutine, ensures the transport is torn down cleanly.
+    _query_gen = query(prompt=_prompt_stream(), options=options)
+    try:
+        async for message in _query_gen:
+            # Explicitly yield control to the event loop on every SDK message.
+            # The SDK's async iterator can deliver buffered messages back-to-back
+            # without internally awaiting on I/O — when tokens arrive in bursts,
+            # the loop body runs synchronously and starves concurrent tasks.
+            # asyncio.sleep(0) is the standard way to let the scheduler dispatch
+            # other ready tasks before continuing. Cost: negligible.
+            #
+            # NOTE 2026-04-30: an earlier diagnosis attempted to fix the
+            # resize-during-streaming bug by escalating these yields to
+            # sleep(0.001). That didn't work because the structural problem
+            # was elsewhere: in tui.py, on_input_submitted was awaiting
+            # _send_turn directly, blocking Textual's _process_messages_loop
+            # on dispatch_message for the entire stream. Yields here had no
+            # path to wake Textual's pump because the pump's task was parked
+            # on US, not waiting on the queue. The real fix lives in tui.py
+            # (run_worker pattern). These sleep(0) yields remain as cheap
+            # hygiene against future task-starvation scenarios.
+            await asyncio.sleep(0)
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    bd = _block_to_dict(block)
+                    if bd is None:
+                        continue
+                    assistant_blocks.append(bd)
+                    if bd.get("type") == "text" and bd.get("text"):
+                        if on_token is not None:
+                            # Per-text-block yield (an AssistantMessage can
+                            # carry many text blocks back-to-back).
+                            await asyncio.sleep(0)
+                            await _maybe_await(on_token(bd["text"]))
+                        elif stream and not callback_mode:
+                            console.print(bd["text"], end="", soft_wrap=True, highlight=False)
+                            printed_any = True
+                    elif bd.get("type") == "tool_use":
+                        name = bd.get("name", "?")
+                        inp = bd.get("input") or {}
+                        if on_tool_use is not None:
+                            await _maybe_await(on_tool_use(name, inp if isinstance(inp, dict) else {}))
+                        elif not callback_mode:
+                            console.print(f"\n[dim]> tool: {name}({_short(inp)})[/dim]")
+                        log("tool_call", tool=name)
+            elif isinstance(message, UserMessage):
+                # tool_result blocks come back in a UserMessage. Surface failures
+                # in debug log; the model already sees them via the SDK's loop.
+                for block in (message.content or []):
+                    bd = _block_to_dict(block)
+                    if bd and bd.get("type") == "tool_result":
+                        if bd.get("is_error"):
+                            log("tool_result_error", content=str(bd.get("content"))[:200])
+                        if on_tool_result is not None:
+                            await _maybe_await(
+                                on_tool_result(
+                                    bd.get("tool_use_id", ""),
+                                    bd.get("content"),
+                                    bool(bd.get("is_error", False)),
+                                )
                             )
-                        )
-        elif isinstance(message, ResultMessage):
-            usage = message.usage or {}
-            tokens_in = int(usage.get("input_tokens", 0) or 0) + int(
-                usage.get("cache_read_input_tokens", 0) or 0
-            ) + int(usage.get("cache_creation_input_tokens", 0) or 0)
-            tokens_out = int(usage.get("output_tokens", 0) or 0)
-            if message.is_error:
-                log("agent_error", subtype=message.subtype, result=str(message.result)[:200])
-                warn(f"agent_error subtype={message.subtype}")
-        # SystemMessage: init / context info — ignore.
+            elif isinstance(message, ResultMessage):
+                usage = message.usage or {}
+                tokens_in = int(usage.get("input_tokens", 0) or 0) + int(
+                    usage.get("cache_read_input_tokens", 0) or 0
+                ) + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                tokens_out = int(usage.get("output_tokens", 0) or 0)
+                if message.is_error:
+                    log("agent_error", subtype=message.subtype, result=str(message.result)[:200])
+                    warn(f"agent_error subtype={message.subtype}")
+            # SystemMessage: init / context info — ignore.
+    finally:
+        # Explicitly close the generator so SubprocessCLITransport.close()
+        # runs while the event loop is still live.  The inner try/except
+        # swallows any exception raised by aclose() itself (e.g. a second
+        # CancelledError during cleanup) without disturbing whatever
+        # exception is already propagating out of this function.
+        try:
+            await _query_gen.aclose()
+        except BaseException:  # noqa: BLE001
+            pass
 
     if printed_any:
         console.print("")  # newline after streamed text

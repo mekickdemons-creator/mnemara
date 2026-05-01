@@ -2012,7 +2012,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
     async def action_quit(self) -> None:
         self.exit()
 
-    def on_unmount(self) -> None:
+    async def on_unmount(self) -> None:
         # --- Step 1: cancel timers and workers BEFORE touching the store ---
         # The ambient inbox timer and spinner timer are still registered with
         # Textual's event loop at quit time. If either fires after store.close()
@@ -2032,10 +2032,37 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             pass
         try:
-            # Cancel any in-flight streaming turn workers. CancelledError is
-            # caught inside _send_turn's finally block so _busy is cleared
-            # cleanly even though we're exiting.
-            self.workers.cancel_group(self, "turn")
+            # Cancel any in-flight streaming turn workers and AWAIT their
+            # completion.  This is the critical step that prevents the
+            # RuntimeError: Event loop is closed  error from
+            # BaseSubprocessTransport.__del__.
+            #
+            # Root cause: cancel_group() calls task.cancel() — fire-and-forget.
+            # The task's finally blocks (including _query_gen.aclose() →
+            # query.close() → transport.close() → subprocess termination) need
+            # the event loop to still be live to execute.  If on_unmount returns
+            # as a plain sync method, Textual starts tearing down the loop
+            # immediately, and those finally blocks never run.  Python's GC then
+            # collects the abandoned BaseSubprocessTransport after the loop is
+            # closed, triggering __del__ → RuntimeError.
+            #
+            # By making on_unmount async and awaiting the cancelled workers, we
+            # keep the event loop alive long enough for every cleanup coroutine
+            # to complete.  timeout=5.0 is generous — SubprocessCLITransport
+            # already has its own 5+5s terminate/kill ladder; we cap the outer
+            # wait so a hung subprocess can't stall the TUI forever.
+            cancelled = self.workers.cancel_group(self, "turn")
+            if cancelled:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *[w.wait() for w in cancelled],
+                            return_exceptions=True,
+                        ),
+                        timeout=5.0,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass
         except Exception:
             pass
 
