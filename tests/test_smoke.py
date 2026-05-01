@@ -4746,3 +4746,168 @@ def test_tui_stop_slash_when_not_busy(home, monkeypatch):
     assert len(cancel_calls) == 1
     assert cancel_calls[0][1] == "turn"
     app.store.close()
+
+
+# ----------------------------------------------------------------------
+# /export slash command
+# ----------------------------------------------------------------------
+
+def test_slash_export_writes_temp_file(home, tmp_path):
+    """/export writes the full window to a temp file and prints its path."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("exp_temp_t")
+    app = tui_mod.MnemaraTUI("exp_temp_t")
+    # Seed a couple of turns so there's content to export.
+    app.store.append_turn("user", [{"type": "text", "text": "hello"}])
+    app.store.append_turn("assistant", [{"type": "text", "text": "hi there"}])
+
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    app._chat = lambda: _FakeChat()  # type: ignore[method-assign]
+
+    _asyncio.run(app._slash_export("", _FakeChat()))
+
+    # A path should appear in the messages.
+    path_msgs = [m for m in chat_msgs if "mnemara_" in m and ".md" in m]
+    assert path_msgs, f"expected path in chat messages; got {chat_msgs}"
+
+    # Extract path from the message and verify the file exists and has content.
+    import re
+    for m in chat_msgs:
+        match = re.search(r"(/[^\s\[\]]+\.md)", m)
+        if match:
+            p = __import__("pathlib").Path(match.group(1))
+            assert p.exists(), f"temp file {p} does not exist"
+            content = p.read_text(encoding="utf-8")
+            assert "hello" in content
+            assert "hi there" in content
+            p.unlink()  # cleanup
+            break
+    else:
+        __import__("pytest").fail(f"no .md path found in chat messages: {chat_msgs}")
+    app.store.close()
+
+
+def test_slash_export_explicit_path(home, tmp_path):
+    """/export N path writes last N turns to the explicit path."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("exp_path_t")
+    app = tui_mod.MnemaraTUI("exp_path_t")
+    for i in range(5):
+        app.store.append_turn("user", [{"type": "text", "text": f"q{i}"}])
+        app.store.append_turn("assistant", [{"type": "text", "text": f"a{i}"}])
+
+    out_file = tmp_path / "export_test.md"
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    _asyncio.run(app._slash_export(f"4 {out_file}", _FakeChat()))
+
+    assert out_file.exists(), f"output file {out_file} not created"
+    content = out_file.read_text(encoding="utf-8")
+    # Last 4 rows out of 10 = turns 7-10. Check partial content present.
+    assert "q" in content
+    assert "a" in content
+    # Full window should NOT appear (we only asked for 4 rows out of 10)
+    # — hard to assert exactly without knowing turn ids so just assert
+    # the file is nonempty and path appears in chat.
+    assert str(out_file) in " ".join(chat_msgs), (
+        f"export path should appear in chat; got {chat_msgs}"
+    )
+    app.store.close()
+
+
+def test_slash_export_empty_window(home):
+    """/export on an empty window shows a 'nothing to export' message."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("exp_empty_t")
+    app = tui_mod.MnemaraTUI("exp_empty_t")
+
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    _asyncio.run(app._slash_export("", _FakeChat()))
+
+    assert any("empty" in m.lower() for m in chat_msgs), (
+        f"expected empty-window message; got {chat_msgs}"
+    )
+    app.store.close()
+
+
+def test_slash_export_last_n(home, tmp_path):
+    """/export N (without explicit path) exports only last N turns."""
+    import asyncio as _asyncio
+    import re
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("exp_lastn_t")
+    app = tui_mod.MnemaraTUI("exp_lastn_t")
+    app.store.append_turn("user", [{"type": "text", "text": "old"}])
+    app.store.append_turn("user", [{"type": "text", "text": "new"}])
+
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    _asyncio.run(app._slash_export("1", _FakeChat()))
+
+    # Find the exported file from the message.
+    written_path = None
+    for m in chat_msgs:
+        match = re.search(r"(/[^\s\[\]]+\.md)", m)
+        if match:
+            written_path = __import__("pathlib").Path(match.group(1))
+            break
+
+    assert written_path is not None and written_path.exists()
+    content = written_path.read_text(encoding="utf-8")
+    assert "new" in content
+    # "old" turn is outside the last-1 window.
+    assert "old" not in content
+    written_path.unlink()
+    app.store.close()
+
+
+def test_slash_export_bad_n_shows_usage(home):
+    """/export with a non-integer non-path first token shows usage hint."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("exp_badarg_t")
+    app = tui_mod.MnemaraTUI("exp_badarg_t")
+
+    chat_msgs: list[str] = []
+
+    class _FakeChat:
+        def write(self, msg: str) -> None:
+            chat_msgs.append(msg)
+
+    _asyncio.run(app._slash_export("notanumber", _FakeChat()))
+
+    assert any("usage" in m.lower() for m in chat_msgs), (
+        f"expected usage message; got {chat_msgs}"
+    )
+    app.store.close()

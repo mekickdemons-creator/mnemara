@@ -1031,6 +1031,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 "  /pin <id> [label]       pin a row to preserve against proactive eviction\n"
                 "  /unpin <id>             remove the pin from a row\n"
                 "  /pinned [label]         list pinned rows (optionally filter by label)\n"
+                "  /copy [all|N]    copy turns to clipboard (Ctrl+Y for last response)\n"
+                "  /export [all|N] [path] [--open]   write turns to file for editing\n"
                 "  /stop            interrupt the current turn (clean cancel, panel stays alive)\n"
                 "  /quit, /exit     exit\n"
                 "[b]Key bindings:[/b]\n"
@@ -1104,6 +1106,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd == "/copy":
             await self._slash_copy(arg.strip(), chat)
+            return
+
+        if cmd == "/export":
+            await self._slash_export(arg.strip(), chat)
             return
 
         if cmd == "/inbox":
@@ -1873,6 +1879,129 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if self._copy_to_clipboard(text):
             self._flash_copy(len(text))
+
+    async def _slash_export(self, arg: str, chat: "RichLog") -> None:
+        """/export [all|N] [path] [--open] — write turns to a file for editing.
+
+        Solves the cross-scroll selection problem: dumps the conversation to a
+        file so you can open it in any editor that has real text selection,
+        make all your cuts in one pass, and return. The TUI panel stays alive
+        while the file is open — no blocking.
+
+        Usage:
+          /export               export the entire window to a temp file
+          /export N             export last N turns to a temp file
+          /export all           same as bare /export (full window)
+          /export N path/out.md export last N turns to a specific file
+          /export all --open    write to temp file and open in $EDITOR
+          /export N --open      write last N turns and open in $EDITOR
+
+        When --open is present, $EDITOR (or 'less' as fallback) is launched in
+        a subprocess. The TUI continues running. Standard editor UX: save/quit
+        to return context to the terminal.
+
+        Path is written as UTF-8 plain text. Rich markup is stripped (tool_use
+        blocks show as "tool: <name> <input>" summaries). Content mirrors what
+        the agent sees in its rolling window — stub turns like [interrupted]
+        are preserved verbatim.
+        """
+        import subprocess as _subprocess
+        import tempfile as _tempfile
+
+        parts = arg.split()
+        open_in_editor = False
+        explicit_path: str | None = None
+
+        # Parse args: consume --open and detect positional (N|all) and path.
+        remaining: list[str] = []
+        for p in parts:
+            if p in ("--open", "-o"):
+                open_in_editor = True
+            else:
+                remaining.append(p)
+
+        last_n: int | None = None
+        if remaining:
+            first = remaining[0]
+            if first.lower() == "all":
+                remaining = remaining[1:]
+            else:
+                try:
+                    last_n = int(first)
+                    if last_n <= 0:
+                        raise ValueError
+                    remaining = remaining[1:]
+                except ValueError:
+                    if not first.startswith("/") and not first.startswith("."):
+                        chat.write(
+                            "[red]usage: /export [all|N] [path] [--open][/red]\n"
+                            "  /export 20          last 20 turns → temp file\n"
+                            "  /export all --open  full window → $EDITOR\n"
+                            "  /export 10 out.md   last 10 turns → out.md"
+                        )
+                        return
+                    # Treat first token as a path if it looks like one.
+                    remaining = [first] + remaining[1:]
+
+        if remaining:
+            explicit_path = " ".join(remaining)  # allow spaces if quoted edge case
+
+        # Extract content.
+        text = self._extract_window_as_text(last_n=last_n)
+        if not text:
+            chat.write("[dim](window is empty — nothing to export)[/dim]")
+            return
+
+        # Determine output path.
+        if explicit_path:
+            out_path = Path(explicit_path).expanduser()
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(text, encoding="utf-8")
+            except OSError as exc:
+                chat.write(f"[red]export failed: {exc}[/red]")
+                return
+        else:
+            # Temp file — suffix .md so editors pick up markdown highlighting.
+            fd, tmp = _tempfile.mkstemp(
+                prefix=f"mnemara_{self.instance}_", suffix=".md"
+            )
+            try:
+                import os as _os
+                _os.write(fd, text.encode("utf-8"))
+                _os.close(fd)
+            except OSError as exc:
+                chat.write(f"[red]export failed: {exc}[/red]")
+                return
+            out_path = Path(tmp)
+
+        n_turns = len(self.store.window()) if last_n is None else min(
+            last_n, len(self.store.window())
+        )
+        n_chars = len(text)
+
+        if open_in_editor:
+            editor = __import__("os").environ.get("EDITOR", "less")
+            try:
+                _subprocess.Popen([editor, str(out_path)])
+                chat.write(
+                    f"[green]exported {n_turns} turns ({n_chars:,} chars)[/green] → "
+                    f"[cyan]{out_path}[/cyan]\n"
+                    f"[dim]opened in {editor} (TUI stays live)[/dim]"
+                )
+            except OSError as exc:
+                # Editor launch failed — still show the path so they can open manually.
+                chat.write(
+                    f"[green]exported[/green] → [cyan]{out_path}[/cyan]\n"
+                    f"[dim]editor launch failed ({exc}) — open manually[/dim]"
+                )
+        else:
+            chat.write(
+                f"[green]exported {n_turns} turns ({n_chars:,} chars)[/green] → "
+                f"[cyan]{out_path}[/cyan]"
+            )
+            log("tui_export", instance=self.instance, path=str(out_path),
+                turns=n_turns, chars=n_chars)
 
     async def action_quit(self) -> None:
         self.exit()
