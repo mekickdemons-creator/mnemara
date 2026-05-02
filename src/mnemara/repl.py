@@ -13,7 +13,7 @@ from rich.markdown import Markdown
 from . import config as config_mod
 from . import inbox as inbox_mod
 from . import paths
-from .agent import AgentSession, _codex_bin
+from .agent import AgentSession
 from .config import Config
 from .logging_util import log, set_log_path
 from .permissions import PermissionStore
@@ -53,11 +53,6 @@ def run(instance: str) -> None:
     store = Store(instance)
     perms = PermissionStore(instance)
     log("repl_start", instance=instance, model=cfg.model)
-
-    codex_bin = _codex_bin()
-    if not (Path(codex_bin).is_file() and os.access(codex_bin, os.X_OK)):
-        console.print("[red]codex CLI not found. Install Codex and authenticate first.[/red]")
-        sys.exit(1)
 
     runner = ToolRunner(instance, cfg, perms, permission_prompt)
     session = AgentSession(cfg, store, runner, client=None)

@@ -572,7 +572,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             f"{k}={v}" for k, v in sorted(config_mod.MODEL_ALIASES.items())
         )
         lines.append(f"[dim]aliases: {aliases}[/dim]")
-        lines.append("[dim]usage: /swap 1  or  /swap gpt-5.3-codex[/dim]")
+        lines.append("[dim]usage: /swap 1  or  /swap claude-opus-4-7[/dim]")
         chat.write("\n".join(lines))
 
     async def _slash_swap_model(self, arg: str, chat: "RichLog") -> None:

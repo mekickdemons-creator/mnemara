@@ -1,3 +1,3 @@
-"""Mnemara — controlled rolling-context conversation runtime for Codex."""
+"""Mnemara — controlled rolling-context conversation runtime for Claude."""
 
 __version__ = "0.1.0"
