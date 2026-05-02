@@ -9,7 +9,7 @@ from typing import Any
 from . import paths
 
 DEFAULT_MODEL = "gpt-5.3-codex"
-SENTINEL_DEFAULT_MODEL = "gpt-5.4-mini"
+SENTINEL_DEFAULT_MODEL = "claude-haiku-4-5"
 AVAILABLE_MODELS = [
     "gpt-5.5",
     "gpt-5.4",
