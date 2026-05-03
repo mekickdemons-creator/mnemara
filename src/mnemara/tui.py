@@ -413,8 +413,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             tin, tout = 0, 0
         try:
-            rows = self.store.load_window(self.cfg.max_window_turns, self.cfg.max_window_tokens)
-            nturns = len(rows)
+            nturns = len(self.store.window())
         except Exception:
             nturns = 0
         try:
