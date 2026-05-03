@@ -413,12 +413,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             tin, tout = 0, 0
         try:
+            rows = self.store.load_window(self.cfg.max_window_turns, self.cfg.max_window_tokens)
+            nturns = len(rows)
+        except Exception:
+            nturns = 0
+        try:
             ev = self.store.get_eviction_stats()
             ev_str = f"{ev['rows_evicted']}r"
         except Exception:
             ev_str = "0r"
         return (
-            f"tokens: {tin}/{self.cfg.max_window_tokens} (out: {tout} cum) | "
+            f"turns: {nturns} | tokens: {tin}/{self.cfg.max_window_tokens} (out: {tout} cum) | "
             f"model: {self.cfg.model} | evicted: {ev_str}"
         )
 
