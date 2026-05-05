@@ -5,10 +5,35 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mnemara"
 version = "0.3.0"
-description = "Controlled rolling-context conversation runtime for Codex orchestrators"
+description = "Controlled rolling-context conversation runtime for Claude — transparent turns store, role doc system prompt, and the Claude Agent SDK underneath."
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{name = "Aethon Poiesis"}]
+license = "MIT"
+authors = [{name = "Michael Anderson"}]
+keywords = [
+    "claude",
+    "anthropic",
+    "claude-agent-sdk",
+    "llm",
+    "agent",
+    "mcp",
+    "rolling-context",
+    "repl",
+    "tui",
+    "context-window",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "click>=8.1",
     "prompt-toolkit>=3.0",
@@ -19,10 +44,16 @@ dependencies = [
     "pyarrow>=15",
     "kuzu>=0.10",
     "pyperclip>=1.8",
+    "claude-agent-sdk>=0.1",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/mekickdemons-creator/mnemara"
+Repository = "https://github.com/mekickdemons-creator/mnemara"
+Issues = "https://github.com/mekickdemons-creator/mnemara/issues"
 
 [project.scripts]
 mnemara = "mnemara.cli:main"

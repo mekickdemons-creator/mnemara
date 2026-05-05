@@ -37,7 +37,6 @@ OnToken = Callable[[str], Optional[Awaitable[None]]]
 OnToolUse = Callable[[str, dict], Optional[Awaitable[None]]]
 OnToolResult = Callable[[str, Any, bool], Optional[Awaitable[None]]]
 
-from . import inbox as inbox_mod
 from . import paths as paths_mod
 from . import role as role_mod
 from . import tools as tools_mod
@@ -167,25 +166,6 @@ class AgentSession:
 
         Used by the Textual TUI; the REPL uses turn() which wraps this.
         """
-        # Inbox auto-surface: prepend a notice when peer pings are waiting.
-        if getattr(self.cfg, "inbox_auto_surface", True):
-            try:
-                db = getattr(self.cfg, "architect_db_path", "") or ""
-                peers = getattr(self.cfg, "peer_roles", ["theseus", "majordomo"])
-                if db:
-                    pings = inbox_mod.peek_pending_pings(
-                        db, peers, exclude_role=self.runner.instance
-                    )
-                    if pings:
-                        senders = sorted({p["agent_role"] for p in pings})
-                        user_text = (
-                            f"[INBOX: {len(pings)} ping(s) waiting from "
-                            f"{', '.join(senders)} — call next_return to read]\n\n"
-                            + user_text
-                        )
-            except Exception:
-                pass
-
         # Persist the user turn before contacting the model.
         user_blocks = [{"type": "text", "text": user_text}]
         self.store.append_turn("user", user_blocks)
@@ -1087,7 +1067,7 @@ class AgentSession:
             "text/thinking blocks. HIGHEST-IMPACT block surgery for context "
             "budget — tool_use spec blocks (file paths, command strings, "
             "payload JSONs, edit before/after content) average ~870 bytes each "
-            "and dominate stored bytes in long sessions (78% of substrate's "
+            "and dominate stored bytes in long sessions (often 70%+ of the "
             "store, vs. <1% for thinking signature stubs). Pairing-safe: in "
             "mnemara only assistant_blocks are persisted — tool_result blocks "
             "from the SDK come back via callback only and are never stored, "

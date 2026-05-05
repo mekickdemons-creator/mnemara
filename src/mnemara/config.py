@@ -134,19 +134,6 @@ class Config:
     rag_embed_model: str = "nomic-embed-text"
     rag_auto_index_memory: bool = True
     rag_auto_index_wiki: bool = True
-    # v0.2.1.1 — panel inbox
-    peer_roles: list[str] = field(default_factory=lambda: ["theseus", "majordomo"])
-    architect_db_path: str = ""  # empty = not configured; set to .../architect/muninn.db for Aethon
-    inbox_auto_surface: bool = True
-    # v0.3.1 — agent-level auto-respond to peer pings (off by default; opt-in
-    # per panel). When True, the TUI's ambient inbox poller spawns a worker
-    # turn the moment a new peer ping lands, prompting the agent to drain +
-    # process + reply without waiting for a human-driven turn. Coordinator
-    # panels (Theseus, Producer) typically want this on; engineer panels
-    # (Substrate) typically leave it off so they only act when explicitly
-    # prompted. See tui.py:_check_inbox_ambient for the loop guard
-    # (skips payload_type in {ack, ack_final, reply_final}).
-    inbox_auto_respond: bool = False
     # v0.3.2 — auto-evict-after-write context discipline
     # When True, after each turn that contained Edit/Write/MultiEdit/
     # NotebookEdit tool_use blocks, mnemara stubs the bulky body content
@@ -158,8 +145,7 @@ class Config:
     # {"file_path": "/foo/bar.py", "_evicted": true}.
     # Pinned rows are skipped. The actual change persists in git or
     # wherever the tool wrote; only the in-context audit body goes.
-    # Off by default; opt-in per panel. Same agent-decides-primitive-
-    # stays-clean pattern as inbox_auto_respond.
+    # Off by default; opt-in per instance.
     auto_evict_after_write: bool = False
     # v0.3.3 — token-aware row-cap slack
     # When > 0, the cap-FIFO eviction loop allows n_turns to exceed
@@ -257,10 +243,6 @@ class Config:
             rag_embed_model=str(d.get("rag_embed_model", "nomic-embed-text")),
             rag_auto_index_memory=bool(d.get("rag_auto_index_memory", True)),
             rag_auto_index_wiki=bool(d.get("rag_auto_index_wiki", True)),
-            peer_roles=list(d.get("peer_roles", ["theseus", "majordomo"])),
-            architect_db_path=str(d.get("architect_db_path", "") or ""),
-            inbox_auto_surface=bool(d.get("inbox_auto_surface", True)),
-            inbox_auto_respond=bool(d.get("inbox_auto_respond", False)),
             auto_evict_after_write=bool(d.get("auto_evict_after_write", False)),
             row_cap_slack_when_token_headroom=int(
                 d.get("row_cap_slack_when_token_headroom", 0)

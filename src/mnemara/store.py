@@ -53,8 +53,8 @@ class Store:
     def _migrate_schema(self) -> None:
         """Idempotent column adds for older DBs that pre-date a column.
 
-        Mirrors the architect-side ensure_*_schema PRAGMA pattern. Running on
-        every Store() construction is cheap (PRAGMA + dict membership). The
+        Running on every Store() construction is cheap (PRAGMA + dict
+        membership lookup). The
         index creation MUST run after the ALTER TABLE on legacy DBs because
         the column doesn't exist when SCHEMA's executescript runs the first
         time on a pre-existing turns table.
@@ -850,9 +850,9 @@ class Store:
         """Strip 'tool_use' blocks from selected rolling-window rows.
 
         Block-level surgery for the largest bloat category in long sessions.
-        Substrate's pre-surgery store had 78% of bytes in tool_use specs
-        (file paths, command strings, payload JSONs, edit before/after
-        strings) — far more than thinking. Stripping them is the highest-
+        In long agent sessions, tool_use specs (file paths, command strings,
+        payload JSONs, edit before/after strings) typically dominate stored
+        bytes — far more than thinking. Stripping them is the highest-
         impact context budget intervention available.
 
         Pairing safety note: Mnemara persists assistant-facing blocks as an

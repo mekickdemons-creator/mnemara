@@ -6,7 +6,7 @@ Three features, nothing else:
   3. Spinner during streaming turns
 
 Slash commands: /quit, /exit, /models, /swap, /tokens, /export, and /stop.
-No inbox polling, no block surgery, no pin system, no copy.
+No block surgery, no pin system, no copy.
 """
 from __future__ import annotations
 
