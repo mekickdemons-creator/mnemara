@@ -177,6 +177,54 @@ You can also layer Sentinel-style self-monitoring rules on top of a
 task-specific role doc — there's nothing special about Sentinel; it's
 just text in a Markdown file that the agent reads on every turn.
 
+### More example role docs
+
+The repo ships three role docs under [`examples/roles/`](examples/roles/):
+
+| File | Use it when |
+|---|---|
+| [`sentinel.md`](examples/roles/sentinel.md) | You want the agent to self-monitor for loops, drift, sycophancy and halt to ask the user. |
+| [`coder.md`](examples/roles/coder.md) | You want a careful, grounded coding collaborator that reads before it writes and edits narrowly. |
+| [`researcher.md`](examples/roles/researcher.md) | You want a citation-grounded research assistant that distinguishes observation from inference and refuses to fabricate. |
+
+These are starting points. Copy any of them, edit the rules to match
+your work, and point your instance at the copy.
+
+### What a session looks like with a self-monitoring role doc
+
+Concrete example. Your role doc tells the agent to halt if it polls
+the same tool 3 times. The user asks the agent to wait for a build
+to finish:
+
+```
+you: run the build and tell me when it's done
+
+agent: > Bash(npm run build)
+       (output: building...)
+       Build is running. Let me check.
+       > Bash(npm run build)
+       (output: building...)
+       Still building.
+       > Bash(npm run build)
+       (output: building...)
+
+       [SENTINEL HALT]
+       trigger: polling
+       turn: 4
+       context: I've called `npm run build` three times in a row and
+       each call started a new build rather than reporting on the
+       running one. I'm not actually monitoring; I'm starting fresh
+       builds.
+       proposed next step: wait on the existing build process via
+       `wait` or check `npm run build:status` if it exists. Which
+       would you like?
+```
+
+Without the role doc, the same agent would happily call `npm run build`
+twenty times in a row, each one starting a fresh build, before either
+the user noticed or the API budget ran out. The role doc is what makes
+the agent notice on turn 4 and check in.
+
 ## State layout
 
 Everything for an instance lives under `~/.mnemara/<instance>/`:
@@ -277,6 +325,37 @@ Format: append-only Markdown, one block per note:
 
 Worth remembering across sessions.
 ```
+
+## Context budget — agent-side eviction tools
+
+The rolling window's row + token caps are the *floor* of context
+discipline. The agent itself has access to a set of in-process tools
+that let it compact its own history mid-session — useful for long
+sessions where most of the context is bulky tool-use audit data the
+model no longer needs.
+
+| Tool | What it does |
+|---|---|
+| `evict_thinking_blocks` | Strips `thinking` blocks from selected rows while preserving text + tool_use. Cheap, low-risk. |
+| `evict_tool_use_blocks` | Strips `tool_use` spec bodies (file paths, command strings, edit before/after content) from rows while preserving the audit shell. Often the highest-impact intervention — tool_use specs frequently dominate stored bytes in long sessions. |
+| `evict_write_pairs` | Stubs the bulky body content of Edit/Write/MultiEdit tool calls *and* their paired prior Read calls for the same file path. Audit trail intact ("I edited /foo/bar.py"); the kilobytes-per-block strings collapse to `{file_path, _evicted: true}`. |
+
+Concrete: an `Edit` tool call with old_string + new_string commonly
+carries 1–5 KB of inline content. A `Write` call with full file body
+is often much more. Multiplied across a long session, that becomes
+the majority of stored bytes. The actual change persists on disk; the
+in-context audit body doesn't need to.
+
+The agent decides when to call these. The role doc is the right place
+to encode the policy ("when the rolling window is more than 80% full,
+call `evict_write_pairs` on completed edit turns before doing more
+work").
+
+There is also an opt-in **auto-evict-after-write** config flag
+(`auto_evict_after_write: true` in `config.json`) that runs
+`evict_write_pairs` automatically after any turn that contained an
+edit/write tool call. Off by default; opt in per instance if you've
+decided that's the policy you want.
 
 ## MCP wire-through
 
@@ -393,6 +472,18 @@ model and its native tools (Bash/Read/Edit/Write); Mnemara owns:
   (the SDK is stateless per `query()`).
 - The permission policy (mediated via the SDK's `can_use_tool` callback).
 - The memory/wiki/RAG/graph backends and the `replay` consolidation pass.
+
+## Programmatic use
+
+The CLI is the primary surface, but Mnemara is also a regular Python
+library you can embed in your own code. See
+[`examples/programmatic_use.py`](examples/programmatic_use.py) for a
+minimal embed: initializes an instance, configures a role doc, drives
+a turn, and inspects the rolling window — about 60 lines.
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... python examples/programmatic_use.py
+```
 
 ## Troubleshooting
 
