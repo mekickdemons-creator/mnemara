@@ -1,5 +1,9 @@
 # Mnemara
 
+[![PyPI](https://img.shields.io/pypi/v/mnemara.svg)](https://pypi.org/project/mnemara/)
+[![Python](https://img.shields.io/pypi/pyversions/mnemara.svg)](https://pypi.org/project/mnemara/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A controlled rolling-context conversation runtime for Claude. Built on the
 **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)**:
 Mnemara wraps the SDK with a transparent, file-based context layer so you can
@@ -25,6 +29,12 @@ If you want a chat loop where you control the system prompt, control the
 window, and can read every byte of state on disk, that's what this is.
 
 ## Install
+
+```bash
+pip install mnemara
+```
+
+Or from source if you want to hack on it:
 
 ```bash
 git clone https://github.com/mekickdemons-creator/mnemara.git
@@ -400,6 +410,10 @@ pytest -q tests/
 
 Tests do not call the network — they cover the store, config, permissions,
 and the file tools.
+
+## Acknowledgments
+
+Built by Michael Anderson with Dave Moore.
 
 ## License
 
