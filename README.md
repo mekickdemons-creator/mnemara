@@ -1,19 +1,34 @@
 # Mnemara
 
-A controlled rolling-context conversation runtime for Codex. Runs an
-interactive REPL with transparent context construction: a re-read-every-call
-role doc as the system prompt, a configurable rolling window of recent turns,
-native tool use (Bash, Read, Edit, Write, WriteMemory), and optional MCP
-wire-through. Per-instance state under `~/.mnemara/<instance>/`.
+A controlled rolling-context conversation runtime for Claude. Built on the
+**[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)**:
+Mnemara wraps the SDK with a transparent, file-based context layer so you can
+see and shape exactly what the model sees on every turn.
 
-Mnemara is the runtime under which Aethon orchestrators (Majordomo, Theseus,
-future) operate when transparent and controlled context construction matters.
-Each orchestrator panel runs its own Mnemara process.
+What you get:
+
+- A **role doc** re-read on every API call and pinned as the system prompt.
+- A configurable **rolling window** of recent turns (FIFO, by row count or
+  token budget).
+- Native tool use — Bash, Read, Edit, Write — plus an in-process `WriteMemory`
+  tool registered as an SDK MCP server.
+- Optional **MCP wire-through**: declare stdio MCP servers in config and the
+  Claude Agent SDK exposes them to the model.
+- A **Textual TUI** (`mnemara run`) and a bare prompt-toolkit REPL fallback.
+- Per-instance, file-only state under `~/.mnemara/<instance>/` — no daemon,
+  no service, no hidden state.
+- Optional memory/wiki + LanceDB RAG + Kuzu property graph backends, and a
+  `mnemara replay` consolidation primitive that drafts wiki pages and
+  role-amendment proposals from clustered memory atoms.
+
+If you want a chat loop where you control the system prompt, control the
+window, and can read every byte of state on disk, that's what this is.
 
 ## Install
 
 ```bash
-cd ~/workspace/mnemara
+git clone https://github.com/mekickdemons-creator/mnemara.git
+cd mnemara
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -21,42 +36,44 @@ pip install -e .
 
 ### Auth
 
-Mnemara shells out to your local `codex` CLI and inherits its auth. If you
-have not already authed:
+Mnemara runs on the Claude Agent SDK, which talks to the Anthropic API. The
+easiest way is to set your API key:
 
 ```bash
-codex login
+export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-No Anthropic key or Claude SDK is required.
+Get a key at <https://console.anthropic.com/>. The SDK also supports the local
+`claude` CLI's subscription auth as a fallback if you have Claude Code
+installed and logged in — but the documented path is the API key.
 
 ## Quick start
 
 ```bash
-mnemara init --instance majordomo
-# (prompts for role doc path; you can leave blank and set later)
-mnemara role --instance majordomo --set ~/workspace/architect/roles/majordomo.md
-mnemara run --instance majordomo
+mnemara init --instance scratch
+# (prompts for role doc path; you can leave it blank and set it later)
+mnemara role --instance scratch --set ~/path/to/role.md
+mnemara run --instance scratch
 ```
 
 By default `mnemara run` opens the **Textual chat panel** (TUI). Pass
-`--no-tui` (or set `MNEMARA_NO_TUI=1`) to force the bare prompt-toolkit
-REPL — useful for scripting or non-TTY contexts.
+`--no-tui` (or set `MNEMARA_NO_TUI=1`) for the bare prompt-toolkit REPL —
+useful for scripting or non-TTY contexts.
 
-### Chat panel layout (v0.1.2)
+### Chat panel layout
 
 ```
 +------------------------------------------------------------+
-| mnemara: majordomo            model=gpt-5.3-codex role=... |   header
+| mnemara: scratch        model=claude-opus-4-7  role=...    |   header
 +------------------------------------------------------------+
 |                                                            |
 |  you: how do I check the lease timeout?                    |
-|  assistant: open architect/orchestrator.py and grep ...    |
-|  > tool: Read(file_path=architect/orchestrator.py)         |
+|  assistant: open server.py and grep for ...                |
+|  > tool: Read(file_path=server.py)                         |
 |    result: ...                                             |
 |                                                            |   chat log
 +------------------------------------------------------------+
-| turns: 12/100 | tokens: 14K/200K | model: gpt-5.3-codex | ... | status
+| turns: 12/100 | tokens: 14K/200K | model: claude-opus-4-7  |   status
 +------------------------------------------------------------+
 | > _                                                        |   input
 +------------------------------------------------------------+
@@ -72,8 +89,8 @@ Keybindings:
 | `/help` | Slash-command list (same as the REPL) |
 
 The TUI accepts `/models`, `/swap`, `/tokens`, `/quit`, and `/exit`.
-`/models` lists the available Codex models and numbered shortcuts;
-`/swap 1` or `/swap gpt-5.3-codex` switches the active model.
+`/models` lists the available Claude model shortcuts; `/swap 1` or
+`/swap claude-sonnet-4-6` switches the active model.
 
 ## State layout
 
@@ -102,8 +119,9 @@ Everything for an instance lives under `~/.mnemara/<instance>/`:
 | Field | Meaning |
 |---|---|
 | `role_doc_path` | Absolute path to the role doc. Re-read on every API call. Pinned as the system prompt. |
-| `model` | Codex/OpenAI model id (e.g. `gpt-5.3-codex`). |
+| `model` | Claude model id (e.g. `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`). |
 | `max_window_turns` | Rolling-window size (FIFO). Default 20. Counts both user and assistant turns. |
+| `max_window_tokens` | Token-budget cap. The window is FIFO-trimmed once total tokens exceed this. |
 | `allowed_tools` | List of `{tool, mode, allowed_patterns}` policies. `mode` ∈ `allow`/`ask`/`deny`. |
 | `mcp_servers` | List of stdio MCP servers wired through to the model. |
 | `stream` | If true, render the model's text deltas as they arrive. |
@@ -124,15 +142,16 @@ mnemara note --instance <name> TEXT...    # append a memory note from the shell
 mnemara replay --instance <name> [--days N] [--threshold N] [--apply]  # consolidation pass
 ```
 
-## Slash commands (in REPL)
+## Slash commands (REPL and TUI)
 
 ```
 /role <path>     swap role doc (also persists to config)
 /show            print the rolling window
 /clear           wipe the window (with confirm)
-/models          list available Codex model shortcuts
+/models          list available Claude model shortcuts
 /swap <model|n>  switch model for this and future sessions
 /note <text>     append to today's memory file
+/proposals       list pending role-amendment proposals
 /quit, /exit     save state and exit
 /help            show this list
 ```
@@ -171,7 +190,7 @@ Format: append-only Markdown, one block per note:
 ```
 ## [2026-04-27T18:32:01+00:00] insight
 
-The Majordomo refactor depends on the Phase-3 lease timeout patch landing first.
+Worth remembering across sessions.
 ```
 
 ## MCP wire-through
@@ -181,8 +200,8 @@ Add an entry to `mcp_servers` in `config.json`:
 ```json
 "mcp_servers": [
   {
-    "name": "architect",
-    "command": "/home/michael/workspace/architect/plugin/mcp_server.py",
+    "name": "myserver",
+    "command": "/usr/local/bin/my-mcp-server",
     "args": [],
     "env": {}
   }
@@ -190,14 +209,14 @@ Add an entry to `mcp_servers` in `config.json`:
 ```
 
 Mnemara records these servers in its runtime metadata and allow-lists their
-`mcp__<name>__*` namespace. Native Codex MCP wire-through is the next bridge
-step once the transport surface is finalized.
+`mcp__<name>__*` tool namespace. The Claude Agent SDK handles the actual
+stdio transport.
 
-### v0.3 — Graph backend (kuzu) + sleep/replay primitive
+## Graph backend (Kuzu) + sleep/replay primitive
 
-Two co-evolving features land together. The graph captures relational
-structure between memories and entities; replay exploits that structure on
-each consolidation pass.
+Two co-evolving features. The graph captures relational structure between
+memories and entities; replay exploits that structure on each consolidation
+pass.
 
 **Graph backend** — `graph/` directory holding a [Kuzu](https://kuzudb.com/)
 property graph. Two tables: `Node(id, label, properties JSON, created_at)`
@@ -213,14 +232,14 @@ graph_match(pattern_json) -> nodes matching {label, properties_subset}
 graph_shortest_path(from_id, to_id) -> list of node ids
 ```
 
-Auto-edge hooks fire on every `write_memory` (with structured
-`applies_to`) and `wiki_write` (frontmatter `tags:`). All wrapped in
-try/except — graph failure never fails the primary write.
+Auto-edge hooks fire on every `write_memory` (with structured `applies_to`)
+and `wiki_write` (frontmatter `tags:`). All wrapped in try/except — graph
+failure never fails the primary write.
 
-Lazy: kuzu is not opened until the first graph tool call. If kuzu is
-absent or the DB is corrupt, every tool returns
-`{"ok": false, "error": "Graph backend unavailable: …"}` and the rest of
-the system keeps working. Off-switch: `graph_enabled: false` in config.
+Lazy: Kuzu is not opened until the first graph tool call. If Kuzu is absent
+or the DB is corrupt, every tool returns
+`{"ok": false, "error": "Graph backend unavailable: …"}` and the rest of the
+system keeps working. Off-switch: `graph_enabled: false` in config.
 
 **Sleep / replay primitive** — `mnemara replay --instance <name>`. Seven
 phases:
@@ -231,41 +250,30 @@ phases:
 3. Augment patterns with graph structure — frequently-co-occurring entities
    from `applies_to` edges; causal phrasing in member text.
 4. For patterns not already covered by an existing wiki page, draft a
-   proposal at `wiki_proposals/<slug>.md` (frontmatter: `source_count`,
-   `member_atom_ids`, `drafted_at`, `status: proposed`).
-5. Archive near-duplicate atoms (distance < 0.10) into `memory/archive/`
-   — preserved verbatim with a header pointing at the canonical atom.
+   proposal at `wiki_proposals/<slug>.md`.
+5. Archive near-duplicate atoms (distance < 0.10) into `memory/archive/`.
    **Never deletes.**
 6. When `self_observation` atoms cluster, draft a role-amendment proposal
    at `role_proposals/<ts>_replay-<slug>.md`.
 7. Write a sleep digest at `sleep/YYYY-MM-DD.md` with counts and pointers.
 
-Default behavior is dry-run (prints planned actions but writes nothing).
-Pass `--apply` to actually write proposals, archive duplicates, and emit
-the digest.
+Default behavior is dry-run. Pass `--apply` to actually write proposals,
+archive duplicates, and emit the digest.
 
-**Policy doc** — `wiki/replay_policy.md` (the agent's, written by the
-agent over time) is read for `threshold:` / `days:` overrides. Mnemara
-ships only the primitive; the policy is the agent's.
+## Multi-backend memory (wiki + RAG)
 
-After a replay completes, the next `mnemara run` prints a one-line summary
-of the most recent digest at session start.
+Three memory surfaces write together. The agent picks which surface to read
+from given the kind of recall it needs.
 
-### v0.2.1 — Multi-backend memory (wiki + RAG)
-
-Three memory backends now write together. The agent picks which surface to
-read from given the kind of recall it needs; observed retrieval patterns
-become the data Mnemara self-tunes against.
-
-**Memory file** (existing) — `memory/YYYY-MM-DD.md`. Append-only, chronological.
+**Memory file** — `memory/YYYY-MM-DD.md`. Append-only, chronological.
 
 **Wiki** — `wiki/<slug>.md`. Slash-allowed slugs (e.g. `replay_policy`,
 `patterns/loader_traps`). Plain markdown, optional frontmatter, no schema.
 
 ```
-wiki_read(path)                          # returns body or "no such page"
-wiki_write(path, content, mode='replace')  # mode='replace'|'append'
-wiki_list(prefix='')                     # [{path, size_bytes, last_modified}]
+wiki_read(path)
+wiki_write(path, content, mode='replace')  # 'replace'|'append'
+wiki_list(prefix='')
 ```
 
 **RAG** — `index/` (LanceDB), embeddings via Ollama `nomic-embed-text` (768-dim).
@@ -276,87 +284,55 @@ rag_query(question, k=5, kind=None)
 ```
 
 **Write-to-all consolidation:** every `write_memory` call also `rag_index`es
-the content (kind=memory). Every `wiki_write` also `rag_index`es it
-(kind=wiki). If `category` starts with `wiki/`, `write_memory` ALSO writes
-the body to `wiki/<rest>.md`. So `category='wiki/patterns/loader_traps'`
-fans out into the daily memory file, the wiki page, and the RAG index in
-one call.
+the content. Every `wiki_write` also indexes itself. If `category` starts
+with `wiki/`, `write_memory` ALSO writes the body to `wiki/<rest>.md`.
 
-**Setup:**
+**Setup for RAG:**
 
 ```bash
 ollama pull nomic-embed-text  # one-time; ~270MB
 # Ollama must be running on http://localhost:11434
 ```
 
-If Ollama is unreachable or LanceDB import fails, RAG tools degrade
-gracefully — they return `"RAG backend unavailable: <reason>"` and the
-memory + wiki layers continue to work. RAG is lazy: nothing connects to
-Ollama or LanceDB until the first `rag_index` / `rag_query` call.
+If Ollama is unreachable or LanceDB import fails, RAG tools return
+`"RAG backend unavailable: <reason>"` and memory + wiki keep working.
 
-**Config additions** (all backward-compatible — existing `config.json` files
-load with sensible defaults):
+## Architecture note
 
-| Field | Default | Purpose |
-|---|---|---|
-| `rag_enabled` | `true` | Off-switch for the entire RAG backend |
-| `rag_embed_url` | `http://localhost:11434/api/embeddings` | Ollama embeddings endpoint |
-| `rag_embed_model` | `nomic-embed-text` | Embedding model id |
-| `rag_auto_index_memory` | `true` | Auto-index every `write_memory` call |
-| `rag_auto_index_wiki` | `true` | Auto-index every `wiki_write` call |
+Mnemara is a thin runtime around the Claude Agent SDK. The SDK runs the
+model and its native tools (Bash/Read/Edit/Write); Mnemara owns:
 
-### v0.1.2 — Textual chat panel
-
-`mnemara run` now defaults to a Textual TUI: header (instance/model/role),
-scrollable chat log with user/assistant/tool-use rendering, status bar
-(turns / tokens / model / evicted), and a single-line input box. Streaming
-tokens render live via new `on_token` / `on_tool_use` / `on_tool_result`
-callbacks on `AgentSession.turn_async()`. The bare prompt-toolkit REPL
-remains as the `--no-tui` / `MNEMARA_NO_TUI=1` fallback.
-
-### Architecture note (v0.4.0)
-
-Mnemara now uses the **Codex CLI** (`codex exec --json`) as its turn runner.
-The CLI is stateless per invocation, so Mnemara serialises the role doc and
-rolling-window transcript into each turn prompt. Bash/file operations are
-delegated to Codex's built-in tools. Mnemara still owns the persistent
-turn store, memory/wiki/RAG/graph backends, config, and eviction policy.
-
-## Where state lives
-
-```
-~/.mnemara/
-  majordomo/
-    config.json
-    turns.sqlite
-    permissions.json
-    memory/
-      2026-04-27.md
-    debug.log
-  theseus/
-    ...
-```
+- The persistent turn store (`turns.sqlite`).
+- The role doc, re-read every call as `system_prompt`.
+- The rolling-window transcript serialized into each turn's prompt
+  (the SDK is stateless per `query()`).
+- The permission policy (mediated via the SDK's `can_use_tool` callback).
+- The memory/wiki/RAG/graph backends and the `replay` consolidation pass.
 
 ## Troubleshooting
 
-- **Auth errors / "codex CLI not found"** — install Codex and run
-  `codex login`. Mnemara delegates auth entirely to the `codex` CLI.
+- **Auth errors** — confirm `ANTHROPIC_API_KEY` is set, or that `claude`
+  CLI is installed and `claude login` has been run as a fallback.
 - **Role doc not loading** — Mnemara warns to stderr and uses an empty system
   prompt; the REPL stays alive. Check `debug.log` for the path that failed.
 - **MCP server crashes** — check `debug.log` and the server's own stderr.
-  As a fallback, remove the entry from `mcp_servers` and rely on native tools.
+  As a fallback, remove the entry from `mcp_servers`.
 - **Window eviction surprises** — `mnemara show --instance <name>` prints the
   current window. The rolling window keeps the last `max_window_turns` rows;
   long tool-use turns count as one row but can carry many content blocks.
 - **Token errors** — if a long role doc + window overruns the model context,
   drop `max_window_turns` or split the role doc.
 
-## Running the smoke tests
+## Running the tests
 
 ```bash
 pip install -e ".[dev]"
 pytest -q tests/
 ```
 
-Tests do not call the network — they cover store, config, permissions, and the
-file tools.
+Tests do not call the network — they cover the store, config, permissions,
+and the file tools.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,8 +1,8 @@
 """MCP config helpers.
 
 Mnemara stores local stdio MCP server descriptors in config.json and exposes
-their names in runtime metadata. Native Codex MCP wire-through lives in the
-transport layer; this helper keeps the descriptor conversion small and stable.
+their names in runtime metadata. The Claude Agent SDK handles the actual MCP
+wire-through; this helper keeps the descriptor conversion small and stable.
 """
 from __future__ import annotations
 
