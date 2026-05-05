@@ -9,7 +9,10 @@ description = "Controlled rolling-context conversation runtime for Claude — tr
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-authors = [{name = "Michael Anderson"}]
+authors = [
+    {name = "Michael Anderson"},
+    {name = "Dave Moore"},
+]
 keywords = [
     "claude",
     "anthropic",
