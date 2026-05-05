@@ -44,6 +44,13 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+### Platform support
+
+Tested on Linux and macOS. Windows works through **WSL** — the
+Claude Agent SDK's tool calls use `bash`, which is not available on
+native Windows shells (cmd / PowerShell). If you're on Windows, run
+Mnemara inside a WSL distro and treat that as your "Linux" environment.
+
 ### Auth
 
 Mnemara runs on the Claude Agent SDK, which talks to the Anthropic API. The
