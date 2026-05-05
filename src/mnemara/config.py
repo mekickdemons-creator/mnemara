@@ -9,7 +9,6 @@ from typing import Any
 from . import paths
 
 DEFAULT_MODEL = "claude-opus-4-7"
-SENTINEL_DEFAULT_MODEL = "claude-haiku-4-5"
 AVAILABLE_MODELS = [
     "claude-opus-4-7",
     "claude-sonnet-4-6",
@@ -269,11 +268,6 @@ def load(instance: str) -> Config:
     with path.open() as f:
         raw = json.load(f)
     cfg = Config.from_dict(raw)
-    # Backward-compat: older configs may not carry an explicit model key.
-    # Keep existing behavior for all instances except sentinel, which should
-    # default to mini on stable per product policy.
-    if "model" not in raw and instance == "sentinel":
-        cfg.model = SENTINEL_DEFAULT_MODEL
     return cfg
 
 
@@ -294,8 +288,6 @@ def init_instance(instance: str, role_doc_path: str = "") -> Path:
     paths.rag_index_dir(instance).mkdir(exist_ok=True)
     cfg = Config.default()
     cfg.role_doc_path = role_doc_path
-    if instance == "sentinel":
-        cfg.model = SENTINEL_DEFAULT_MODEL
     save(instance, cfg)
     # touch permissions file
     paths.permissions_path(instance).write_text("{}\n")

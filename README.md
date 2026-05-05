@@ -52,9 +52,14 @@ installed and logged in — but the documented path is the API key.
 ```bash
 mnemara init --instance scratch
 # (prompts for role doc path; you can leave it blank and set it later)
-mnemara role --instance scratch --set ~/path/to/role.md
+mnemara role --instance scratch --set examples/roles/sentinel.md
 mnemara run --instance scratch
 ```
+
+The `--set` argument points at a **role doc** — a Markdown file that becomes
+the agent's system prompt. The repo ships with `examples/roles/sentinel.md`
+as a starting point; see [Role docs](#role-docs) below for what to put in
+your own.
 
 By default `mnemara run` opens the **Textual chat panel** (TUI). Pass
 `--no-tui` (or set `MNEMARA_NO_TUI=1`) for the bare prompt-toolkit REPL —
@@ -91,6 +96,69 @@ Keybindings:
 The TUI accepts `/models`, `/swap`, `/tokens`, `/quit`, and `/exit`.
 `/models` lists the available Claude model shortcuts; `/swap 1` or
 `/swap claude-sonnet-4-6` switches the active model.
+
+## Role docs
+
+The role doc is a plain Markdown file that becomes the agent's **system
+prompt**. Mnemara re-reads it on every API call and pins it at slot 0 of
+the messages — meaning it applies to every turn, not just the opening one,
+and you can edit the file mid-session and the next turn picks up the
+changes.
+
+This is the strongest steering signal you have over the agent. Use it.
+
+### What to put in a role doc
+
+A good role doc is a short prose document (a few hundred to a few thousand
+words) that answers, in order:
+
+1. **Who the agent is** — its identity and standing instructions in this
+   instance. ("You are a code reviewer for the Acme repo." "You are a
+   research assistant working on tax law.")
+2. **What it should and shouldn't do** — scope, hard constraints,
+   anti-patterns to avoid.
+3. **How it should behave when something goes wrong** — when to halt,
+   when to ask for help, when to escalate.
+
+You can include style notes ("be terse, no apologies"), tooling
+conventions ("always run the tests after writing code"), or domain
+glossaries. There is no required schema. The only mechanical requirement
+is that the file exists and is readable.
+
+### Solving the looping / drift problem
+
+The most common reason an interactive agent session burns through
+tokens with nothing to show for it is that the agent **gets stuck**:
+
+- It calls the same tool over and over waiting for output to change.
+- It drifts from the user's actual request into adjacent rabbit holes.
+- It reverses a correct conclusion the moment the user pushes back.
+
+These are role-doc-shaped problems. The role doc is where you encode the
+**rules that keep the agent from spiraling**. If those rules aren't in the
+system prompt, they aren't applied consistently — they reappear only when
+the user remembers to remind the agent.
+
+### Example: Sentinel
+
+[`examples/roles/sentinel.md`](examples/roles/sentinel.md) is a
+self-monitoring role doc. Drop it in as your instance's role and the
+agent will watch its own execution for the failure modes above
+(timeout / no progress, polling, semantic drift, sycophantic reversal)
+and **halt to ask the user** rather than spending another N turns on a
+runaway loop.
+
+```bash
+mnemara role --instance my-agent --set examples/roles/sentinel.md
+```
+
+Use it as-is for monitoring-flavored work, or treat it as a template:
+copy the file, edit the trigger conditions to match the failure modes
+you care about, and point your instance at the copy.
+
+You can also layer Sentinel-style self-monitoring rules on top of a
+task-specific role doc — there's nothing special about Sentinel; it's
+just text in a Markdown file that the agent reads on every turn.
 
 ## State layout
 
