@@ -3972,8 +3972,8 @@ def test_tui_slash_cmd_routes_through_when_busy(home):
 
 
 def test_tui_non_slash_blocked_when_busy(home):
-    """Non-slash text submitted while _busy shows the 'use /stop' hint
-    and does NOT enqueue a turn."""
+    """Non-slash text submitted while _busy is queued in _queued_input,
+    shows a 'queued' hint, and does NOT immediately fire a turn."""
     import asyncio as _asyncio
     from mnemara import config
     from mnemara import tui as tui_mod
@@ -4010,8 +4010,13 @@ def test_tui_non_slash_blocked_when_busy(home):
     app.query_one = lambda *a, **kw: _fake_inp  # type: ignore[method-assign]
 
     _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
-    assert turns_sent == [], "no turn should be queued while busy"
-    assert any("/stop" in m for m in chat_msgs), "hint message should mention /stop"
+    assert turns_sent == [], "no turn should fire immediately while busy"
+    assert app._queued_input == "hello", (
+        "input should be stored in _queued_input when busy"
+    )
+    assert any("queued" in m for m in chat_msgs), (
+        "hint message should say 'queued'"
+    )
     app.store.close()
 
 

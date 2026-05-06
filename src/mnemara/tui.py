@@ -270,6 +270,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         self._busy = False
         self._stream_buffer = ""
+        self._queued_input: str | None = None  # input received while busy; fires after turn
 
         # Spinner state.
         _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -421,9 +422,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             ev_str = f"{ev['rows_evicted']}r"
         except Exception:
             ev_str = "0r"
+        queue_str = " [yellow]⏸ queued[/yellow]" if self._queued_input is not None else ""
         return (
             f"turns: {nturns} | tokens: {tin}/{self.cfg.max_window_tokens} (out: {tout} cum) | "
-            f"model: {self.cfg.model} | evicted: {ev_str}"
+            f"model: {self.cfg.model} | evicted: {ev_str}{queue_str}"
         )
 
     def _status_text(self) -> str:
@@ -472,10 +474,19 @@ class MnemaraTUI(App):  # type: ignore[misc]
             return
 
         if self._busy:
-            self._chat().write(
-                "[dim]⏸ turn in progress — use [b]/stop[/b] to interrupt, "
-                "or wait for it to complete[/dim]"
-            )
+            if self._queued_input is None:
+                self._queued_input = text
+                self._chat().write(
+                    f"[dim]⏸ queued (1): [i]{text[:80]}{'…' if len(text) > 80 else ''}[/i] "
+                    f"— will fire when current turn completes[/dim]"
+                )
+            else:
+                # Already one item queued — replace it and tell the user.
+                self._queued_input = text
+                self._chat().write(
+                    f"[dim]⏸ queue replaced: [i]{text[:80]}{'…' if len(text) > 80 else ''}[/i][/dim]"
+                )
+            self._refresh_status()
             return
 
         self.run_worker(
@@ -529,6 +540,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._busy = False
             self._refresh_status()
             self._focus_input_after_refresh()
+            # Drain the input queue — fire the next message automatically.
+            if self._queued_input is not None:
+                queued = self._queued_input
+                self._queued_input = None
+                self._refresh_status()
+                self.run_worker(
+                    self._send_turn(queued),
+                    name="mnemara_turn",
+                    group="turn",
+                    exclusive=True,
+                )
 
     # ---------------------------------------------------------------- slash commands
 
