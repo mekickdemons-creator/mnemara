@@ -587,9 +587,20 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self._slash_stop(chat)
             return
 
+        if cmd == "/clear":
+            self._slash_clear(chat)
+            return
+
+        if cmd == "/evict":
+            self._slash_evict(arg, chat)
+            return
+
+        if cmd in ("/help", "/?"):
+            self._slash_help(chat)
+            return
+
         chat.write(
-            f"[dim]unknown command: {cmd} — /quit, /exit, /models, "
-            "/swap MODEL, /tokens N, /export, or /stop[/dim]"
+            f"[dim]unknown command: {cmd} — try /help for a full list[/dim]"
         )
 
     def _slash_models(self, chat: "RichLog") -> None:
@@ -677,6 +688,70 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write("[dim]⏹ stop signal sent — finishing current operation…[/dim]")
         else:
             chat.write("[dim]nothing in flight[/dim]")
+
+    def _slash_clear(self, chat: "RichLog") -> None:
+        """/clear — erase all visible chat history (does not touch stored rows)."""
+        chat.clear()
+        chat.write("[dim]chat display cleared (conversation history is preserved in storage)[/dim]")
+        self._refresh_status()
+
+    def _slash_evict(self, arg: str, chat: "RichLog") -> None:
+        """/evict [tools|thinking|N] — free context budget.
+
+        /evict tools    — strip tool_use blocks from all stored rows
+        /evict thinking — strip thinking blocks from all stored rows
+        /evict N        — drop the N oldest rows from the rolling window
+        /evict          — show eviction stats
+        """
+        arg = arg.strip().lower()
+        ev = self.store.get_eviction_stats()
+        if not arg:
+            chat.write(
+                f"[bold]eviction stats[/bold]  "
+                f"rows: {ev['rows_evicted']} | blocks: {ev.get('blocks_evicted', 0)} | "
+                f"bytes freed: {ev.get('bytes_freed', 0):,}"
+            )
+            return
+
+        try:
+            if arg == "tools":
+                result = self.store.evict_tool_use_blocks(all_rows=True)
+                freed = result.get("blocks_evicted", result.get("rows_modified", 0))
+                chat.write(f"[green]/evict tools:[/green] {freed} tool_use block(s) stripped")
+            elif arg == "thinking":
+                result = self.store.evict_thinking_blocks(all_rows=True)
+                freed = result.get("blocks_evicted", result.get("rows_modified", 0))
+                chat.write(f"[green]/evict thinking:[/green] {freed} thinking block(s) stripped")
+            elif arg.isdigit():
+                n = int(arg)
+                dropped = self.store.evict_last(n)
+                chat.write(f"[green]/evict {n}:[/green] {dropped} row(s) evicted")
+            else:
+                chat.write("[dim]/evict [tools|thinking|N] — see /help[/dim]")
+                return
+        except Exception as exc:
+            chat.write(f"[red]evict error: {exc}[/red]")
+        self._refresh_status()
+
+    def _slash_help(self, chat: "RichLog") -> None:
+        """/help — list available slash commands."""
+        lines = [
+            "[bold]slash commands[/bold]",
+            "  /help, /?               — show this list",
+            "  /clear                  — clear display (keeps history)",
+            "  /models                 — list available models",
+            "  /swap MODEL             — switch to MODEL (in-session only)",
+            "  /tokens N [--temp]      — set max context window",
+            "  /evict                  — show eviction stats",
+            "  /evict tools            — strip tool_use blocks",
+            "  /evict thinking         — strip thinking blocks",
+            "  /evict N                — drop N oldest rows",
+            "  /export [N] [path]      — export rolling window to markdown",
+            "  /stop                   — cancel active streaming turn",
+            "  /quit, /exit            — exit",
+        ]
+        for line in lines:
+            chat.write(line)
 
     async def _slash_export(self, arg: str, chat: "RichLog") -> None:
         """/export [N] [path] — write rolling-window text to markdown."""
