@@ -588,9 +588,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._slash_evict(arg, chat)
             return
 
+        if cmd == "/clear":
+            self._slash_clear(chat)
+            return
+
+        if cmd == "/help":
+            self._slash_help(chat)
+            return
+
         chat.write(
-            f"[dim]unknown command: {cmd} — /quit, /exit, /models, "
-            "/swap MODEL, /tokens N, /export, /stop, or /evict [tools|N][/dim]"
+            f"[dim]unknown command: {cmd} — type /help for the full list[/dim]"
         )
 
     def _slash_models(self, chat: "RichLog") -> None:
@@ -717,6 +724,32 @@ class MnemaraTUI(App):  # type: ignore[misc]
             return
 
         chat.write("[red]usage: /evict  |  /evict tools  |  /evict N[/red]")
+
+    def _slash_clear(self, chat: "RichLog") -> None:
+        """/clear — wipe the entire rolling window."""
+        n = len(self.store.window())
+        if n == 0:
+            chat.write("[dim]rolling window is already empty[/dim]")
+            return
+        removed = self.store.evict_last(n)
+        chat.write(f"[green]✓ cleared[/green] {removed} row(s) — rolling window wiped")
+
+    def _slash_help(self, chat: "RichLog") -> None:
+        """/help — print all available slash commands."""
+        chat.write(
+            "[bold]slash commands[/bold]\n"
+            "  /quit, /exit          — close the panel\n"
+            "  /stop                 — interrupt the current streaming turn\n"
+            "  /models               — list available Gemma models\n"
+            "  /swap MODEL           — switch model by index, alias, or name\n"
+            "  /tokens N             — set rolling-window token cap\n"
+            "  /export [N] [path]    — export chat turns to a markdown file\n"
+            "  /evict                — show eviction stats\n"
+            "  /evict tools          — strip tool_use blocks from all rows\n"
+            "  /evict N              — drop oldest N rows from rolling window\n"
+            "  /clear                — wipe the entire rolling window\n"
+            "  /help                 — show this message"
+        )
 
     async def _slash_export(self, arg: str, chat: "RichLog") -> None:
         """/export [N] [path] — write rolling-window text to markdown."""

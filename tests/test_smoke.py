@@ -1460,6 +1460,70 @@ def test_slash_evict_and_mark_command_dispatch(home):
     app.store.close()
 
 
+def test_slash_clear_wipes_rolling_window(home):
+    """/clear drops all rows; second /clear on empty window is a no-op."""
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    config_mod.init_instance("slash_clear_t")
+    app = tui_mod.MnemaraTUI("slash_clear_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for i in range(4):
+                app.store.append_turn("user", [{"type": "text", "text": f"row{i}"}])
+            assert len(app.store.window()) == 4
+
+            # /clear wipes all rows.
+            await app._handle_slash("/clear")
+            await pilot.pause()
+            assert len(app.store.window()) == 0
+
+            # Second /clear on empty window — must not raise.
+            await app._handle_slash("/clear")
+            await pilot.pause()
+            assert len(app.store.window()) == 0
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_slash_help_lists_commands(home):
+    """/help writes a message that mentions all documented commands."""
+    import asyncio as _asyncio
+    from mnemara import config as config_mod
+    from mnemara import tui as tui_mod
+
+    config_mod.init_instance("slash_help_t")
+    app = tui_mod.MnemaraTUI("slash_help_t")
+
+    captured: list[str] = []
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            chat = app._chat()
+            # Monkey-patch write so we can inspect without driving the TUI.
+            original_write = chat.write
+            chat.write = lambda msg, **kw: captured.append(str(msg))  # type: ignore[method-assign]
+            try:
+                await app._handle_slash("/help")
+                await pilot.pause()
+            finally:
+                chat.write = original_write  # type: ignore[method-assign]
+
+    _asyncio.run(_run())
+    app.store.close()
+
+    assert captured, "/help produced no output"
+    full = "\n".join(captured)
+    for keyword in ("/quit", "/stop", "/models", "/swap", "/tokens",
+                    "/export", "/evict", "/clear", "/help"):
+        assert keyword in full, f"/help output missing mention of {keyword!r}"
+
+
 def test_agent_eviction_tools_persist_to_store(home):
     """Agent-side evict_last / evict_ids / mark_segment / evict_since tools.
 
