@@ -1,15 +1,27 @@
 """Filesystem layout for an instance."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+_INSTANCE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 def root() -> Path:
     return Path.home() / ".mnemara"
 
 
+def _validate_instance_name(name: str) -> str:
+    if not isinstance(name, str) or not _INSTANCE_NAME_RE.match(name):
+        raise ValueError(
+            f"invalid instance name: {name!r} "
+            "(allowed: alnum, '_', '-', '.'; must start with alnum; max 64 chars)"
+        )
+    return name
+
+
 def instance_dir(name: str) -> Path:
-    return root() / name
+    return root() / _validate_instance_name(name)
 
 
 def config_path(name: str) -> Path:
