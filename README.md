@@ -66,6 +66,10 @@ installed and logged in — but the documented path is the API key.
 
 ## Quick start
 
+> Before your first run: skim the [Permissions model](#permissions-model)
+> section. Mnemara gives an LLM Bash/Read/Write/Edit access to the
+> machine you run it on. It is not a sandbox.
+
 ```bash
 mnemara init --instance scratch
 # (prompts for role doc path; you can leave it blank and set it later)
@@ -291,13 +295,38 @@ mnemara replay --instance <name> [--days N] [--threshold N] [--apply]  # consoli
 
 ## Permissions model
 
+> **Read this section before you run Mnemara.** The agent has Bash, Read,
+> Write, and Edit tools. With permissive settings it can run any command
+> on your machine — including destructive ones (`rm -rf`, `git push
+> --force`, network calls, file overwrites). Mnemara is **not a
+> sandbox**. It runs as your user, with your filesystem and network
+> permissions. Treat it like a shell session you've handed to an LLM.
+
 Each tool has a `mode`:
 
-- `allow` — never prompts.
+- `allow` — never prompts. **Use only for tools you've decided are safe to invoke without review.**
 - `ask` — prompts on first use; user picks `yes`, `no`, `always`, or `session`.
 - `deny` — always blocked.
 
-Defaults: Bash=ask, Read=allow, Write=ask, Edit=ask, WriteMemory=allow.
+Defaults (deliberately conservative): Bash=ask, Read=allow, Write=ask, Edit=ask, WriteMemory=allow.
+
+**Things to know:**
+
+- Setting Bash to `allow` means the agent can run **any shell command**
+  without prompting. Don't do this on a machine with credentials, prod
+  access, or unbacked-up data unless you know what you're doing.
+- `allow_always` (the `a` answer at a prompt) writes a regex to
+  `permissions.json`. Review that file — a too-broad regex is a
+  permanent foot-gun.
+- `file_tool_home_only` (default `True`) restricts Read/Write/Edit to
+  paths under `$HOME`. Disabling it lets the agent touch anywhere your
+  user can.
+- The agent can call MCP tools wired through `mcp_servers` in
+  `config.json`. Those tools run with your privileges — vet them like
+  you'd vet any third-party binary.
+- If you don't trust a role doc to behave, run it in a throwaway
+  instance (`--instance scratch`) on a non-sensitive machine, or under
+  a restricted user account / container.
 
 When prompted at the REPL:
 - `y` allow this one invocation
