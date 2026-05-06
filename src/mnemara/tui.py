@@ -206,26 +206,42 @@ def _render_export_rows(rows: list[dict[str, Any]], instance: str) -> str:
 class _UserInput(Input):
     """Input with paste behaviour tuned for the Mnemara panel.
 
-    Textual's stock Input._on_paste inserts char-by-char after taking only
-    the first line.  We collapse multi-line pastes to one line (join with
-    spaces), truncate at _USERINPUT_PASTE_CAP, and do a single atomic value
-    assignment so there's one render instead of one per character.
+    Textual's stock Input._on_paste takes only the first line of a paste.
+    We collapse multi-line pastes to a single space-joined line, truncate at
+    _USERINPUT_PASTE_CAP, and delegate to Textual's own replace/insert_text_at_cursor
+    so there is exactly one value-reactive fire and one cursor-reactive fire.
+    Selections are honoured: if text is selected it is replaced by the paste.
+
+    NOTE: newlines must never reach Input.value — they confuse Textual's strip
+    renderer (Text with no_wrap=True still emits newline segments that can
+    corrupt the screen compositor), producing the "input migrates up" artefact.
     """
 
-    def _on_paste(self, event: "_txt_events.Paste") -> None:  # type: ignore[name-defined]
-        event.prevent_default()
-        event.stop()
-        text = event.text or ""
-        if not text:
-            return
-        lines = text.splitlines()
+    @staticmethod
+    def _collapse_paste(raw: str) -> str:
+        """Collapse multi-line text to a single line, capped at _USERINPUT_PASTE_CAP."""
+        lines = raw.splitlines()
         collapsed = " ".join(part for part in (s.strip() for s in lines) if part)
         if len(collapsed) > _USERINPUT_PASTE_CAP:
             collapsed = collapsed[:_USERINPUT_PASTE_CAP]
-        cur = self.cursor_position
-        old = self.value
-        self.value = old[:cur] + collapsed + old[cur:]
-        self.cursor_position = cur + len(collapsed)
+        return collapsed
+
+    def _on_paste(self, event: "_txt_events.Paste") -> None:  # type: ignore[name-defined]
+        # prevent_default stops Textual from descending further into the MRO
+        # (Input._on_paste would only take the first line without collapsing).
+        event.prevent_default()
+        event.stop()
+        raw = event.text or ""
+        if not raw:
+            return
+        collapsed = self._collapse_paste(raw)
+        if not collapsed:
+            return
+        selection = self.selection
+        if selection.is_empty:
+            self.insert_text_at_cursor(collapsed)
+        else:
+            self.replace(collapsed, *selection)
 
 
 # ---------------------------------------------------------------------------
@@ -804,14 +820,28 @@ class MnemaraTUI(App):  # type: ignore[misc]
     # ---------------------------------------------------------------- actions
 
     def action_paste(self) -> None:
+        """Ctrl+V paste: read clipboard via pyperclip, collapse multi-line,
+        and delegate to the same Textual-native insert path as _on_paste."""
         try:
             import pyperclip
-            text = pyperclip.paste()
-            inp = self.query_one("#userinput", Input)
-            cur = inp.cursor_position
-            old = inp.value
-            inp.value = old[:cur] + text + old[cur:]
-            inp.cursor_position = cur + len(text)
+            raw = pyperclip.paste()
+        except Exception:
+            return
+        if not raw:
+            return
+        try:
+            inp = self.query_one("#userinput", _UserInput)
+        except Exception:
+            return
+        collapsed = inp._collapse_paste(raw)
+        if not collapsed:
+            return
+        try:
+            selection = inp.selection
+            if selection.is_empty:
+                inp.insert_text_at_cursor(collapsed)
+            else:
+                inp.replace(collapsed, *selection)
         except Exception:
             pass
 
