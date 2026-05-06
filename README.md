@@ -173,6 +173,18 @@ runaway loop.
 mnemara role --instance my-agent --set examples/roles/sentinel.md
 ```
 
+Or download it directly from GitHub without cloning the repo:
+
+```bash
+mnemara role --instance my-agent --set-from-url \
+  https://raw.githubusercontent.com/mekickdemons-creator/mnemara/main/examples/roles/sentinel.md
+```
+
+`--set-from-url` fetches the doc once (https only, 1 MB cap, UTF-8) and
+saves it into `~/.mnemara/<instance>/role.md`. Mnemara never re-fetches
+the URL at runtime — the saved local copy is what gets re-read each
+turn. Edit the local copy to customize.
+
 Use it as-is for monitoring-flavored work, or treat it as a template:
 copy the file, edit the trigger conditions to match the failure modes
 you care about, and point your instance at the copy.
@@ -274,7 +286,8 @@ mnemara list                              # list instances
 mnemara show --instance <name> [-n N]     # print the rolling window (read-only)
 mnemara clear --instance <name>           # wipe the rolling window
 mnemara delete --instance <name> --force  # nuke ~/.mnemara/<name>/
-mnemara role --instance <name> --set PATH # set role_doc_path
+mnemara role --instance <name> --set PATH                # set role_doc_path (local file)
+mnemara role --instance <name> --set-from-url URL        # download once into instance dir
 mnemara note --instance <name> TEXT...    # append a memory note from the shell
 mnemara replay --instance <name> [--days N] [--threshold N] [--apply]  # consolidation pass
 ```

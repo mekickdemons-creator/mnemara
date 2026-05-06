@@ -156,13 +156,57 @@ def delete_cmd(instance: str, force: bool) -> None:
 
 @main.command("role")
 @click.option("--instance", required=True)
-@click.option("--set", "role_path", required=True)
-def role_cmd(instance: str, role_path: str) -> None:
-    """Set role_doc_path for an instance without entering the REPL."""
+@click.option("--set", "role_path", default=None, help="Path to a local role doc.")
+@click.option(
+    "--set-from-url",
+    "role_url",
+    default=None,
+    help="Download a role doc from an https:// URL into the instance dir.",
+)
+def role_cmd(instance: str, role_path: str | None, role_url: str | None) -> None:
+    """Set role_doc_path for an instance without entering the REPL.
+
+    Pass either --set <path> for a local file, or --set-from-url <https://...>
+    to download once into the instance dir. Downloaded role docs are stored
+    locally; Mnemara never re-fetches the URL at runtime.
+    """
+    if not role_path and not role_url:
+        raise click.UsageError("provide either --set or --set-from-url")
+    if role_path and role_url:
+        raise click.UsageError("--set and --set-from-url are mutually exclusive")
+
     cfg = config_mod.load(instance)
-    cfg.role_doc_path = str(Path(role_path).expanduser())
+
+    if role_url:
+        if not role_url.startswith("https://"):
+            raise click.UsageError("--set-from-url requires an https:// URL")
+        import urllib.request
+        dest = paths.instance_dir(instance) / "role.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with urllib.request.urlopen(role_url, timeout=30) as resp:
+                data = resp.read()
+        except Exception as exc:
+            raise click.ClickException(f"failed to download role doc: {exc}")
+        if len(data) > 1_000_000:
+            raise click.ClickException(
+                f"role doc too large ({len(data)} bytes; cap is 1 MB)"
+            )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise click.ClickException("role doc is not valid UTF-8")
+        dest.write_text(text)
+        cfg.role_doc_path = str(dest)
+        console.print(
+            f"[green]downloaded[/green] {role_url}\n"
+            f"[green]role doc set to[/green] {cfg.role_doc_path}"
+        )
+    else:
+        cfg.role_doc_path = str(Path(role_path).expanduser())
+        console.print(f"[green]role doc set to[/green] {cfg.role_doc_path}")
+
     config_mod.save(instance, cfg)
-    console.print(f"[green]role doc set to[/green] {cfg.role_doc_path}")
 
 
 @main.command("replay")
