@@ -420,6 +420,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
         try:
             ev = self.store.get_eviction_stats()
             ev_str = f"{ev['rows_evicted']}r"
+            blocks = ev.get("blocks_evicted", 0)
+            if blocks > 0:
+                ev_str += f" {blocks}b"
         except Exception:
             ev_str = "0r"
         queue_str = " [yellow]⏸ queued[/yellow]" if self._queued_input is not None else ""
