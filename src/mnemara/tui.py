@@ -67,7 +67,7 @@ atexit.register(_tty_mouse_reset)
 
 from . import config as config_mod
 from . import paths
-from .agent import AgentSession
+from .gemma_agent import GemmaSession as AgentSession
 from .config import Config
 from .logging_util import log, set_log_path
 from .permissions import PermissionStore

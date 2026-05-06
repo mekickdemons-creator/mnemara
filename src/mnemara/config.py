@@ -8,20 +8,19 @@ from typing import Any
 
 from . import paths
 
-DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "gemma4:26b"
 AVAILABLE_MODELS = [
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
+    "gemma4:26b",
+    "gemma4:12b",
+    "gemma3:27b",
+    "gemma3:12b",
 ]
 MODEL_ALIASES = {
-    "latest": "claude-opus-4-7",
-    "frontier": "claude-opus-4-7",
+    "latest": "gemma4:26b",
+    "frontier": "gemma4:26b",
     "default": DEFAULT_MODEL,
-    "opus": "claude-opus-4-7",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5",
-    "mini": "claude-haiku-4-5",
+    "large": "gemma4:26b",
+    "small": "gemma4:12b",
 }
 DEFAULT_MAX_TURNS = 100
 DEFAULT_MAX_TOKENS = 500_000  # matches observed productive ceiling — natural compaction sets in around 600K, 500K leaves 100K safety buffer

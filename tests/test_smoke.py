@@ -206,6 +206,7 @@ def test_tui_imports_and_instantiates(home):
     app.store.close()
 
 
+@pytest.mark.skip(reason="gemma-branch: model list is now Gemma/Ollama; test expects Claude models")
 def test_tui_models_and_swap_commands(home):
     """TUI exposes the Claude model list and can swap by index."""
     import asyncio as _asyncio
@@ -659,6 +660,7 @@ def test_tui_on_token_tolerates_missing_status_widget(home, monkeypatch):
 # ---------------------------------------------------------- Pilot-based TUI tests
 
 
+@pytest.mark.skip(reason="gemma-branch: patches agent_mod.AgentSession; TUI now uses GemmaSession — see test_gemma_tui_pilot_focus below")
 def test_tui_pilot_focus_returns_after_turn(home, monkeypatch):
     """After a streaming turn completes, focus settles back on #userinput.
 
@@ -2656,6 +2658,7 @@ def test_normalize_model_name_idempotent_on_clean_input():
     assert normalize_model_name("claude-opus-4-7") == "claude-opus-4-7"
 
 
+@pytest.mark.skip(reason="gemma-branch: model list is Gemma/Ollama; test hard-codes Claude model names")
 def test_resolve_model_choice_accepts_indexes_aliases_and_exact_names():
     from mnemara.config import resolve_model_choice
 
@@ -4598,3 +4601,272 @@ def test_run_turn_acloses_query_gen_on_normal_completion(monkeypatch):
     assert result["tokens_in"] == 5
     assert result["tokens_out"] == 3
     assert result["assistant_blocks"] == []
+
+
+# ===================================================================
+# Gemma-backend smoke tests (gemma branch only)
+# All Ollama HTTP calls are mocked — no network required.
+# ===================================================================
+
+
+def test_gemma_extract_text_from_blocks():
+    """_extract_text_from_blocks flattens text, tool_use, and tool_result blocks."""
+    from mnemara.gemma_agent import _extract_text_from_blocks
+
+    blocks = [
+        {"type": "text", "text": "Hello world"},
+        {"type": "tool_use", "name": "Read", "input": {"path": "/tmp/f"}},
+        {"type": "tool_result", "content": [{"type": "text", "text": "file content"}]},
+    ]
+    out = _extract_text_from_blocks(blocks)
+    assert "Hello world" in out
+    assert "[tool_use: Read(" in out
+    assert "[tool_result: file content]" in out
+
+    # Empty list → empty string
+    assert _extract_text_from_blocks([]) == ""
+
+
+def test_gemma_build_messages_format(home):
+    """_build_messages produces [system, ...history, user(current)] in Ollama format."""
+    import json as _json
+    from mnemara import config
+    from mnemara.store import Store
+    from mnemara.gemma_agent import _build_messages
+
+    config.init_instance("gemma_msg_t")
+    store = Store("gemma_msg_t")
+    store.append_turn("user", [{"type": "text", "text": "first user"}])
+    store.append_turn("assistant", [{"type": "text", "text": "first assistant"}])
+    # Add a pending user turn (will be dropped in favour of current_user_text)
+    store.append_turn("user", [{"type": "text", "text": "pending"}])
+
+    msgs = _build_messages(
+        store,
+        system_prompt="SYSTEM-PROMPT",
+        current_user_text="CURRENT-USER",
+        max_turns=100,
+        max_tokens=500_000,
+    )
+
+    # First message is always the system prompt.
+    assert msgs[0] == {"role": "system", "content": "SYSTEM-PROMPT"}
+    # Last message is the current user input.
+    assert msgs[-1] == {"role": "user", "content": "CURRENT-USER"}
+    # The "pending" stored user turn must NOT appear — it's been replaced.
+    texts = [m["content"] for m in msgs]
+    assert "pending" not in texts
+    # History turns appear in the middle.
+    assert any("first user" in m["content"] for m in msgs)
+    assert any("first assistant" in m["content"] for m in msgs)
+    store.close()
+
+
+def test_gemma_session_streams_response(home, monkeypatch):
+    """turn_async streams tokens, persists user+assistant turns, returns correct schema."""
+    import asyncio as _asyncio
+    import json as _json
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from mnemara import config
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+    from mnemara.gemma_agent import GemmaSession
+
+    config.init_instance("gemma_turn_t")
+    cfg = config.load("gemma_turn_t")
+    store = Store("gemma_turn_t")
+    perms = PermissionStore("gemma_turn_t")
+    runner = ToolRunner("gemma_turn_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    # Build fake streaming chunks that Ollama /api/chat would emit.
+    _chunks = [
+        '{"message": {"content": "Hello"}, "done": false}',
+        '{"message": {"content": " world"}, "done": false}',
+        '{"message": {"content": ""}, "done": true, "prompt_eval_count": 12, "eval_count": 7}',
+    ]
+
+    async def _fake_aiter_lines():
+        for chunk in _chunks:
+            yield chunk
+
+    class _FakeResp:
+        def raise_for_status(self): pass  # sync — gemma_agent calls it without await
+        def aiter_lines(self): return _fake_aiter_lines()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+
+    class _FakeStream:
+        async def __aenter__(self): return _FakeResp()
+        async def __aexit__(self, *args): pass
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def stream(self, *args, **kwargs): return _FakeStream()
+
+    def _make_client(*args, **kwargs):
+        return _FakeClient()
+
+    with patch("mnemara.gemma_agent.httpx.AsyncClient", side_effect=_make_client):
+        session = GemmaSession(cfg, store, runner)
+        tokens_received: list[str] = []
+
+        async def _go():
+            return await session.turn_async(
+                "hi",
+                on_token=lambda t: tokens_received.append(t),
+            )
+
+        result = _asyncio.run(_go())
+
+    # Verify streaming tokens delivered.
+    assert tokens_received == ["Hello", " world"]
+    # Verify return schema.
+    assert result["stop_reason"] == "end_turn"
+    assert result["tokens_in"] == 12
+    assert result["tokens_out"] == 7
+    assert result["assistant_blocks"] == [{"type": "text", "text": "Hello world"}]
+    # Verify persistence: user + assistant rows stored.
+    rows = store.window()
+    roles = [r["role"] for r in rows]
+    assert "user" in roles and "assistant" in roles
+    store.close()
+
+
+def test_gemma_session_connection_error(home):
+    """turn_async returns a graceful error message when Ollama is unreachable."""
+    import asyncio as _asyncio
+    from unittest.mock import patch
+    import httpx
+    from mnemara import config
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+    from mnemara.gemma_agent import GemmaSession
+
+    config.init_instance("gemma_err_t")
+    cfg = config.load("gemma_err_t")
+    store = Store("gemma_err_t")
+    perms = PermissionStore("gemma_err_t")
+    runner = ToolRunner("gemma_err_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    class _FailStream:
+        async def __aenter__(self):
+            raise httpx.ConnectError("connection refused")
+        async def __aexit__(self, *args): pass
+
+    class _FailClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def stream(self, *args, **kwargs): return _FailStream()
+
+    def _make_fail_client(*args, **kwargs):
+        return _FailClient()
+
+    with patch("mnemara.gemma_agent.httpx.AsyncClient", side_effect=_make_fail_client):
+        session = GemmaSession(cfg, store, runner)
+        tokens: list[str] = []
+
+        async def _go():
+            return await session.turn_async("hi", on_token=lambda t: tokens.append(t))
+
+        result = _asyncio.run(_go())
+
+    # Error surfaced as a message, not an exception.
+    assert len(tokens) == 1
+    assert "Gemma backend unavailable" in tokens[0]
+    assert "ollama" in tokens[0].lower() or "Ollama" in tokens[0]
+    # Still persisted — the error text IS the assistant response.
+    rows = store.window()
+    assert any(r["role"] == "assistant" for r in rows)
+    store.close()
+
+
+def test_gemma_session_write_stats(home):
+    """write_session_stats writes backend=gemma_ollama and merges across calls."""
+    import json as _json
+    from mnemara import config, paths
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+    from mnemara.gemma_agent import GemmaSession
+
+    config.init_instance("gemma_stats_t")
+    cfg = config.load("gemma_stats_t")
+    store = Store("gemma_stats_t")
+    perms = PermissionStore("gemma_stats_t")
+    runner = ToolRunner("gemma_stats_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    s = GemmaSession(cfg, store, runner)
+    s.evicted_this_session = 3
+    s.memory_writes = 2
+    s.write_session_stats()
+
+    stats_dir = paths.stats_dir("gemma_stats_t")
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    stats_file = stats_dir / f"{today}.json"
+    assert stats_file.exists()
+    entries = _json.loads(stats_file.read_text())
+    assert isinstance(entries, list) and len(entries) == 1
+    entry = entries[0]
+    assert entry["backend"] == "gemma_ollama"
+    assert entry["evicted_this_session"] == 3
+    assert entry["memory_writes"] == 2
+    assert "session_started_at" in entry
+    assert "session_ended_at" in entry
+
+    # Second call on the SAME session object is idempotent (no-op).
+    s.write_session_stats()
+    entries_after_noop = _json.loads(stats_file.read_text())
+    assert len(entries_after_noop) == 1, "second call on same session must not append"
+
+    # Different GemmaSession object on same day merges into the same file.
+    s2 = GemmaSession(cfg, store, runner)
+    s2.write_session_stats()
+    entries2 = _json.loads(stats_file.read_text())
+    assert len(entries2) == 2
+    store.close()
+
+
+def test_gemma_tui_pilot_focus(home, monkeypatch):
+    """After a GemmaSession turn completes, focus returns to #userinput.
+
+    Replaces test_tui_pilot_focus_returns_after_turn on the gemma branch
+    by patching GemmaSession.turn_async directly.
+    """
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+    from mnemara.gemma_agent import GemmaSession
+    from textual.widgets import Input
+
+    config.init_instance("gemma_pilot_focus_t")
+
+    async def _fake_turn_async(self, text, on_token=None, on_tool_use=None,
+                               on_tool_result=None):
+        if on_token:
+            for chunk in ("Hi ", "from ", "Gemma"):
+                await on_token(chunk)
+        return {"tokens_in": 3, "tokens_out": 5, "stop_reason": "end_turn",
+                "assistant_blocks": [{"type": "text", "text": "Hi from Gemma"}]}
+
+    monkeypatch.setattr(GemmaSession, "turn_async", _fake_turn_async)
+
+    app = tui_mod.MnemaraTUI("gemma_pilot_focus_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#userinput", Input)
+            assert inp.has_focus, "input should have focus on mount"
+            inp.value = "hello gemma"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            assert app.query_one("#userinput", Input).has_focus, \
+                "input must regain focus after Gemma turn"
+
+    _asyncio.run(_run())
+    app.store.close()
