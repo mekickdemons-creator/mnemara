@@ -264,8 +264,15 @@ def load(instance: str) -> Config:
     path = paths.config_path(instance)
     if not path.exists():
         raise FileNotFoundError(f"No config at {path} — run `mnemara init --instance {instance}`")
-    with path.open() as f:
-        return Config.from_dict(json.load(f))
+    try:
+        with path.open() as f:
+            return Config.from_dict(json.load(f))
+    except (json.JSONDecodeError, ValueError):
+        # config.json exists but is empty or corrupt (e.g. from a failed init).
+        # Re-write a fresh default config and return it.
+        cfg = Config.default()
+        save(instance, cfg)
+        return cfg
 
 
 def save(instance: str, cfg: Config) -> None:
