@@ -371,6 +371,21 @@ Defaults (deliberately conservative): Bash=ask, Read=allow, Write=ask, Edit=ask,
   instance (`--instance scratch`) on a non-sensitive machine, or under
   a restricted user account / container.
 
+**Runtime sentinel** (`runtime_sentinel: true` in `config.json`) adds a
+second, belt-and-suspenders layer on top of the role-doc sentinel. When
+enabled, Mnemara wires the Claude Agent SDK's `include_hook_events` flag (SDK
+>= 0.1.74 required) so that tool lifecycle events flow into each turn's
+processing loop. A per-session `RuntimeSentinel` watches the last five
+`PreToolUse` events: if the same `(tool_name, args)` pair appears three or
+more times in that window it injects a synthetic `[SENTINEL HALT]` notice
+into the assistant turn and stops consuming the stream, preventing the model
+from burning further tool calls on an obvious polling loop. This is
+complementary to the role-doc sentinel (`sentinel.md`): the role-doc rule
+relies on the model noticing its own pattern; the runtime rule fires at the
+protocol level regardless of what the model intended. Both can run
+simultaneously — enable `runtime_sentinel` when you want a hard floor under
+the model's self-monitoring.
+
 When prompted at the REPL:
 - `y` allow this one invocation
 - `n` deny this one invocation

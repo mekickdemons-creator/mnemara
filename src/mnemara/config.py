@@ -166,6 +166,15 @@ class Config:
     # Default 0 = feature off (backward-compat). A reasonable starting
     # value is 30 (30% slack on a 100-turn cap). Set in config.json.
     row_cap_slack_when_token_headroom: int = 0
+    # v0.3.4 — runtime-enforced sentinel via SDK hook events
+    # When True, AgentSession wires include_hook_events=True into
+    # ClaudeAgentOptions and feeds PreToolUse hook events to a per-session
+    # RuntimeSentinel.  If the sentinel detects a polling pattern (same tool,
+    # same args, 3+ times in the last 5 PreToolUse events) it injects a
+    # synthetic system notice and stops further tool dispatch for that turn.
+    # Belt-and-suspenders with the role-doc sentinel (sentinel.md); both can
+    # run simultaneously. Off by default; opt-in per instance.
+    runtime_sentinel: bool = False
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7
@@ -246,6 +255,7 @@ class Config:
             row_cap_slack_when_token_headroom=int(
                 d.get("row_cap_slack_when_token_headroom", 0)
             ),
+            runtime_sentinel=bool(d.get("runtime_sentinel", False)),
             graph_enabled=bool(d.get("graph_enabled", True)),
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),

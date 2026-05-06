@@ -45,6 +45,7 @@ from .logging_util import log, warn
 from . import store as store_mod
 from .store import Store
 from .tools import ToolRunner
+from .runtime_sentinel import RuntimeSentinel
 
 try:
     from claude_agent_sdk import (
@@ -63,9 +64,16 @@ try:
         query,
         tool,
     )
+    # HookEventMessage was added in SDK 0.1.74; import defensively so the
+    # module loads on older SDKs too (the sentinel feature just won't fire).
+    try:
+        from claude_agent_sdk import HookEventMessage
+    except ImportError:  # pragma: no cover
+        HookEventMessage = None  # type: ignore[assignment,misc]
     _SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _SDK_AVAILABLE = False
+    HookEventMessage = None  # type: ignore[assignment]
 
 console = Console()
 
@@ -113,6 +121,11 @@ class AgentSession:
         # `client` retained in the signature for backward compatibility with
         # repl.py callers; the SDK manages its own transport, so we ignore it.
         self.client = client
+        # Per-session RuntimeSentinel (v0.3.4) — created only when
+        # cfg.runtime_sentinel is True; None otherwise.
+        self._sentinel: Optional[RuntimeSentinel] = (
+            RuntimeSentinel() if getattr(cfg, "runtime_sentinel", False) else None
+        )
         # Session-scoped counters (self-instrumentation, v0.2.0).
         self.session_started_at = datetime.now(timezone.utc).isoformat()
         self.session_ended_at: Optional[str] = None
@@ -186,6 +199,7 @@ class AgentSession:
             on_token=on_token,
             on_tool_use=on_tool_use,
             on_tool_result=on_tool_result,
+            sentinel=self._sentinel,
         )
 
         assistant_blocks = result["assistant_blocks"]
@@ -1470,6 +1484,16 @@ class AgentSession:
                 interrupt=False,
             )
 
+        # Wire include_hook_events when the runtime sentinel is enabled so
+        # that HookEventMessage entries arrive in the query() stream. This
+        # requires SDK >= 0.1.74; the field is guarded at the type level by
+        # the conditional import above and is only passed when the sentinel
+        # is active.
+        sentinel_active = self._sentinel is not None and HookEventMessage is not None
+        extra_opts: dict[str, Any] = {}
+        if sentinel_active:
+            extra_opts["include_hook_events"] = True
+
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=cfg.model,
@@ -1480,6 +1504,7 @@ class AgentSession:
             include_partial_messages=cfg.stream,
             setting_sources=[],
             stderr=lambda line: log("sdk_stderr", line=line),
+            **extra_opts,
         )
 
 
@@ -1554,6 +1579,7 @@ async def _run_turn(
     on_token: OnToken | None = None,
     on_tool_use: OnToolUse | None = None,
     on_tool_result: OnToolResult | None = None,
+    sentinel: "RuntimeSentinel | None" = None,
 ) -> dict[str, Any]:
     assistant_blocks: list[dict] = []
     tokens_in = 0
@@ -1562,6 +1588,8 @@ async def _run_turn(
     # When any callback is wired the caller (TUI) owns presentation —
     # suppress the default console rendering to avoid double-output.
     callback_mode = any(c is not None for c in (on_token, on_tool_use, on_tool_result))
+    # Whether we've already halted this turn due to sentinel firing.
+    _sentinel_halted = False
 
     async def _maybe_await(result):
         if asyncio.iscoroutine(result):
@@ -1661,7 +1689,33 @@ async def _run_turn(
                 if message.is_error:
                     log("agent_error", subtype=message.subtype, result=str(message.result)[:200])
                     warn(f"agent_error subtype={message.subtype}")
-            # SystemMessage: init / context info — ignore.
+            elif HookEventMessage is not None and isinstance(message, HookEventMessage):
+                # SDK >= 0.1.74 emits hook lifecycle events into the stream
+                # when include_hook_events=True. Feed PreToolUse events to the
+                # sentinel so it can detect polling patterns.
+                if sentinel is not None and not _sentinel_halted:
+                    sentinel.observe(message)
+                    halt_reason = sentinel.should_halt()
+                    if halt_reason:
+                        _sentinel_halted = True
+                        notice = (
+                            f"[SENTINEL HALT] {halt_reason}. "
+                            "Stopping further tool dispatch for this turn. "
+                            "Please check in with the user before continuing."
+                        )
+                        log("sentinel_halt", reason=halt_reason)
+                        # Inject a synthetic text block so the notice lands
+                        # in the persisted assistant turn.
+                        assistant_blocks.append({"type": "text", "text": notice})
+                        if on_token is not None:
+                            await _maybe_await(on_token(notice))
+                        elif stream and not callback_mode:
+                            console.print(f"\n[bold red]{notice}[/bold red]")
+                            printed_any = True
+                        # Break out of the message stream to stop consuming
+                        # further tool dispatches for this turn.
+                        break
+            # SystemMessage (non-hook): init / context info — ignore.
     finally:
         # Explicitly close the generator so SubprocessCLITransport.close()
         # runs while the event loop is still live.  The inner try/except

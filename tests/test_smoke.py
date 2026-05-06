@@ -260,7 +260,7 @@ def test_on_token_callback_invoked(home, monkeypatch):
             await r
 
     async def _fake_run_turn(prompt, options, stream, on_token=None,
-                             on_tool_use=None, on_tool_result=None):
+                             on_tool_use=None, on_tool_result=None, sentinel=None):
         if on_token is not None:
             await _maybe(on_token, "Hello, ")
             await _maybe(on_token, "world!")
