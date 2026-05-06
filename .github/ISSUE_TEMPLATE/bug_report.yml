@@ -1,0 +1,85 @@
+name: Bug report
+description: Something in Mnemara doesn't work the way the docs say it should.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill out the
+        sections below — sparse reports usually take multiple round
+        trips before anything can move.
+
+        **Security issues:** do NOT file here. See
+        [SECURITY.md](https://github.com/mekickdemons-creator/mnemara/blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Mnemara version
+      description: Output of `mnemara --version` (or the version you `pip install`ed).
+      placeholder: "0.3.2"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+      placeholder: "3.11.7"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Linux
+        - macOS
+        - Windows (WSL)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: |
+        A clear description of the bug. Include the exact command you
+        ran, what you expected, and what actually happened.
+      placeholder: |
+        I ran `mnemara run --instance scratch` and ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal sequence of commands or actions to trigger the bug.
+      placeholder: |
+        1. `mnemara init --instance test`
+        2. `mnemara role --instance test --set examples/roles/sentinel.md`
+        3. `mnemara run --instance test`
+        4. Type "..." at the prompt.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / traceback
+      description: |
+        Paste any relevant output. For crashes, include the full
+        Python traceback. For config issues, include the contents of
+        `~/.mnemara/<instance>/config.json` (redact any secrets).
+      render: shell
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Other context — role doc behavior, permission settings, MCP servers wired in, etc.
