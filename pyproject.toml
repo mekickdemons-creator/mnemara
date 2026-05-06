@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mnemara"
-version = "0.3.2"
-description = "Controlled rolling-context conversation runtime for Claude — transparent turns store, role doc system prompt, and the Claude Agent SDK underneath."
+name = "gemma-mnemara"
+version = "0.1.0"
+description = "Controlled rolling-context conversation runtime for Gemma via Ollama — transparent turns store, role doc system prompt, offline-first."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -47,7 +47,6 @@ dependencies = [
     "pyarrow>=15",
     "kuzu>=0.10",
     "pyperclip>=1.8",
-    "claude-agent-sdk>=0.1",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +59,7 @@ Issues = "https://github.com/mekickdemons-creator/mnemara/issues"
 
 [project.scripts]
 mnemara = "mnemara.cli:main"
+gemma-mnemara = "mnemara.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -29,8 +29,17 @@ def main() -> None:
 def init_cmd(instance: str, role_doc: str | None) -> None:
     """Create ~/.mnemara/<instance>/ with a default config."""
     if paths.instance_dir(instance).exists():
-        console.print(f"[red]Instance already exists:[/red] {paths.instance_dir(instance)}")
-        sys.exit(1)
+        cfg_path = paths.config_path(instance)
+        # If config.json is missing or empty, repair rather than block.
+        if not cfg_path.exists() or cfg_path.stat().st_size == 0:
+            console.print(f"[yellow]Instance dir exists but config is empty — repairing:[/yellow] {cfg_path}")
+            config_mod.save(instance, config_mod.Config.default())
+            console.print(f"[green]repaired[/green] {cfg_path}")
+            console.print(f"\nRun: [bold]mnemara role --instance {instance} --set <path>[/bold] to set a role doc.")
+            return
+        else:
+            console.print(f"[red]Instance already exists:[/red] {paths.instance_dir(instance)}")
+            sys.exit(1)
     if not role_doc:
         try:
             role_doc = click.prompt("Role doc path (blank for none)", default="", show_default=False).strip()
