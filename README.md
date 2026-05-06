@@ -4,14 +4,47 @@
 [![Python](https://img.shields.io/pypi/pyversions/mnemara.svg)](https://pypi.org/project/mnemara/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A controlled rolling-context conversation runtime for Claude. Built on the
-**[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)**:
-Mnemara wraps the SDK with a transparent, file-based context layer so you can
-see and shape exactly what the model sees on every turn.
+**Stop your Claude agent from running away with your bill.**
 
-What you get:
+Mnemara is a Claude conversation runtime where the **role doc is re-read on
+every turn** and pinned as the system prompt. That sounds boring until you
+realize what it lets you do: write rules the agent has to obey on every
+single API call — not just the first one — and the agent enforces them on
+itself.
 
-- A **role doc** re-read on every API call and pinned as the system prompt.
+The flagship example is [`examples/roles/sentinel.md`](examples/roles/sentinel.md).
+Drop it in, and the agent watches its own execution for the four failure
+modes that turn agent sessions into expensive accidents:
+
+- **No progress** — N+ turns on the same sub-goal with no state change.
+- **Polling** — same tool, same args, 3+ times in a row.
+- **Drift** — about to do something the user didn't ask for.
+- **Sycophancy** — about to reverse a conclusion under tone-only pushback.
+
+When any one fires, the agent **halts and asks**, instead of burning
+another N turns of API budget. The role doc is plain Markdown — edit it
+to match the failure modes you actually see.
+
+Try it in 30 seconds:
+
+```bash
+pip install mnemara
+mnemara init --instance scratch
+mnemara role --instance scratch --set-from-url \
+  https://raw.githubusercontent.com/mekickdemons-creator/mnemara/main/examples/roles/sentinel.md
+mnemara run --instance scratch
+```
+
+---
+
+Built on the **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)**.
+Mnemara wraps the SDK with a transparent, file-based context layer so you
+can see and shape exactly what the model sees on every turn.
+
+What's in the box:
+
+- A **role doc** re-read on every API call and pinned as the system prompt
+  (the bit that makes Sentinel work).
 - A configurable **rolling window** of recent turns (FIFO, by row count or
   token budget).
 - Native tool use — Bash, Read, Edit, Write — plus an in-process `WriteMemory`
@@ -24,9 +57,6 @@ What you get:
 - Optional memory/wiki + LanceDB RAG + Kuzu property graph backends, and a
   `mnemara replay` consolidation primitive that drafts wiki pages and
   role-amendment proposals from clustered memory atoms.
-
-If you want a chat loop where you control the system prompt, control the
-window, and can read every byte of state on disk, that's what this is.
 
 ## Install
 
