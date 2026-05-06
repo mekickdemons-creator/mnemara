@@ -1414,9 +1414,8 @@ def test_messages_for_api_filters_marker_rows(home):
     store.close()
 
 
-@pytest.mark.skip(reason="STABLE-era regression: /evict and /mark commands removed during STABLE pass")
 def test_slash_evict_and_mark_command_dispatch(home):
-    """/mark, /marks, /evict last|ids|since dispatch through the TUI handler."""
+    """/evict stats | tools | N — dispatch through the TUI handler (gemma branch API)."""
     import asyncio as _asyncio
     from mnemara import config as config_mod
     from mnemara import tui as tui_mod
@@ -1431,49 +1430,31 @@ def test_slash_evict_and_mark_command_dispatch(home):
             for i in range(5):
                 app.store.append_turn("user", [{"type": "text", "text": f"m{i}"}])
 
-            # /mark and /marks
-            await app._handle_slash("/mark checkpoint-a")
+            # /evict (no arg) — prints stats, no rows removed.
+            await app._handle_slash("/evict")
             await pilot.pause()
-            marks = app.store.list_markers()
-            assert len(marks) == 1
-            assert marks[0]["name"] == "checkpoint-a"
+            assert len(app.store.window()) == 5
 
-            # /evict last 1 should drop the marker (it was the most recent row).
-            await app._handle_slash("/evict last 1")
+            # /evict tools — strips tool_use blocks; no tool_use blocks seeded,
+            # so row count stays the same but call must not raise.
+            await app._handle_slash("/evict tools")
             await pilot.pause()
-            assert app.store.list_markers() == []
-            assert len(app.store.window()) == 5  # five user turns intact
+            assert len(app.store.window()) == 5
 
-            # Re-mark and evict_since
-            await app._handle_slash("/mark checkpoint-b")
-            await pilot.pause()
-            for i in range(3):
-                app.store.append_turn("assistant", [{"type": "text", "text": f"r{i}"}])
-            assert len(app.store.window()) == 5 + 1 + 3  # 5 user + marker + 3 assistant
-
-            await app._handle_slash("/evict since checkpoint-b")
-            await pilot.pause()
-            # Marker + 3 assistant rows dropped; 5 original user turns survive.
-            rows = app.store.window()
-            assert len(rows) == 5
-            assert all(r["role"] == "user" for r in rows)
-
-            # /evict ids targeting two of the survivors
-            ids_to_drop = [r["id"] for r in rows[:2]]
-            await app._handle_slash(f"/evict ids {ids_to_drop[0]},{ids_to_drop[1]}")
+            # /evict N — drop oldest 2 rows.
+            await app._handle_slash("/evict 2")
             await pilot.pause()
             assert len(app.store.window()) == 3
 
-            # Bad input is a no-op (errors logged to chat, not raised).
-            await app._handle_slash("/evict last abc")
+            # Bad input: bogus arg.
+            await app._handle_slash("/evict bogus")
             await pilot.pause()
-            assert len(app.store.window()) == 3
-            await app._handle_slash("/evict since does-not-exist")
+            assert len(app.store.window()) == 3  # unchanged
+
+            # Bad input: N=0 rejected.
+            await app._handle_slash("/evict 0")
             await pilot.pause()
-            assert len(app.store.window()) == 3
-            await app._handle_slash("/evict bogus-mode")
-            await pilot.pause()
-            assert len(app.store.window()) == 3
+            assert len(app.store.window()) == 3  # unchanged
 
     _asyncio.run(_run())
     app.store.close()

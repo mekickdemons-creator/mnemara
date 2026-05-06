@@ -584,9 +584,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self._slash_stop(chat)
             return
 
+        if cmd == "/evict":
+            self._slash_evict(arg, chat)
+            return
+
         chat.write(
             f"[dim]unknown command: {cmd} — /quit, /exit, /models, "
-            "/swap MODEL, /tokens N, /export, or /stop[/dim]"
+            "/swap MODEL, /tokens N, /export, /stop, or /evict [tools|N][/dim]"
         )
 
     def _slash_models(self, chat: "RichLog") -> None:
@@ -674,6 +678,45 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write("[dim]⏹ stop signal sent — finishing current operation…[/dim]")
         else:
             chat.write("[dim]nothing in flight[/dim]")
+
+    def _slash_evict(self, arg: str, chat: "RichLog") -> None:
+        """/evict [tools|N] — context surgery.
+
+        /evict          → show current eviction stats
+        /evict tools    → strip tool_use blocks from all rows (free up bloat)
+        /evict N        → drop the oldest N rows from the rolling window
+        """
+        arg = arg.strip()
+        if not arg:
+            ev = self.store.get_eviction_stats()
+            chat.write(
+                f"[bold]eviction stats[/bold]\n"
+                f"  rows evicted   : {ev.get('rows_evicted', 0)}\n"
+                f"  blocks evicted : {ev.get('blocks_evicted', 0)}\n"
+                f"  bytes freed    : {ev.get('bytes_freed', 0)}"
+            )
+            return
+
+        if arg == "tools":
+            result = self.store.evict_tool_use_blocks(all_rows=True)
+            rows_hit = result.get("rows_modified", 0)
+            blocks_rm = result.get("blocks_evicted", 0)
+            chat.write(
+                f"[green]✓ tool_use blocks stripped[/green] — "
+                f"{blocks_rm} block(s) removed from {rows_hit} row(s)"
+            )
+            return
+
+        if arg.isdigit():
+            n = int(arg)
+            if n <= 0:
+                chat.write("[red]N must be > 0[/red]")
+                return
+            removed = self.store.evict_last(n)
+            chat.write(f"[green]✓ evicted[/green] {removed} oldest row(s)")
+            return
+
+        chat.write("[red]usage: /evict  |  /evict tools  |  /evict N[/red]")
 
     async def _slash_export(self, arg: str, chat: "RichLog") -> None:
         """/export [N] [path] — write rolling-window text to markdown."""
