@@ -473,6 +473,28 @@ model and its native tools (Bash/Read/Edit/Write); Mnemara owns:
 - The permission policy (mediated via the SDK's `can_use_tool` callback).
 - The memory/wiki/RAG/graph backends and the `replay` consolidation pass.
 
+### Scope: single-instance runtime
+
+Mnemara is **per-instance**: one role doc, one rolling window, one config,
+one set of files under `~/.mnemara/<instance>/`. That's deliberate.
+
+If you want to run **multiple Mnemara instances with shared coordination**
+— a producer panel handing tasks to engineer panels, a watchdog instance
+monitoring others, a researcher and a writer running side-by-side — that's
+a multi-agent orchestration layer that lives *above* Mnemara, not inside
+it. Mnemara is the per-instance runtime each panel runs on; the harness
+that spawns, coordinates, and arbitrates between panels is a separate
+concern.
+
+We don't ship that orchestration harness publicly. The reason is design,
+not omission: a generic multi-agent harness has too many opinions
+(scheduling? message-passing? leader election? failure recovery?) to be
+useful as one-size-fits-all. Build your own thin wrapper around the
+[programmatic-use surface](#programmatic-use) — Mnemara is small enough
+that "spawn N `AgentSession`s and route messages between them" is real
+code you can write in an afternoon for the specific shape of orchestration
+your project needs.
+
 ## Programmatic use
 
 The CLI is the primary surface, but Mnemara is also a regular Python
