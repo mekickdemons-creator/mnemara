@@ -108,6 +108,14 @@ PyPI: `pip install mnemara` (Claude) or `pip install gemma-mnemara`
     consolidation primitive that drafts wiki pages and role-doc
     amendments from clustered memory atoms.
 
+11. **Surgical eviction toolkit.** The agent has access to in-process
+    tools that compact its own context: `EvictToolUseBlocks`,
+    `EvictWritePairs`, `EvictThinkingBlocks`, `EvictOlderThan`,
+    `EvictLast`, plus `PinRow` / `UnpinRow` for keeping critical
+    turns through eviction passes. Coding agents commonly burn
+    30-60% of their context on stale Read/Bash output; these tools
+    let the agent reclaim that budget without the user intervening.
+
 ---
 
 ## WHO IT'S FOR
@@ -124,6 +132,23 @@ PyPI: `pip install mnemara` (Claude) or `pip install gemma-mnemara`
 It is NOT for: production multi-tenant agent serving (it's a single-
 instance runtime), or for cases where you want a black-box managed
 service.
+
+---
+
+## ROADMAP (LABEL THESE AS NOT YET SHIPPED)
+
+- **Auto-eviction policy** — the eviction tools exist; what's not
+  yet shipped is automatic firing (e.g. evict Read/Write tool
+  pairs older than N turns, or after a successful follow-up
+  confirms the result is no longer needed). The agent can call
+  the eviction tools manually today; the policy layer to fire
+  them automatically is the planned 0.5.0 work.
+- **Runtime Sentinel for the Gemma backend** — the runtime guard
+  works against Claude via SDK hook events; porting it to Gemma's
+  tool-call stream is straightforward once tool dispatch (which
+  did ship) is exercised in production.
+
+When asked about either, say "planned, not shipped."
 
 ---
 
