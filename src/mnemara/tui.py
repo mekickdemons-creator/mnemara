@@ -106,6 +106,13 @@ Screen {
     padding: 0 1;
 }
 
+#keyhint {
+    height: 1;
+    background: #11151e;
+    color: #636b7a;
+    padding: 0 1;
+}
+
 #userinput {
     height: auto;
     min-height: 4;
@@ -299,6 +306,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             auto_scroll=True,
         )
         yield Static(self._status_text(), id="status")
+        yield Static(
+            "[dim]Enter for newline · Ctrl+Enter to send · Ctrl+C to quit[/dim]",
+            id="keyhint",
+        )
         yield _UserTextArea(
             "",
             language=None,
@@ -429,6 +440,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
         log_widget = self._chat()
         rows = self.store.window()
         if not rows:
+            log_widget.write(
+                "[dim]Tip: Enter inserts a newline. Ctrl+Enter sends.[/dim]"
+            )
             log_widget.write("[dim](empty window — start chatting below)[/dim]")
             return
         for row in rows:
