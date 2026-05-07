@@ -309,13 +309,35 @@ class _UserTextArea(TextArea):
 
     BINDINGS = [
         Binding("ctrl+s",     "app.submit_prompt",  "Send",        show=True),
-        Binding("escape",     "app.clear_input",    "Clear input", show=False),
+        # Escape declared as a Binding for documentation, but the actual
+        # interception happens in _on_key below — TextArea swallows Escape
+        # at the key-event level before any Binding lookup runs.
+        Binding("escape",     "app.clear_input",    "Clear input", show=False, priority=True),
         # Delegate page scroll to App so the chatlog scrolls even when input
         # has focus.  Without these, TextArea's own scroll handling intercepts
         # the keys and the chatlog never receives them.
         Binding("pageup",   "app.scroll_log_up",   show=False),
         Binding("pagedown", "app.scroll_log_down",  show=False),
     ]
+
+    async def _on_key(self, event) -> None:  # type: ignore[override]
+        """Intercept submit and clear keys at the key-event level.
+
+        TextArea's internal key handler runs before the Binding system,
+        so bindings with app.* actions are unreliable — the widget may
+        consume the key first.  We catch Ctrl+S and Escape here instead
+        and forward them to App actions manually.
+        """
+        if event.key == "ctrl+s":
+            event.prevent_default()
+            event.stop()
+            await self.app.run_action("submit_prompt")
+            return
+        if event.key == "escape":
+            event.prevent_default()
+            event.stop()
+            await self.app.run_action("clear_input")
+            return
 
 
 # ---------------------------------------------------------------------------
