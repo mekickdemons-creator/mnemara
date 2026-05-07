@@ -591,8 +591,8 @@ def test_cli_list_show_clear(home):
 
 
 
-def test_tui_input_guard_ignores_non_userinput(home):
-    """on_input_submitted returns without action when event.input.id != 'userinput'."""
+def test_tui_submit_prompt_empty_is_noop(home):
+    """action_submit_prompt does not dispatch a turn when the TextArea is blank."""
     import asyncio as _asyncio
     from mnemara import config
     from mnemara import tui as tui_mod
@@ -605,18 +605,15 @@ def test_tui_input_guard_ignores_non_userinput(home):
     async def _fake_send_turn(text: str) -> None:
         turns_sent.append(text)
 
-    app._send_turn = _fake_send_turn  # type: ignore[method-assign]
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Leave TextArea empty and invoke the submit action.
+            await app.action_submit_prompt()
+            await pilot.pause()
 
-    class _FakeInput:
-        id = "note_text"
-        value = "should be ignored"
-
-    class _FakeEvent:
-        input = _FakeInput()
-        value = "should be ignored"
-
-    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
-    assert turns_sent == [], "non-userinput events must be ignored"
+    _asyncio.run(_run())
+    assert turns_sent == [], "blank TextArea must not fire a turn"
     app.store.close()
 
 
@@ -667,7 +664,6 @@ def test_tui_pilot_focus_returns_after_turn(home, monkeypatch):
     import asyncio as _asyncio
     from mnemara import config, agent as agent_mod
     from mnemara import tui as tui_mod
-    from textual.widgets import Input
 
     config.init_instance("pilot_focus_t")
 
@@ -685,18 +681,18 @@ def test_tui_pilot_focus_returns_after_turn(home, monkeypatch):
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            inp = app.query_one("#userinput", Input)
-            assert inp.has_focus, "input should have focus on mount"
-            inp.value = "hello"
-            await pilot.press("enter")
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            assert ta.has_focus, "textarea should have focus on mount"
+            ta.load_text("hello")
+            await app.action_submit_prompt()
             await pilot.pause()
             await pilot.pause()
-            inp2 = app.query_one("#userinput", Input)
-            assert inp2.has_focus, "input must regain focus after turn"
-            inp2.value = "second"
-            await pilot.press("enter")
+            ta2 = app.query_one("#userinput", tui_mod._UserTextArea)
+            assert ta2.has_focus, "textarea must regain focus after turn"
+            ta2.load_text("second")
+            await app.action_submit_prompt()
             await pilot.pause()
-            assert app.query_one("#userinput", Input).has_focus
+            assert app.query_one("#userinput", tui_mod._UserTextArea).has_focus
 
     _asyncio.run(_run())
     app.store.close()
@@ -707,7 +703,7 @@ def test_tui_pilot_input_visible_height(home):
     import asyncio as _asyncio
     from mnemara import config
     from mnemara import tui as tui_mod
-    from textual.widgets import Input, RichLog
+    from textual.widgets import RichLog
 
     config.init_instance("pilot_height_t")
     app = tui_mod.MnemaraTUI("pilot_height_t")
@@ -718,11 +714,11 @@ def test_tui_pilot_input_visible_height(home):
             for i in range(200):
                 chat.write(f"[b green]assistant:[/b green] line {i}")
             await pilot.pause()
-            inp = app.query_one("#userinput", Input)
-            # outer_size = border + content + border; widget reserves 3 rows total
-            assert inp.outer_size.height >= 3, f"input collapsed: {inp.outer_size}"
-            assert inp.region.y + inp.region.height <= app.size.height
-            assert inp.size.width > 0
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            # min-height: 4 in CSS; with borders the outer height >= 4
+            assert ta.outer_size.height >= 4, f"textarea collapsed: {ta.outer_size}"
+            assert ta.region.y + ta.region.height <= app.size.height
+            assert ta.size.width > 0
 
     _asyncio.run(_run())
     app.store.close()
@@ -787,37 +783,36 @@ def test_tui_pilot_richlog_scroll_actions(home):
 
 
 def test_tui_pilot_action_paste(home, monkeypatch):
-    """action_paste inserts clipboard text at the cursor of the focused Input."""
+    """action_paste inserts clipboard text at the cursor of the focused TextArea."""
     import asyncio as _asyncio
     import sys
     import types
     from mnemara import config
     from mnemara import tui as tui_mod
-    from textual.widgets import Input
 
     config.init_instance("pilot_paste_t")
 
-    # Provide a fake pyperclip returning a known string.
+    # Provide a fake pyperclip returning a multi-line string to verify
+    # that TextArea preserves newlines natively (no collapsing).
     fake_pyperclip = types.ModuleType("pyperclip")
-    fake_pyperclip.paste = lambda: "pasted_text"  # type: ignore[attr-defined]
+    fake_pyperclip.paste = lambda: "line1\nline2"  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pyperclip", fake_pyperclip)
 
     app = tui_mod.MnemaraTUI("pilot_paste_t")
-    # Reset the one-per-session warning flag between test runs.
-    tui_mod.MnemaraTUI._paste_unavailable_warned = False
 
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            inp = app.query_one("#userinput", Input)
-            inp.focus()
-            inp.value = "before_"
-            inp.cursor_position = len(inp.value)
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.focus()
+            ta.load_text("before_")
+            ta.move_cursor(ta.document.end)
             await pilot.pause()
             app.action_paste()
             await pilot.pause()
-            assert inp.value == "before_pasted_text"
-            assert inp.cursor_position == len("before_pasted_text")
+            # TextArea preserves multi-line paste natively.
+            assert "line1" in ta.text
+            assert "line2" in ta.text
 
     _asyncio.run(_run())
     app.store.close()
@@ -1838,12 +1833,11 @@ def test_agent_eviction_tools_persist_to_store(home):
 # ---------------------------------------------------------------- userinput paste
 
 
-def test_userinput_paste_collapses_multiline_atomically(home):
-    """_UserInput._on_paste joins multi-line content with spaces and inserts atomically.
+def test_usertextarea_preserves_multiline_paste(home):
+    """_UserTextArea preserves multi-line content natively via TextArea.
 
-    Drives the Input via run_test() Pilot, posts a synthesized Paste event,
-    and asserts the resulting value is the collapsed single-line content
-    (not the first-line-only stock Textual behavior).
+    Verifies that pasting multi-line text keeps newlines intact (the old
+    _UserInput would collapse them to spaces; _UserTextArea must not).
     """
     import asyncio as _asyncio
     from mnemara import config as config_mod
@@ -1856,45 +1850,25 @@ def test_userinput_paste_collapses_multiline_atomically(home):
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            inp = app.query_one("#userinput", tui_mod.Input)
-            inp.focus()
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.focus()
             await pilot.pause()
 
-            # Plain single-line paste -> inserted as-is.
-            inp.value = ""
-            inp.cursor_position = 0
-            inp.post_message(_txt_events.Paste("hello world"))
+            # Multi-line paste is preserved with newlines intact.
+            ta.clear()
+            ta.post_message(_txt_events.Paste("line one\nline two\n\nline four"))
             await pilot.pause()
-            assert inp.value == "hello world"
-
-            # Multi-line paste -> collapsed with single spaces.
-            inp.value = ""
-            inp.cursor_position = 0
-            inp.post_message(_txt_events.Paste("line one\nline two\n\nline four"))
-            await pilot.pause()
-            assert inp.value == "line one line two line four"
-
-            # Paste at non-zero cursor preserves prefix/suffix.
-            inp.value = "AB CD"
-            inp.cursor_position = 3  # between 'B ' and 'CD'
-            inp.post_message(_txt_events.Paste("X\nY"))
-            await pilot.pause()
-            assert inp.value == "AB X YCD"
-
-            # Truncation cap: paste larger than _USERINPUT_PASTE_CAP gets clipped.
-            inp.value = ""
-            inp.cursor_position = 0
-            big = "a" * (tui_mod._USERINPUT_PASTE_CAP + 500)
-            inp.post_message(_txt_events.Paste(big))
-            await pilot.pause()
-            assert len(inp.value) == tui_mod._USERINPUT_PASTE_CAP
+            assert "line one" in ta.text
+            assert "line two" in ta.text
+            assert "line four" in ta.text
+            # Newlines present — not collapsed to spaces.
+            assert "\n" in ta.text
 
             # Empty paste is a no-op.
-            inp.value = "preserved"
-            inp.cursor_position = len(inp.value)
-            inp.post_message(_txt_events.Paste(""))
+            ta.load_text("preserved")
+            ta.post_message(_txt_events.Paste(""))
             await pilot.pause()
-            assert inp.value == "preserved"
+            assert "preserved" in ta.text
 
     _asyncio.run(_run())
     app.store.close()
@@ -1903,22 +1877,19 @@ def test_userinput_paste_collapses_multiline_atomically(home):
 # ---------------------------------------------------------------- worker decoupling
 
 
-def test_on_input_submitted_returns_before_send_turn_completes(home, monkeypatch):
-    """on_input_submitted must spawn _send_turn as a worker, not await it.
+def test_action_submit_prompt_returns_before_send_turn_completes(home, monkeypatch):
+    """action_submit_prompt must spawn _send_turn as a worker, not await it.
 
-    Pins down the resize-during-streaming fix: the input handler must
+    Pins down the resize-during-streaming fix: the submit handler must
     return immediately so Textual's _process_messages_loop is freed to
     dispatch other queued events (resize, key, mouse) concurrently with
-    the streaming work. If on_input_submitted reverts to awaiting
-    _send_turn directly, this test fails -- the assertion would only
-    hold if _send_turn awaited completion before returning, and that's
-    exactly the architecture we don't want.
+    the streaming work. If action_submit_prompt reverts to awaiting
+    _send_turn directly, this test fails.
     """
     import asyncio as _asyncio
     import time as _time
     from mnemara import config as config_mod
     from mnemara import tui as tui_mod
-    from textual.widgets import Input
 
     config_mod.init_instance("worker_t")
     app = tui_mod.MnemaraTUI("worker_t")
@@ -1942,20 +1913,15 @@ def test_on_input_submitted_returns_before_send_turn_completes(home, monkeypatch
             # Patch _send_turn to our slow stand-in.
             monkeypatch.setattr(app, "_send_turn", _slow_send_turn)
 
-            # Simulate a submission. The handler should return BEFORE
-            # _send_turn completes; we measure by checking the busy flag
-            # is set (worker started) but the handler awaitable resolved
-            # without blocking.
-            inp = app.query_one("#userinput", Input)
-            inp.value = "hello"
+            # Load the TextArea with a prompt and invoke the submit action.
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("hello")
             handler_returned_at = None
 
             async def _do_submit() -> None:
                 nonlocal handler_returned_at
                 t0 = _time.monotonic()
-                # Mimic Textual posting an Input.Submitted event.
-                event = Input.Submitted(inp, "hello")
-                await app.on_input_submitted(event)
+                await app.action_submit_prompt()
                 handler_returned_at = _time.monotonic() - t0
 
             # Run the handler; it should return promptly because
@@ -1969,7 +1935,7 @@ def test_on_input_submitted_returns_before_send_turn_completes(home, monkeypatch
             # the worker is still parked on send_turn_can_finish.
             assert handler_returned_at is not None
             assert handler_returned_at < 0.5, (
-                f"on_input_submitted took {handler_returned_at:.3f}s -- "
+                f"action_submit_prompt took {handler_returned_at:.3f}s -- "
                 "this means it awaited _send_turn directly instead of "
                 "spawning it as a worker. Resize-during-streaming bug "
                 "will recur."
@@ -4195,7 +4161,7 @@ def test_config_mcp_servers_ignore_unknown_fields():
 # ----------------------------------------------------------------------
 
 def test_tui_slash_cmd_routes_through_when_busy(home):
-    """Slash commands bypass the _busy guard — on_input_submitted dispatches
+    """Slash commands bypass the _busy guard — _handle_user_input dispatches
     to _handle_slash regardless of _busy state."""
     import asyncio as _asyncio
     from mnemara import config
@@ -4213,19 +4179,7 @@ def test_tui_slash_cmd_routes_through_when_busy(home):
     app._handle_slash = _fake_handle_slash  # type: ignore[method-assign]
     app._refresh_status = lambda: None  # suppress widget call
 
-    # Patch query_one so clearing inp.value doesn't trigger a DOM lookup.
-    _fake_inp = type("FakeInp", (), {"value": ""})()
-    app.query_one = lambda *a, **kw: _fake_inp  # type: ignore[method-assign]
-
-    class _FakeInput:
-        id = "userinput"
-        value = "/stop"
-
-    class _FakeEvent:
-        input = _FakeInput()
-        value = "/stop"
-
-    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
+    _asyncio.run(app._handle_user_input("/stop"))
     assert slash_cmds_seen == ["/stop"], "slash commands must bypass _busy guard"
     app.store.close()
 
@@ -4255,20 +4209,9 @@ def test_tui_non_slash_blocked_when_busy(home):
             chat_msgs.append(msg)
 
     app._chat = lambda: _FakeChat()  # type: ignore[method-assign]
+    app._refresh_status = lambda: None  # suppress widget call
 
-    class _FakeInput:
-        id = "userinput"
-        value = "hello"
-
-    class _FakeEvent:
-        input = _FakeInput()
-        value = "hello"
-
-    # Patch query_one so clearing the input doesn't crash.
-    _fake_inp = type("FakeInp", (), {"value": ""})()
-    app.query_one = lambda *a, **kw: _fake_inp  # type: ignore[method-assign]
-
-    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
+    _asyncio.run(app._handle_user_input("hello"))
     assert turns_sent == [], "no turn should fire immediately while busy"
     assert app._queued_input == "hello", (
         "input should be stored in _queued_input when busy"

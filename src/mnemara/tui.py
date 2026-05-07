@@ -22,7 +22,7 @@ try:
     from textual import events as _txt_events
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.widgets import Footer, Header, Input, RichLog, Static
+    from textual.widgets import Footer, Header, Input, RichLog, Static, TextArea
     _TEXTUAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _TEXTUAL_AVAILABLE = False
@@ -30,8 +30,6 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-_USERINPUT_PASTE_CAP = 16_000
 
 # Escape sequences for all mouse-tracking modes Mnemara may enable.
 # Written to /dev/tty at process exit as a last-resort safety net in case
@@ -109,15 +107,26 @@ Screen {
 }
 
 #userinput {
-    height: 3;
-    min-height: 3;
+    height: auto;
+    min-height: 4;
+    max-height: 10;
     border: round #4d6fa3;
     background: #11151e;
     color: #ffffff;
+    padding: 0 1;
 }
 
 #userinput:focus {
     border: round #6f9ad9;
+}
+
+#userinput > .text-area--cursor {
+    background: #6f9ad9;
+    color: #11151e;
+}
+
+#userinput > .text-area--selection {
+    background: #2a3f5f;
 }
 """
 
@@ -199,49 +208,28 @@ def _render_export_rows(rows: list[dict[str, Any]], instance: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Input widget — paste-safe subclass
+# Input widget — multi-line TextArea subclass
 # ---------------------------------------------------------------------------
 
 
-class _UserInput(Input):
-    """Input with paste behaviour tuned for the Mnemara panel.
+class _UserTextArea(TextArea):
+    """Multi-line plain-text prompt area for the Mnemara panel.
 
-    Textual's stock Input._on_paste takes only the first line of a paste.
-    We collapse multi-line pastes to a single space-joined line, truncate at
-    _USERINPUT_PASTE_CAP, and delegate to Textual's own replace/insert_text_at_cursor
-    so there is exactly one value-reactive fire and one cursor-reactive fire.
-    Selections are honoured: if text is selected it is replaced by the paste.
+    Enter inserts a newline.  Ctrl+Enter submits.  Multi-line paste works
+    natively — no collapsing needed since TextArea handles newlines correctly.
 
-    NOTE: newlines must never reach Input.value — they confuse Textual's strip
-    renderer (Text with no_wrap=True still emits newline segments that can
-    corrupt the screen compositor), producing the "input migrates up" artefact.
+    Tab moves focus out of the input rather than inserting whitespace
+    (tab_behavior="focus"); use Shift+Tab to move backwards.
     """
 
-    @staticmethod
-    def _collapse_paste(raw: str) -> str:
-        """Collapse multi-line text to a single line, capped at _USERINPUT_PASTE_CAP."""
-        lines = raw.splitlines()
-        collapsed = " ".join(part for part in (s.strip() for s in lines) if part)
-        if len(collapsed) > _USERINPUT_PASTE_CAP:
-            collapsed = collapsed[:_USERINPUT_PASTE_CAP]
-        return collapsed
-
-    def _on_paste(self, event: "_txt_events.Paste") -> None:  # type: ignore[name-defined]
-        # prevent_default stops Textual from descending further into the MRO
-        # (Input._on_paste would only take the first line without collapsing).
-        event.prevent_default()
-        event.stop()
-        raw = event.text or ""
-        if not raw:
-            return
-        collapsed = self._collapse_paste(raw)
-        if not collapsed:
-            return
-        selection = self.selection
-        if selection.is_empty:
-            self.insert_text_at_cursor(collapsed)
-        else:
-            self.replace(collapsed, *selection)
+    BINDINGS = [
+        Binding("ctrl+enter", "app.submit_prompt", "Send", show=True),
+        # Delegate page scroll to App so the chatlog scrolls even when input
+        # has focus.  Without these, TextArea's own scroll handling intercepts
+        # the keys and the chatlog never receives them.
+        Binding("pageup",   "app.scroll_log_up",   show=False),
+        Binding("pagedown", "app.scroll_log_down",  show=False),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +299,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
             auto_scroll=True,
         )
         yield Static(self._status_text(), id="status")
-        yield _UserInput(
-            placeholder="message  (Enter to send, Ctrl+C to quit)",
+        yield _UserTextArea(
+            "",
+            language=None,
+            show_line_numbers=False,
+            tab_behavior="focus",
+            soft_wrap=True,
             id="userinput",
         )
         yield Footer()
@@ -375,7 +367,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
     def _focus_input_after_refresh(self) -> None:
         def _do_focus() -> None:
             try:
-                self.query_one("#userinput", Input).focus()
+                self.query_one("#userinput", _UserTextArea).focus()
             except Exception:
                 pass
         try:
@@ -524,15 +516,20 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     # ---------------------------------------------------------------- events
 
-    async def on_input_submitted(self, event: "Input.Submitted") -> None:
-        if event.input.id != "userinput":
+    async def action_submit_prompt(self) -> None:
+        """Ctrl+Enter handler: pull text from the TextArea and dispatch."""
+        try:
+            ta = self.query_one("#userinput", _UserTextArea)
+        except Exception:
             return
-        text = (event.value or "").strip()
+        text = (ta.text or "").strip()
         if not text:
             return
-        inp = self.query_one("#userinput", Input)
-        inp.value = ""
+        ta.clear()
+        await self._handle_user_input(text)
 
+    async def _handle_user_input(self, text: str) -> None:
+        """Process a submitted prompt: slash commands, queuing, or turn dispatch."""
         if text.startswith("/"):
             await self._handle_slash(text)
             self._refresh_status()
@@ -873,8 +870,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
     # ---------------------------------------------------------------- actions
 
     def action_paste(self) -> None:
-        """Ctrl+V paste: read clipboard via pyperclip, collapse multi-line,
-        and delegate to the same Textual-native insert path as _on_paste."""
+        """Ctrl+V paste: read clipboard via pyperclip and insert at cursor.
+
+        TextArea handles multi-line content natively, so no collapsing is
+        needed.  The insert() call places text at the current cursor position,
+        replacing any active selection.
+        """
         try:
             import pyperclip
             raw = pyperclip.paste()
@@ -883,18 +884,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
         if not raw:
             return
         try:
-            inp = self.query_one("#userinput", _UserInput)
-        except Exception:
-            return
-        collapsed = inp._collapse_paste(raw)
-        if not collapsed:
-            return
-        try:
-            selection = inp.selection
-            if selection.is_empty:
-                inp.insert_text_at_cursor(collapsed)
-            else:
-                inp.replace(collapsed, *selection)
+            ta = self.query_one("#userinput", _UserTextArea)
+            ta.insert(raw)
         except Exception:
             pass
 
