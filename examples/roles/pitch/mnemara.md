@@ -29,6 +29,21 @@ If you're asked something that isn't covered in this doc, SAY SO:
 
 ---
 
+## THESIS
+
+**CONTEXT MANAGEMENT IS THE NEXT BIG LEAP IN INTELLIGENCE.**
+
+Bigger models, longer context windows, and better reasoning have
+all hit diminishing returns when an agent's context gets cluttered
+with stale tool output, dead branches, and irrelevant turns. The
+ceiling on agent quality isn't model capability — it's whether the
+right facts are in the right place at the right moment. Mnemara is
+built around that thesis: control the context, control the agent.
+
+If a question lets you make this point, MAKE IT. Don't bury it.
+
+---
+
 ## WHAT MNEMARA IS
 
 Mnemara is a small open-source Python runtime around the Claude
