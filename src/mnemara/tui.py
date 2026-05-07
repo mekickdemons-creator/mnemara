@@ -385,13 +385,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     # ---------------------------------------------------------------- startup checks
 
-    _CONTEXT_WARN_RATIO = 0.80  # warn when rolling window >= 80% of max_window_tokens
+    _CONTEXT_WARN_RATIO = 0.80        # trigger auto-evict when >= 80% of max_window_tokens
+    _CONTEXT_AUTO_EVICT_TARGET = 0.60  # trim to 60% on startup auto-evict
 
     def _warn_if_context_near_limit(self) -> None:
-        """Post an inline warning if the rolling window is already near capacity.
+        """Auto-evict on startup if the rolling window is already near capacity.
 
-        This fires once on startup so the user can /evict or /clear before the
-        first API call fails with "Prompt is too long".
+        When estimated tokens >= _CONTEXT_WARN_RATIO * max_window_tokens,
+        evict oldest turns down to _CONTEXT_AUTO_EVICT_TARGET and post a
+        single inline notice showing what was dropped.  Fires silently when
+        below the threshold.
         """
         try:
             max_tok = self.cfg.max_window_tokens
@@ -400,16 +403,28 @@ class MnemaraTUI(App):  # type: ignore[misc]
             estimated, _ = self.store.total_tokens()
             if estimated < max_tok * self._CONTEXT_WARN_RATIO:
                 return
-            pct = int(100 * estimated / max_tok)
-            msg = (
-                f"[bold yellow]⚠ rolling window at {pct}% capacity[/bold yellow] "
-                f"(~{estimated:,} / {max_tok:,} tokens) — "
-                "use [bold]/evict N[/bold] to drop old turns or "
-                "[bold]/clear[/bold] to reset before sending, "
-                'otherwise your first message may fail with "Prompt is too long".'
+            pct_before = int(100 * estimated / max_tok)
+            target_tokens = int(max_tok * self._CONTEXT_AUTO_EVICT_TARGET)
+            rows_dropped = self.store.evict(
+                max_turns=self.cfg.max_window_turns,
+                max_tokens=target_tokens,
             )
-            log("context_warn_startup", estimated=estimated, max=max_tok, pct=pct)
+            new_estimated, _ = self.store.total_tokens()
+            pct_after = int(100 * new_estimated / max_tok)
+            log(
+                "context_auto_evict_startup",
+                pct_before=pct_before,
+                pct_after=pct_after,
+                rows_dropped=rows_dropped,
+                max=max_tok,
+            )
+            msg = (
+                f"[bold yellow]⚠ rolling window was at {pct_before}%[/bold yellow] — "
+                f"auto-evicted [bold]{rows_dropped}[/bold] turn(s), "
+                f"now at {pct_after}% (~{new_estimated:,} / {max_tok:,} tokens)"
+            )
             self._chat().write(msg)
+            self._refresh_status()
         except Exception:
             pass  # never crash startup over a warning
 

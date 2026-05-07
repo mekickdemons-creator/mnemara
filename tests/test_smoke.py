@@ -1149,9 +1149,9 @@ def test_run_turn_raises_on_is_error_result(monkeypatch):
 
 
 def test_warn_if_context_near_limit_fires_above_threshold(home, monkeypatch):
-    """_warn_if_context_near_limit posts a warning when rolling window >= 80% capacity."""
+    """_warn_if_context_near_limit auto-evicts and reports when rolling window >= 80%."""
     import asyncio as _asyncio
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
 
     async def _go():
         from mnemara.tui import MnemaraTUI
@@ -1162,9 +1162,13 @@ def test_warn_if_context_near_limit_fires_above_threshold(home, monkeypatch):
         app.cfg = MnemaraConfig()
         app.cfg.max_window_tokens = DEFAULT_MAX_TOKENS  # 500_000
 
-        # Simulate the store reporting 85% usage
+        # First call → 85% (triggers evict); second call → 60% (after evict)
         mock_store = MagicMock()
-        mock_store.total_tokens.return_value = (int(DEFAULT_MAX_TOKENS * 0.85), 0)
+        mock_store.total_tokens.side_effect = [
+            (int(DEFAULT_MAX_TOKENS * 0.85), 0),
+            (int(DEFAULT_MAX_TOKENS * 0.60), 0),
+        ]
+        mock_store.evict.return_value = 7  # pretend 7 rows were dropped
         app.store = mock_store
 
         # Capture what gets written to the chat log
@@ -1172,14 +1176,23 @@ def test_warn_if_context_near_limit_fires_above_threshold(home, monkeypatch):
         mock_chat = MagicMock()
         mock_chat.write.side_effect = written.append
         app.query_one = MagicMock(return_value=mock_chat)
+        app._refresh_status = MagicMock()
 
         app._warn_if_context_near_limit()
 
-        assert written, "expected a warning message to be written"
+        # evict() must have been called with the 60% target
+        target = int(DEFAULT_MAX_TOKENS * 0.60)
+        mock_store.evict.assert_called_once_with(
+            max_turns=app.cfg.max_window_turns,
+            max_tokens=target,
+        )
+
+        assert written, "expected a status message to be written"
         msg = written[0]
-        assert "85%" in msg or "%" in msg, f"expected pct in message, got: {msg}"
-        assert "/evict" in msg, f"expected /evict hint in message, got: {msg}"
-        assert "/clear" in msg, f"expected /clear hint in message, got: {msg}"
+        assert "85%" in msg, f"expected before-pct in message, got: {msg}"
+        assert "60%" in msg, f"expected after-pct in message, got: {msg}"
+        assert "7" in msg, f"expected rows_dropped count in message, got: {msg}"
+        assert "auto-evicted" in msg, f"expected 'auto-evicted' in message, got: {msg}"
 
     _asyncio.run(_go())
 
