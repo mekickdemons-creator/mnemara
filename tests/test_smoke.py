@@ -1008,11 +1008,17 @@ def test_tui_render_status_widget_omits_spinner_when_idle(home):
 
             # Busy render: spinner frame prepended.
             app._busy = True
-            app._spinner_idx = 3  # frame index 3 is "⠸"
+            app._spinner_idx = 3  # nominal frame; timer may advance during pilot.pause()
             app._render_status_widget()
             await pilot.pause()
             text = str(status.content)
-            assert app._SPINNER_FRAMES[3] in text, f"busy render missing spinner frame: {text!r}"
+            # Assert ANY spinner frame is present, not the specific one we set —
+            # Python 3.12's asyncio scheduling lets the spinner timer fire
+            # inside pilot.pause(), advancing the frame. We only care that the
+            # busy state surfaces a frame at all.
+            assert any(f in text for f in app._SPINNER_FRAMES), (
+                f"busy render missing all spinner frames: {text!r}"
+            )
             assert "STATIC_PART" in text
 
     _asyncio.run(_run())
