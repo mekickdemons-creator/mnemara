@@ -1099,6 +1099,55 @@ def test_run_turn_yields_event_loop_between_messages(home, monkeypatch):
     )
 
 
+def test_run_turn_raises_on_is_error_result(monkeypatch):
+    """_run_turn raises RuntimeError when SDK returns ResultMessage(is_error=True).
+
+    Before this fix, the error was silently logged and the turn completed with
+    empty assistant_blocks.  The TUI then received a cryptic
+    "Command failed with exit code 1" from the subprocess exit rather than the
+    actual error message.
+    """
+    import asyncio as _asyncio
+    import pytest as _pytest
+    from mnemara import agent as agent_mod
+    from claude_agent_sdk import ResultMessage
+
+    # Simulate "Prompt is too long" — the SDK emits a ResultMessage with
+    # is_error=True before the subprocess exits with code 1.
+    async def _fake_query_error(*, prompt, options):
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=True,
+            num_turns=0,
+            session_id="test",
+            total_cost_usd=0.0,
+            usage={},
+            result="Prompt is too long",
+        )
+
+    monkeypatch.setattr(agent_mod, "query", _fake_query_error)
+
+    async def _go():
+        with _pytest.raises(RuntimeError) as exc_info:
+            await agent_mod._run_turn(
+                "a very long prompt",
+                options=None,
+                stream=False,
+                on_token=None,
+                on_tool_use=None,
+                on_tool_result=None,
+            )
+        msg = str(exc_info.value).lower()
+        assert "too long" in msg, f"expected 'too long' in error, got: {exc_info.value}"
+        assert "/evict" in msg or "/clear" in msg, (
+            f"expected recovery hint in error, got: {exc_info.value}"
+        )
+
+    _asyncio.run(_go())
+
+
 def test_parse_size_handles_suffixes_and_underscores():
     """tui._parse_size accepts plain ints, k/m suffixes, and underscores/commas."""
     from mnemara.tui import _parse_size

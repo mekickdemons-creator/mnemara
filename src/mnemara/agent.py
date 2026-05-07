@@ -1687,8 +1687,19 @@ async def _run_turn(
                 ) + int(usage.get("cache_creation_input_tokens", 0) or 0)
                 tokens_out = int(usage.get("output_tokens", 0) or 0)
                 if message.is_error:
-                    log("agent_error", subtype=message.subtype, result=str(message.result)[:200])
+                    result_str = str(message.result)
+                    log("agent_error", subtype=message.subtype, result=result_str[:200])
                     warn(f"agent_error subtype={message.subtype}")
+                    # Raise immediately so the TUI sees a descriptive error rather
+                    # than the cryptic "Command failed with exit code 1" that the
+                    # SDK emits when the subprocess exits after returning this
+                    # ResultMessage.  The finally block below still runs to close
+                    # the generator cleanly.
+                    if any(kw in result_str.lower() for kw in ("too long", "context_length", "tokens")):
+                        raise RuntimeError(
+                            f"{result_str} — use /evict N to free context or /clear to reset the window"
+                        )
+                    raise RuntimeError(f"agent error: {result_str}")
             elif HookEventMessage is not None and isinstance(message, HookEventMessage):
                 # SDK >= 0.1.74 emits hook lifecycle events into the stream
                 # when include_hook_events=True. Feed PreToolUse events to the

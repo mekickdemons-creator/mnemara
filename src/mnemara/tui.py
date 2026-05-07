@@ -555,6 +555,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception as exc:
             log("tui_turn_error", error=str(exc))
             chat.write(f"[red]error:[/red] {exc}")
+            # Surface a recovery hint for context-length overflows.
+            exc_str = str(exc).lower()
+            if "too long" in exc_str or "context" in exc_str or "/evict" in exc_str:
+                chat.write(
+                    "[dim]hint:[/dim] run [bold]/evict N[/bold] to drop the oldest N turns,"
+                    " or [bold]/clear[/bold] to reset the window"
+                )
         finally:
             self._busy = False
             self._refresh_status()
