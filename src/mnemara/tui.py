@@ -5,14 +5,17 @@ Three features, nothing else:
   2. Token-count eviction only             (row cap is not enforced here)
   3. Spinner during streaming turns
 
-Slash commands: /quit, /exit, /models, /swap, /tokens, /export, and /stop.
+Slash commands: /quit, /exit, /models, /swap, /tokens, /export, /import, and /stop.
 No block surgery, no pin system, no copy.
 """
 from __future__ import annotations
 
 import asyncio
 import atexit
+import dataclasses
+import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -192,15 +195,48 @@ def _flatten_text_blocks(content: Any) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _render_export_rows(rows: list[dict[str, Any]], instance: str) -> str:
+def _render_full_export(
+    rows: list[dict[str, Any]],
+    instance: str,
+    cfg_json: str = "",
+    role_doc_text: str = "",
+) -> str:
+    """Render a full round-trippable export with config, role_doc, and turns.
+
+    Sections are delimited by <!-- mnemara:begin:NAME --> / <!-- mnemara:end:NAME -->
+    markers so _parse_export_sections() can extract them unambiguously.
+    """
     ts = datetime.now(timezone.utc).isoformat()
-    lines = [
-        f"# Mnemara Export: {instance}",
+    lines: list[str] = [
+        f"# Mnemara Full Export: {instance}",
         "",
+        "- mnemara-export-version: 1",
         f"- exported_at: {ts}",
+        f"- instance: {instance}",
         f"- turns: {len(rows)}",
         "",
     ]
+
+    if cfg_json:
+        lines += [
+            "<!-- mnemara:begin:config -->",
+            "```json",
+            cfg_json,
+            "```",
+            "<!-- mnemara:end:config -->",
+            "",
+        ]
+
+    if role_doc_text:
+        lines += [
+            "<!-- mnemara:begin:role_doc -->",
+            role_doc_text.rstrip(),
+            "",
+            "<!-- mnemara:end:role_doc -->",
+            "",
+        ]
+
+    lines.append("<!-- mnemara:begin:turns -->")
     for row in rows:
         role = str(row.get("role", "unknown"))
         row_ts = str(row.get("ts", ""))
@@ -211,7 +247,49 @@ def _render_export_rows(rows: list[dict[str, Any]], instance: str) -> str:
         text = _flatten_text_blocks(row.get("content", ""))
         lines.append(text or "(no text content)")
         lines.append("")
+    lines.append("<!-- mnemara:end:turns -->")
+
     return "\n".join(lines).rstrip() + "\n"
+
+
+# Compiled once at import time; used by both export and import paths.
+_SECTION_RE = re.compile(
+    r"<!-- mnemara:begin:(\w+) -->\n(.*?)<!-- mnemara:end:\1 -->",
+    re.DOTALL,
+)
+
+# Matches "## role id" turn headers in the turns section.
+_TURN_HEADER_RE = re.compile(r"^## (user|assistant|system|tool)\s+(\d+)", re.MULTILINE)
+
+
+def _parse_export_sections(text: str) -> dict[str, str]:
+    """Return {section_name: raw_content} for every section in an export file."""
+    return {m.group(1): m.group(2) for m in _SECTION_RE.finditer(text)}
+
+
+def _parse_export_turns(turns_section: str) -> list[dict[str, Any]]:
+    """Parse the turns section back into [{role, content}] dicts.
+
+    Original store IDs are discarded; the store assigns new IDs on import.
+    Timestamps from the export are preserved in the content header comment
+    but store.append_turn() stamps a new ts at insertion time.
+    """
+    turns: list[dict[str, Any]] = []
+    # split() with 2 capture groups gives:
+    #   [preamble, role0, id0, body0, role1, id1, body1, ...]
+    blocks = _TURN_HEADER_RE.split(turns_section)
+    i = 1  # skip preamble at blocks[0]
+    while i + 2 < len(blocks):
+        role = blocks[i].strip()
+        # blocks[i+1] is the original row id — ignored on import
+        body = blocks[i + 2].strip()
+        # Strip leading _ts: ..._ line if present (metadata, not content)
+        body = re.sub(r"^_ts:[^\n]*_\n?", "", body).strip()
+        if not body:
+            body = "(no text content)"
+        turns.append({"role": role, "content": body})
+        i += 3
+    return turns
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +741,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self._slash_export(arg, chat)
             return
 
+        if cmd == "/import":
+            await self._slash_import(arg, chat)
+            return
+
         if cmd == "/stop":
             await self._slash_stop(chat)
             return
@@ -826,7 +908,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict tools            — strip tool_use blocks",
             "  /evict thinking         — strip thinking blocks",
             "  /evict N                — drop N oldest rows",
-            "  /export [N] [path]      — export rolling window to markdown",
+            "  /export [N] [path]      — export turns + config + role_doc to markdown",
+            "  /import <path>          — restore turns from a full export file",
             "  /stop                   — cancel active streaming turn",
             "  /quit, /exit            — exit",
         ]
@@ -834,7 +917,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write(line)
 
     async def _slash_export(self, arg: str, chat: "RichLog") -> None:
-        """/export [N] [path] — write rolling-window text to markdown."""
+        """/export [N] [path] — write full round-trippable markdown export."""
         parts = arg.split()
         n: int | None = None
         out_path: Path | None = None
@@ -870,16 +953,121 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 for c in self.instance
             )
             out_path = Path(tempfile.gettempdir()) / f"mnemara_{safe_instance}_{stamp}.md"
+
+        # Gather config JSON (safe — dataclasses.asdict handles nested dataclasses)
+        try:
+            cfg_json = json.dumps(dataclasses.asdict(self.cfg), indent=2)
+        except Exception:
+            cfg_json = ""
+
+        # Read role doc text if a path is configured
+        role_doc_text = ""
+        if self.cfg.role_doc_path:
+            try:
+                role_doc_text = Path(self.cfg.role_doc_path).read_text(encoding="utf-8")
+            except Exception:
+                pass
+
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(
-                _render_export_rows(rows, self.instance),
+                _render_full_export(rows, self.instance, cfg_json, role_doc_text),
                 encoding="utf-8",
             )
         except Exception as exc:
             chat.write(f"[red]export failed: {exc}[/red]")
             return
-        chat.write(f"[green]exported {len(rows)} turn(s):[/green] {out_path}")
+        sections_written = ["turns"]
+        if cfg_json:
+            sections_written.append("config")
+        if role_doc_text:
+            sections_written.append("role_doc")
+        chat.write(
+            f"[green]exported {len(rows)} turn(s):[/green] {out_path}  "
+            f"[dim](sections: {', '.join(sections_written)})[/dim]"
+        )
+
+    async def _slash_import(self, arg: str, chat: "RichLog") -> None:
+        """/import <path> — restore turns from a full export; show config/role_doc diffs."""
+        arg = arg.strip()
+        if not arg:
+            chat.write("[red]usage: /import <path>[/red]")
+            return
+        path = Path(arg).expanduser()
+        if not path.exists():
+            chat.write(f"[red]file not found: {path}[/red]")
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            chat.write(f"[red]read failed: {exc}[/red]")
+            return
+
+        sections = _parse_export_sections(text)
+        if "turns" not in sections:
+            chat.write("[red]no turns section found — is this a full mnemara export?[/red]")
+            return
+
+        turns = _parse_export_turns(sections["turns"])
+        old_count = len(self.store.window())
+        self.store.clear()
+        for t in turns:
+            self.store.append_turn(role=t["role"], content=t["content"])
+
+        chat.write(
+            f"[green]imported {len(turns)} turn(s)[/green] "
+            f"(replaced {old_count} previous turn(s) — {path.name})"
+        )
+
+        # Config diff report
+        if "config" in sections:
+            cfg_raw = sections["config"].strip()
+            # Strip ```json ... ``` fences if present
+            if cfg_raw.startswith("```"):
+                cfg_raw = "\n".join(cfg_raw.split("\n")[1:])
+            if cfg_raw.endswith("```"):
+                cfg_raw = "\n".join(cfg_raw.split("\n")[:-1])
+            try:
+                imported_cfg = json.loads(cfg_raw.strip())
+                current_dict = dataclasses.asdict(self.cfg)
+                diffs = [
+                    f"  {k}: {current_dict.get(k)!r} → {v!r}"
+                    for k, v in imported_cfg.items()
+                    if current_dict.get(k) != v
+                ]
+                if diffs:
+                    chat.write("[dim]config differences (not applied — edit config.json and restart):[/dim]")
+                    for d in diffs:
+                        chat.write(f"[dim]{d}[/dim]")
+                else:
+                    chat.write("[dim]config: matches current session[/dim]")
+            except Exception:
+                chat.write("[dim]config section present but couldn't parse[/dim]")
+
+        # Role doc diff + save
+        if "role_doc" in sections:
+            imported_rd = sections["role_doc"].strip()
+            current_text = ""
+            if self.cfg.role_doc_path:
+                try:
+                    current_text = Path(self.cfg.role_doc_path).read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+            if imported_rd == current_text:
+                chat.write("[dim]role_doc: matches current[/dim]")
+            else:
+                saved = Path("~/.mnemara").expanduser() / self.instance / "imported_role_doc.md"
+                try:
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    saved.write_text(imported_rd + "\n", encoding="utf-8")
+                    chat.write(
+                        f"[yellow]role_doc: differs from current — saved to {saved}[/yellow]\n"
+                        "[dim]set role_doc_path in config.json and restart to apply[/dim]"
+                    )
+                except Exception as exc:
+                    chat.write(f"[yellow]role_doc: differs from current (save failed: {exc})[/yellow]")
+
+        self._refresh_status()
 
     # ---------------------------------------------------------------- actions
 

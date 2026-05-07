@@ -4497,8 +4497,8 @@ def test_slash_export_last_n(home, tmp_path):
 
     config.init_instance("exp_lastn_t")
     app = tui_mod.MnemaraTUI("exp_lastn_t")
-    app.store.append_turn("user", [{"type": "text", "text": "old"}])
-    app.store.append_turn("user", [{"type": "text", "text": "new"}])
+    app.store.append_turn("user", [{"type": "text", "text": "XPREVTURN"}])
+    app.store.append_turn("user", [{"type": "text", "text": "XCURRTURN"}])
 
     chat_msgs: list[str] = []
 
@@ -4518,9 +4518,9 @@ def test_slash_export_last_n(home, tmp_path):
 
     assert written_path is not None and written_path.exists()
     content = written_path.read_text(encoding="utf-8")
-    assert "new" in content
-    # "old" turn is outside the last-1 window.
-    assert "old" not in content
+    assert "XCURRTURN" in content
+    # Previous turn is outside the last-1 window.
+    assert "XPREVTURN" not in content
     written_path.unlink()
     app.store.close()
 
@@ -4545,6 +4545,103 @@ def test_slash_export_bad_n_shows_usage(home):
     assert any("usage" in m.lower() for m in chat_msgs), (
         f"expected usage message; got {chat_msgs}"
     )
+    app.store.close()
+
+
+# ----------------------------------------------------------------------
+# export/import round-trip
+# ----------------------------------------------------------------------
+
+def test_export_import_round_trip(home, tmp_path):
+    """Full round-trip: /export writes config+role_doc+turns; /import restores them."""
+    import asyncio as _asyncio
+    from mnemara import config as cfg_mod
+    from mnemara import tui as tui_mod
+
+    cfg_mod.init_instance("rt_export_t")
+    app = tui_mod.MnemaraTUI("rt_export_t")
+    app.store.append_turn("user",      "hello from user")
+    app.store.append_turn("assistant", "hello from assistant")
+    app.store.append_turn("user",      "second user turn")
+
+    export_path = tmp_path / "export.md"
+
+    class _FakeChat:
+        msgs: list[str] = []
+        def write(self, m: str) -> None:
+            self.msgs.append(m)
+
+    chat = _FakeChat()
+    _asyncio.run(app._slash_export(str(export_path), chat))
+    assert export_path.exists(), "export file not created"
+
+    content = export_path.read_text(encoding="utf-8")
+    assert "mnemara-export-version: 1" in content
+    assert "<!-- mnemara:begin:config -->" in content
+    assert "<!-- mnemara:begin:turns -->" in content
+    assert "hello from user" in content
+    assert "hello from assistant" in content
+
+    # Now import into a fresh instance and verify turns are restored.
+    cfg_mod.init_instance("rt_import_t")
+    app2 = tui_mod.MnemaraTUI("rt_import_t")
+    # Pre-populate with a different turn that should be replaced.
+    app2.store.append_turn("user", "this should be cleared")
+
+    chat2 = _FakeChat()
+    _asyncio.run(app2._slash_import(str(export_path), chat2))
+
+    all_msgs = " ".join(chat2.msgs)
+    assert "imported 3 turn(s)" in all_msgs
+
+    restored = app2.store.window()
+    assert len(restored) == 3
+    texts = [tui_mod._flatten_text_blocks(r["content"]) for r in restored]
+    assert texts[0] == "hello from user"
+    assert texts[1] == "hello from assistant"
+    assert texts[2] == "second user turn"
+
+    app.store.close()
+    app2.store.close()
+
+
+def test_import_no_turns_section_errors(home, tmp_path):
+    """Importing a file without a turns section shows a clear error."""
+    import asyncio as _asyncio
+    from mnemara import config as cfg_mod
+    from mnemara import tui as tui_mod
+
+    cfg_mod.init_instance("rt_noturns_t")
+    app = tui_mod.MnemaraTUI("rt_noturns_t")
+    bad_file = tmp_path / "bad.md"
+    bad_file.write_text("# Just some markdown\nNo sections here.\n")
+
+    chat_msgs: list[str] = []
+    class _FakeChat:
+        def write(self, m: str) -> None:
+            chat_msgs.append(m)
+
+    _asyncio.run(app._slash_import(str(bad_file), _FakeChat()))
+    assert any("no turns section" in m for m in chat_msgs)
+    app.store.close()
+
+
+def test_import_missing_file_errors(home, tmp_path):
+    """Importing a non-existent path shows a clear error."""
+    import asyncio as _asyncio
+    from mnemara import config as cfg_mod
+    from mnemara import tui as tui_mod
+
+    cfg_mod.init_instance("rt_missing_t")
+    app = tui_mod.MnemaraTUI("rt_missing_t")
+
+    chat_msgs: list[str] = []
+    class _FakeChat:
+        def write(self, m: str) -> None:
+            chat_msgs.append(m)
+
+    _asyncio.run(app._slash_import(str(tmp_path / "does_not_exist.md"), _FakeChat()))
+    assert any("not found" in m for m in chat_msgs)
     app.store.close()
 
 
