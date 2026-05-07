@@ -4,6 +4,8 @@
 [![Python](https://img.shields.io/pypi/pyversions/mnemara.svg)](https://pypi.org/project/mnemara/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> **Note:** There is also a Rust project called [`mnemara`](https://github.com/deliberium/mnemara) by `deliberium` — a memory engine for embedded/service systems. Different project, parallel naming (both inspired by Mnemosyne). If you arrived looking for that one, head over there.
+
 **Stop your Claude agent from running away with your bill.**
 
 Mnemara is a Claude conversation runtime where the **role doc is re-read on
