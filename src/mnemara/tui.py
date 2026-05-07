@@ -858,11 +858,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._refresh_status()
 
     def _slash_evict(self, arg: str, chat: "RichLog") -> None:
-        """/evict [tools|thinking|N] — free context budget.
+        """/evict [tools|thinking|N|last N] — free context budget.
 
         /evict tools    — strip tool_use blocks from all stored rows
         /evict thinking — strip thinking blocks from all stored rows
-        /evict N        — drop the N oldest rows from the rolling window
+        /evict N        — drop the N oldest rows (budget reclaim, keeps recent context)
+        /evict last N   — drop the N most-recent rows (rollback a bad paste/turn)
         /evict          — show eviction stats
         """
         arg = arg.strip().lower()
@@ -886,10 +887,14 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 chat.write(f"[green]/evict thinking:[/green] {freed} thinking block(s) stripped")
             elif arg.isdigit():
                 n = int(arg)
+                dropped = self.store.evict_oldest(n)
+                chat.write(f"[green]/evict {n}:[/green] {dropped} oldest row(s) evicted")
+            elif arg.startswith("last ") and arg[5:].strip().isdigit():
+                n = int(arg[5:].strip())
                 dropped = self.store.evict_last(n)
-                chat.write(f"[green]/evict {n}:[/green] {dropped} row(s) evicted")
+                chat.write(f"[green]/evict last {n}:[/green] {dropped} most-recent row(s) evicted")
             else:
-                chat.write("[dim]/evict [tools|thinking|N] — see /help[/dim]")
+                chat.write("[dim]/evict [tools|thinking|N|last N] — see /help[/dim]")
                 return
         except Exception as exc:
             chat.write(f"[red]evict error: {exc}[/red]")
@@ -907,7 +912,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict                  — show eviction stats",
             "  /evict tools            — strip tool_use blocks",
             "  /evict thinking         — strip thinking blocks",
-            "  /evict N                — drop N oldest rows",
+            "  /evict N                — drop N oldest rows (budget reclaim)",
+            "  /evict last N           — drop N most-recent rows (rollback)",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",
             "  /import <path>          — restore turns from a full export file",
             "  /stop                   — cancel active streaming turn",

@@ -441,6 +441,40 @@ class Store:
             self._bump_eviction_stats(rows=n)
         return n
 
+    def evict_oldest(self, n: int, *, skip_pinned: bool = True) -> int:
+        """Delete the N oldest (lowest-id) rows. Returns count actually deleted.
+
+        This is the budget-reclaim primitive: stale history is removed while
+        keeping the most-recent context intact — the opposite of evict_last.
+
+        skip_pinned: if True (default) pinned rows are skipped when counting
+            and selecting. Pass skip_pinned=False to include pinned rows.
+        """
+        if n <= 0:
+            return 0
+        if skip_pinned:
+            cur = self.conn.execute(
+                "SELECT id FROM turns WHERE pin_label IS NULL "
+                "ORDER BY id ASC LIMIT ?",
+                (int(n),),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT id FROM turns ORDER BY id ASC LIMIT ?", (int(n),)
+            )
+        ids = [r[0] for r in cur.fetchall()]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(
+            f"DELETE FROM turns WHERE id IN ({placeholders})", ids
+        )
+        self.conn.commit()
+        n = len(ids)
+        if n:
+            self._bump_eviction_stats(rows=n)
+        return n
+
     def evict_ids(self, ids: list[int]) -> int:
         """Delete specific row ids. Returns count actually deleted.
 

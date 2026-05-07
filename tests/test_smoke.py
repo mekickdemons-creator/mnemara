@@ -1560,6 +1560,66 @@ def test_store_evict_last_drops_most_recent_rows(home):
     store.close()
 
 
+def test_store_evict_oldest_drops_oldest_rows(home):
+    """Store.evict_oldest(n) removes the N lowest-id rows, keeping recent context."""
+    from mnemara.store import Store
+
+    store = Store("evict_oldest_t")
+    for i in range(5):
+        store.append_turn("user", [{"type": "text", "text": f"msg{i}"}])
+    assert len(store.window()) == 5
+
+    # Drop the 2 oldest — msg0 and msg1 should go; msg2/3/4 survive.
+    deleted = store.evict_oldest(2)
+    assert deleted == 2
+    rows = store.window()
+    assert len(rows) == 3
+    texts = [r["content"][0]["text"] for r in rows]
+    assert texts == ["msg2", "msg3", "msg4"], f"Expected newest 3 to survive, got {texts}"
+
+    # Asking for more than available deletes what's there.
+    deleted = store.evict_oldest(99)
+    assert deleted == 3
+    assert store.window() == []
+
+    # Zero / negative is a no-op.
+    assert store.evict_oldest(0) == 0
+    assert store.evict_oldest(-1) == 0
+    store.close()
+
+
+def test_slash_evict_n_drops_oldest_not_newest(home):
+    """/evict N drops the N oldest rows — regression for evict_last/evict_oldest mixup."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("evict_order_t")
+    app = tui_mod.MnemaraTUI("evict_order_t")
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            # Insert 5 turns directly into the store.
+            for i in range(5):
+                app.store.append_turn("user", [{"type": "text", "text": f"msg{i}"}])
+            assert len(app.store.window()) == 5
+
+            # /evict 2 should drop the 2 oldest (msg0, msg1).
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/evict 2")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+            rows = app.store.window()
+            assert len(rows) == 3, f"Expected 3 rows after /evict 2, got {len(rows)}"
+            texts = [r["content"][0]["text"] for r in rows]
+            assert texts == ["msg2", "msg3", "msg4"], (
+                f"Expected oldest rows gone, got {texts}"
+            )
+
+    _asyncio.run(_run())
+
+
 def test_store_evict_ids_targets_specific_rows(home):
     """Store.evict_ids deletes only the requested ids; unknown ids ignored."""
     from mnemara.store import Store
