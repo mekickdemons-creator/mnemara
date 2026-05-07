@@ -1148,6 +1148,136 @@ def test_run_turn_raises_on_is_error_result(monkeypatch):
     _asyncio.run(_go())
 
 
+def test_overflow_recovery_happy_path(home, monkeypatch):
+    """turn_async recovers from 'Prompt is too long' by evicting and retrying.
+
+    First _run_turn raises RuntimeError("Prompt is too long ...").
+    Recovery evicts write pairs, sees tokens still above cap, evicts tool_use
+    blocks, then retries.  Second _run_turn succeeds.  turn_async returns
+    the success dict and the two eviction methods are verified as called.
+    """
+    import asyncio as _asyncio
+    from unittest.mock import MagicMock
+    from mnemara import agent as agent_mod
+    from mnemara import config
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("ovf_happy")
+    cfg = config.load("ovf_happy")
+    cfg.model = "claude-sonnet-4-6"   # ceiling = 200_000
+    cfg.max_window_tokens = 100_000   # configured cap, below ceiling
+
+    store = Store("ovf_happy")
+    perms = PermissionStore("ovf_happy")
+    runner = ToolRunner("ovf_happy", cfg, perms, prompt=lambda t, x: "deny")
+
+    _call_count = {"n": 0}
+
+    async def _fake_run_turn(prompt, options, stream,
+                             on_token=None, on_tool_use=None,
+                             on_tool_result=None, sentinel=None):
+        _call_count["n"] += 1
+        if _call_count["n"] == 1:
+            raise RuntimeError(
+                "Prompt is too long — use /evict N to free context or /clear to reset the window"
+            )
+        return {
+            "assistant_blocks": [{"type": "text", "text": "recovered ok"}],
+            "tokens_in": 10,
+            "tokens_out": 5,
+        }
+
+    monkeypatch.setattr(agent_mod, "_run_turn", _fake_run_turn)
+
+    # Mock store eviction methods so we can assert they were called.
+    store.evict_write_pairs = MagicMock(return_value={
+        "writes_stubbed": 3, "reads_stubbed": 1, "rows_modified": 2,
+        "bytes_freed": 4096, "files_seen": 2, "rows_skipped_pinned": 0,
+    })
+    # total_tokens returns above original_cap (100_000) → triggers tool_use evict
+    store.total_tokens = MagicMock(return_value=(150_000, 0))
+    store.evict_tool_use_blocks = MagicMock(return_value={
+        "rows_modified": 5, "bytes_freed": 8192, "blocks_stripped": 12,
+        "rows_skipped_pinned": 0,
+    })
+
+    session = agent_mod.AgentSession(cfg, store, runner, client=None)
+
+    async def _go():
+        return await session.turn_async("hello overflow")
+
+    usage = _asyncio.run(_go())
+
+    assert usage["input_tokens"] == 10
+    assert usage["output_tokens"] == 5
+    assert _call_count["n"] == 2, "expected exactly two _run_turn calls"
+    store.evict_write_pairs.assert_called_once_with(skip_pinned=True)
+    store.evict_tool_use_blocks.assert_called_once_with(all_rows=True, skip_pinned=True)
+    store.close()
+
+
+def test_overflow_recovery_fails_at_ceiling(home, monkeypatch):
+    """turn_async raises with ceiling context when retry also overflows.
+
+    Both _run_turn calls raise 'Prompt is too long'.  The final RuntimeError
+    must mention 'hard ceiling' so the TUI can display a meaningful message.
+    evict_write_pairs must be called (recovery was attempted before giving up).
+    """
+    import asyncio as _asyncio
+    import pytest as _pytest
+    from unittest.mock import MagicMock
+    from mnemara import agent as agent_mod
+    from mnemara import config
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("ovf_ceil")
+    cfg = config.load("ovf_ceil")
+    cfg.model = "claude-sonnet-4-6"
+    cfg.max_window_tokens = 100_000
+
+    store = Store("ovf_ceil")
+    perms = PermissionStore("ovf_ceil")
+    runner = ToolRunner("ovf_ceil", cfg, perms, prompt=lambda t, x: "deny")
+
+    async def _fake_run_turn_always_fails(prompt, options, stream,
+                                          on_token=None, on_tool_use=None,
+                                          on_tool_result=None, sentinel=None):
+        raise RuntimeError(
+            "Prompt is too long — use /evict N to free context or /clear to reset the window"
+        )
+
+    monkeypatch.setattr(agent_mod, "_run_turn", _fake_run_turn_always_fails)
+
+    store.evict_write_pairs = MagicMock(return_value={
+        "writes_stubbed": 0, "reads_stubbed": 0, "rows_modified": 0,
+        "bytes_freed": 0, "files_seen": 0, "rows_skipped_pinned": 0,
+    })
+    store.total_tokens = MagicMock(return_value=(50_000, 0))  # under cap → skip tub evict
+    store.evict_tool_use_blocks = MagicMock(return_value={
+        "rows_modified": 0, "bytes_freed": 0, "blocks_stripped": 0,
+        "rows_skipped_pinned": 0,
+    })
+
+    session = agent_mod.AgentSession(cfg, store, runner, client=None)
+
+    async def _go():
+        with _pytest.raises(RuntimeError) as exc_info:
+            await session.turn_async("hello overflow ceiling")
+        msg = str(exc_info.value).lower()
+        assert "hard ceiling" in msg, f"expected 'hard ceiling' in final error, got: {exc_info.value}"
+        assert "/evict" in msg or "/clear" in msg, f"expected hint in error, got: {exc_info.value}"
+
+    _asyncio.run(_go())
+    store.evict_write_pairs.assert_called_once_with(skip_pinned=True)
+    # tokens under cap → evict_tool_use_blocks should NOT have been called
+    store.evict_tool_use_blocks.assert_not_called()
+    store.close()
+
+
 def test_warn_if_context_near_limit_fires_above_threshold(home, monkeypatch):
     """_warn_if_context_near_limit auto-evicts and reports when rolling window >= 80%."""
     import asyncio as _asyncio

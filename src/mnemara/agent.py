@@ -109,6 +109,31 @@ _UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
 _LIST_PINNED_TOOL = "mcp__mnemara_memory__list_pinned"
 
 
+# Hard context ceilings per model family — the API's absolute token limit.
+# Used by _recover_from_overflow to gauge how aggressively to evict before
+# retrying; unlike max_window_tokens these are not user-configurable.
+_MODEL_CONTEXT_CEILING: dict[str, int] = {
+    "opus": 1_000_000,
+    "sonnet": 200_000,
+    "haiku": 200_000,
+}
+_DEFAULT_CONTEXT_CEILING = 200_000
+
+
+def _model_context_ceiling(model: str) -> int:
+    """Return the hard context token ceiling for a given model identifier.
+
+    Matches by substring — "claude-sonnet-4-6" → 200_000,
+    "claude-opus-4-7" → 1_000_000.  Returns _DEFAULT_CONTEXT_CEILING for
+    unknown models (safe underestimate, won't over-evict).
+    """
+    m = (model or "").lower()
+    for family, ceiling in _MODEL_CONTEXT_CEILING.items():
+        if family in m:
+            return ceiling
+    return _DEFAULT_CONTEXT_CEILING
+
+
 class AgentSession:
     def __init__(self, cfg: Config, store: Store, runner: ToolRunner, client: Any = None):
         if not _SDK_AVAILABLE:
@@ -192,15 +217,26 @@ class AgentSession:
 
         options = self._build_options(system_prompt)
 
-        result = await _run_turn(
-            prompt,
-            options,
-            self.cfg.stream,
-            on_token=on_token,
-            on_tool_use=on_tool_use,
-            on_tool_result=on_tool_result,
-            sentinel=self._sentinel,
-        )
+        try:
+            result = await _run_turn(
+                prompt,
+                options,
+                self.cfg.stream,
+                on_token=on_token,
+                on_tool_use=on_tool_use,
+                on_tool_result=on_tool_result,
+                sentinel=self._sentinel,
+            )
+        except RuntimeError as _overflow_exc:
+            if "Prompt is too long" not in str(_overflow_exc):
+                raise
+            result = await self._recover_from_overflow(
+                user_text=user_text,
+                options=options,
+                on_token=on_token,
+                on_tool_use=on_tool_use,
+                on_tool_result=on_tool_result,
+            )
 
         assistant_blocks = result["assistant_blocks"]
         total_in = result["tokens_in"]
@@ -263,6 +299,81 @@ class AgentSession:
                 self.tools_called[name] = self.tools_called.get(name, 0) + 1
 
         return {"input_tokens": total_in, "output_tokens": total_out, "evicted": evicted}
+
+    async def _recover_from_overflow(
+        self,
+        *,
+        user_text: str,
+        options: "ClaudeAgentOptions",
+        on_token: "OnToken | None",
+        on_tool_use: "OnToolUse | None",
+        on_tool_result: "OnToolResult | None",
+    ) -> dict[str, Any]:
+        """Self-healing recovery when the API rejects the prompt as too long.
+
+        Sequence:
+          1. Log overflow_recovery_lift with model name and hard ceiling.
+          2. evict_write_pairs(skip_pinned=True) — highest bytes freed per
+             call, audit trail (file_path) preserved.
+          3. If stored tokens are still above the *configured* cap, also run
+             evict_tool_use_blocks(all_rows=True, skip_pinned=True).
+          4. Rebuild the prompt from the trimmed store and retry once.
+          5. If the retry still overflows, log overflow_recovery_failed and
+             raise RuntimeError with the ceiling context for display.
+        """
+        model = getattr(self.cfg, "model", "") or ""
+        ceiling = _model_context_ceiling(model)
+        original_cap = self.cfg.max_window_tokens
+        log("overflow_recovery_lift",
+            model=model,
+            original_cap=original_cap,
+            ceiling=ceiling)
+
+        # Step 1: stub Edit/Write body content — max bytes freed, min info lost.
+        pair_result = self.store.evict_write_pairs(skip_pinned=True)
+        log("overflow_recovery_evict_write_pairs",
+            bytes_freed=pair_result.get("bytes_freed", 0),
+            writes_stubbed=pair_result.get("writes_stubbed", 0),
+            reads_stubbed=pair_result.get("reads_stubbed", 0))
+
+        # Step 2: if still over the configured cap, strip full tool_use blocks.
+        current_tokens, _ = self.store.total_tokens()
+        if current_tokens > original_cap:
+            tub_result = self.store.evict_tool_use_blocks(
+                all_rows=True, skip_pinned=True
+            )
+            log("overflow_recovery_evict",
+                rows_modified=tub_result.get("rows_modified", 0),
+                bytes_freed=tub_result.get("bytes_freed", 0),
+                blocks_stripped=tub_result.get("blocks_stripped", 0))
+
+        # Step 3: rebuild the prompt from the now-trimmed store and retry once.
+        prompt_retry = _build_prompt(self.store, user_text)
+        log("overflow_recovery_retry", model=model, ceiling=ceiling)
+
+        try:
+            return await _run_turn(
+                prompt_retry,
+                options,
+                self.cfg.stream,
+                on_token=on_token,
+                on_tool_use=on_tool_use,
+                on_tool_result=on_tool_result,
+                sentinel=self._sentinel,
+            )
+        except RuntimeError as retry_exc:
+            if "Prompt is too long" in str(retry_exc):
+                tokens_now, _ = self.store.total_tokens()
+                log("overflow_recovery_failed",
+                    model=model,
+                    ceiling=ceiling,
+                    tokens_after_evict=tokens_now)
+                raise RuntimeError(
+                    f"Prompt is too long even after aggressive eviction "
+                    f"({model} hard ceiling: {ceiling:,} tokens) — "
+                    "use /evict N to free context or /clear to reset the window"
+                ) from None
+            raise
 
     def write_session_stats(self) -> Optional[Path]:
         """Dump session counters to ~/.mnemara/<instance>/stats/YYYY-MM-DD.json.
