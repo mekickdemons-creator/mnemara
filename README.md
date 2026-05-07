@@ -386,7 +386,59 @@ There is also an opt-in **auto-evict-after-write** config flag
 edit/write tool call. Off by default; opt in per instance if you've
 decided that's the policy you want.
 
-## MCP wire-through
+## Gemma / Ollama backend
+
+The `gemma` branch ships an alternative backend (`GemmaSession`) that
+replaces the Claude Agent SDK with a direct Ollama `/api/chat` call.
+No API key, no Anthropic account — Ollama must be running locally.
+
+```bash
+ollama pull gemma4:26b   # or gemma3:27b
+ollama serve             # if not already running
+mnemara run --instance my-gemma-instance
+```
+
+Set `"model": "gemma4:26b"` (or any Ollama tag) in `config.json`.
+
+### MCP tool use from the Gemma backend
+
+When `mcp_servers` are configured, GemmaSession starts each server as a
+stdio subprocess on the first turn, negotiates the MCP handshake, and
+passes the available tools to Ollama via the `tools` request field.  When
+Gemma calls a tool the request is dispatched to the appropriate MCP server
+(the same permission gates as the Claude backend apply).  Results are
+appended as `role: "tool"` messages and the model is re-invoked until it
+produces a plain text response (capped at 10 tool-call iterations).
+
+Tool names are namespaced `<server>__<tool>` so multiple servers coexist
+without collision.  Grant blanket permission in `allowed_tools`:
+
+```json
+"allowed_tools": [
+  {"tool": "fetch__fetch", "mode": "allow", "allowed_patterns": []}
+]
+```
+
+**Example — add web fetch (no API key required):**
+
+```json
+"mcp_servers": [
+  {
+    "name": "fetch",
+    "command": "uvx",
+    "args": ["mcp-server-fetch"],
+    "env": {}
+  }
+]
+```
+
+`uvx` downloads and caches `mcp-server-fetch` on first use; no separate
+install step.  The model can then call `fetch__fetch` with `{"url": "..."}`.
+
+MCP servers that fail to start are logged to `debug.log` and silently
+skipped — the session continues without their tools.
+
+## MCP wire-through (Claude backend)
 
 Add an entry to `mcp_servers` in `config.json`:
 
