@@ -175,6 +175,17 @@ class Config:
     # Belt-and-suspenders with the role-doc sentinel (sentinel.md); both can
     # run simultaneously. Off by default; opt-in per instance.
     runtime_sentinel: bool = False
+    # v0.6.0 — diff-based compression for repeated Reads
+    # compress_repeated_reads: when True, /compress reads and the auto-evict
+    # hook call store.compress_repeated_reads() to stub older copies of the
+    # same file with a unified diff against the latest Read, freeing context
+    # budget while preserving the LAST Read at full fidelity (so Claude's
+    # pre-write old_string exact-match still works).
+    # preserve_compressed_reads: when True, rows with compressed_read_stub=1
+    # are excluded from cap-FIFO eviction (same soft-protect semantics as
+    # pin_label). Lets stub rows outlive their turn-count age.
+    compress_repeated_reads: bool = False
+    preserve_compressed_reads: bool = False
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7
@@ -256,6 +267,8 @@ class Config:
                 d.get("row_cap_slack_when_token_headroom", 0)
             ),
             runtime_sentinel=bool(d.get("runtime_sentinel", False)),
+            compress_repeated_reads=bool(d.get("compress_repeated_reads", False)),
+            preserve_compressed_reads=bool(d.get("preserve_compressed_reads", False)),
             graph_enabled=bool(d.get("graph_enabled", True)),
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),

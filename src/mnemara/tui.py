@@ -793,6 +793,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._slash_help(chat)
             return
 
+        if line.strip() == "/compress reads":
+            self._slash_compress_reads(chat)
+            return
+
         chat.write(
             f"[dim]unknown command: {cmd} — try /help for a full list[/dim]"
         )
@@ -932,6 +936,18 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write(f"[red]evict error: {exc}[/red]")
         self._refresh_status()
 
+    def _slash_compress_reads(self, chat: "RichLog") -> None:
+        """/compress reads — stub earlier Read tool_results with diffs vs latest."""
+        try:
+            result = self.store.compress_repeated_reads(skip_pinned=True)
+            chat.write(
+                f"[green]compressed reads:[/green] {result['reads_compressed']} read(s) stubbed, "
+                f"{result['bytes_freed']:,} bytes freed"
+            )
+        except Exception as exc:
+            chat.write(f"[red]compress reads error: {exc}[/red]")
+        self._refresh_status()
+
     def _slash_help(self, chat: "RichLog") -> None:
         """/help — list available slash commands."""
         lines = [
@@ -946,6 +962,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict thinking         — strip thinking blocks",
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
+            "  /compress reads         — stub repeated Read results with diffs",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",
             "  /import <path>          — restore turns from a full export file",
             "  /stop                   — cancel active streaming turn",

@@ -4987,3 +4987,413 @@ def test_run_turn_acloses_query_gen_on_normal_completion(monkeypatch):
     assert result["tokens_in"] == 5
     assert result["tokens_out"] == 3
     assert result["assistant_blocks"] == []
+
+
+# ----------------------------------------------------------------------
+# compress_repeated_reads — diff-based compression for repeated Reads
+# ----------------------------------------------------------------------
+
+def _make_read_pair(store, file_path: str, content: str, tu_id: str) -> tuple[int, int]:
+    """Helper: insert an assistant Read tool_use + user tool_result pair.
+
+    Returns (assistant_row_id, user_row_id).
+    """
+    asst_id = store.append_turn(
+        "assistant",
+        [
+            {
+                "type": "tool_use",
+                "id": tu_id,
+                "name": "Read",
+                "input": {"file_path": file_path},
+            }
+        ],
+    )
+    user_id = store.append_turn(
+        "user",
+        [
+            {
+                "type": "tool_result",
+                "tool_use_id": tu_id,
+                "content": content,
+            }
+        ],
+    )
+    return asst_id, user_id
+
+
+_LONG_CONTENT = "x" * 300  # 300 bytes — above min_bytes=200 threshold
+
+
+def test_compress_repeated_reads_keeps_latest_full(home):
+    """Read foo.py three times: latest stays full, earlier two get stubbed."""
+    from mnemara.store import Store
+
+    store = Store("crr_latest_full_t")
+    file_path = "/workspace/foo.py"
+
+    # Three reads with different content
+    _, uid1 = _make_read_pair(store, file_path, "version one\n" + _LONG_CONTENT, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, "version two\n" + _LONG_CONTENT, "tu2")
+    _, uid3 = _make_read_pair(store, file_path, "version three\n" + _LONG_CONTENT, "tu3")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 2
+    # bytes_freed may be negative when diff header overhead > saved bytes for
+    # short test strings; real production files save significant bytes.
+    assert "bytes_freed" in result
+
+    rows = store.window()
+    # Find the three user rows (uid1, uid2, uid3) by id
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+
+    # Latest (uid3) stays full
+    latest_content = user_rows[uid3]["content"][0]["content"]
+    assert latest_content == "version three\n" + _LONG_CONTENT, (
+        f"Latest should stay full, got: {latest_content[:80]}"
+    )
+
+    # Earlier two are stubbed
+    for uid in (uid1, uid2):
+        content = user_rows[uid]["content"][0]["content"]
+        assert content.startswith("(see turn") or content.startswith("(historical state"), (
+            f"Earlier read at uid={uid} should be stubbed, got: {content[:80]}"
+        )
+
+    store.close()
+
+
+def test_compress_repeated_reads_unchanged_uses_pointer(home):
+    """Three identical Reads: earlier two get 'content unchanged' pointer."""
+    from mnemara.store import Store
+
+    store = Store("crr_unchanged_t")
+    file_path = "/workspace/stable.py"
+    content = "def foo():\n    pass\n" + _LONG_CONTENT
+
+    _, uid1 = _make_read_pair(store, file_path, content, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, content, "tu2")
+    _, uid3 = _make_read_pair(store, file_path, content, "tu3")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 2
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+
+    # Stubs for uid1 and uid2 use "content unchanged" pattern
+    for uid in (uid1, uid2):
+        content_cell = user_rows[uid]["content"][0]["content"]
+        assert "content unchanged" in content_cell, (
+            f"Expected 'content unchanged' stub, got: {content_cell[:120]}"
+        )
+        # Should reference the last turn
+        assert str(user_rows[uid3]["id"]) in content_cell
+
+    # Latest unchanged
+    assert user_rows[uid3]["content"][0]["content"] == content
+
+    store.close()
+
+
+def test_compress_repeated_reads_modified_uses_diff(home):
+    """Reads with different content get unified diff stub."""
+    from mnemara.store import Store
+
+    store = Store("crr_diff_t")
+    file_path = "/workspace/changing.py"
+
+    v1 = "def foo():\n    return 1\n" + "a" * 200
+    v2 = "def foo():\n    return 99\n" + "a" * 200
+
+    _, uid1 = _make_read_pair(store, file_path, v1, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, v2, "tu2")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 1
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+
+    # uid1 gets a diff stub
+    stub = user_rows[uid1]["content"][0]["content"]
+    assert stub.startswith("(historical state"), (
+        f"Expected diff stub prefix, got: {stub[:80]}"
+    )
+    # Diff should contain the changed line
+    assert "return 1" in stub or "return 99" in stub or "@@" in stub, (
+        f"Expected unified diff content, got: {stub[:200]}"
+    )
+
+    # uid2 stays full
+    assert user_rows[uid2]["content"][0]["content"] == v2
+
+    store.close()
+
+
+def test_compress_repeated_reads_preserves_pre_edit_read(home):
+    """Read → (some turns) → Read: second Read is last so it stays full."""
+    from mnemara.store import Store
+
+    store = Store("crr_pre_edit_t")
+    file_path = "/workspace/edited.py"
+
+    content_before = "def bar():\n    pass\n" + "b" * 200
+    content_after = "def bar():\n    return 42\n" + "b" * 200
+
+    # First read (pre-edit state)
+    _, uid1 = _make_read_pair(store, file_path, content_before, "tu1")
+
+    # Simulate an edit turn (assistant turn)
+    store.append_turn(
+        "assistant",
+        [{"type": "tool_use", "id": "edit1", "name": "Edit",
+          "input": {"file_path": file_path,
+                    "old_string": "pass", "new_string": "return 42"}}],
+    )
+
+    # Second read (post-edit state) — this is the latest
+    _, uid2 = _make_read_pair(store, file_path, content_after, "tu2")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 1
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+
+    # Second (last) Read stays full — Edit's old_string base is still intact
+    assert user_rows[uid2]["content"][0]["content"] == content_after, (
+        "Last Read must stay full so pre-write old_string exact-match works"
+    )
+
+    # First Read is stubbed
+    stub = user_rows[uid1]["content"][0]["content"]
+    assert stub.startswith("(see turn") or stub.startswith("(historical state"), (
+        f"First Read should be stubbed, got: {stub[:80]}"
+    )
+
+    store.close()
+
+
+def test_compress_repeated_reads_skips_binary(home):
+    """Binary file content (contains \\x00) is skipped — no compression."""
+    from mnemara.store import Store
+
+    store = Store("crr_binary_t")
+    file_path = "/workspace/image.bin"
+    binary_content = "prefix\x00binary\x00data" + "z" * 200
+
+    _, uid1 = _make_read_pair(store, file_path, binary_content, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, binary_content, "tu2")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 0, (
+        "Binary files should not be compressed"
+    )
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    # Both reads preserved as-is
+    for uid in (uid1, uid2):
+        assert user_rows[uid]["content"][0]["content"] == binary_content
+
+    store.close()
+
+
+def test_compress_repeated_reads_skips_tiny_file(home):
+    """Files smaller than min_bytes (200 bytes default) are skipped."""
+    from mnemara.store import Store
+
+    store = Store("crr_tiny_t")
+    file_path = "/workspace/small.py"
+    tiny_content = "x" * 50  # only 50 bytes
+
+    _, uid1 = _make_read_pair(store, file_path, tiny_content, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, tiny_content, "tu2")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 0, (
+        "Tiny files should not be compressed (overhead > savings)"
+    )
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    for uid in (uid1, uid2):
+        assert user_rows[uid]["content"][0]["content"] == tiny_content
+
+    store.close()
+
+
+def test_compress_repeated_reads_pin_aware(home):
+    """Pinned row's Read tool_result is not stubbed when skip_pinned=True."""
+    from mnemara.store import Store
+
+    store = Store("crr_pin_t")
+    file_path = "/workspace/pinned.py"
+    content = "def pinned():\n    pass\n" + "p" * 200
+
+    _, uid1 = _make_read_pair(store, file_path, content, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, content, "tu2")
+
+    # Pin the user row that holds the first tool_result (uid1)
+    store.pin_row(uid1, "finding")
+
+    result = store.compress_repeated_reads(skip_pinned=True)
+    assert result["reads_compressed"] == 0, (
+        "Pinned read should not be stubbed with skip_pinned=True"
+    )
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    # Both reads preserved because the only candidate (uid1) is pinned
+    assert user_rows[uid1]["content"][0]["content"] == content
+
+    store.close()
+
+
+def test_preserve_compressed_reads_survives_eviction(home):
+    """With preserve_compressed_reads=True, stub rows survive cap-FIFO past their turn age."""
+    from mnemara.store import Store
+
+    store = Store("crr_preserve_t")
+    file_path = "/workspace/big.py"
+
+    # Create 3 reads — first two will be stubbed
+    _, uid1 = _make_read_pair(store, file_path, "version A\n" + "a" * 300, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, "version B\n" + "b" * 300, "tu2")
+    _, uid3 = _make_read_pair(store, file_path, "version C\n" + "c" * 300, "tu3")
+
+    # Compress with preserve flag
+    result = store.compress_repeated_reads(
+        skip_pinned=True, preserve_compressed_reads=True
+    )
+    assert result["reads_compressed"] == 2
+
+    # Verify compressed_read_stub is set on the stubbed rows
+    row_uid1 = store.conn.execute(
+        "SELECT compressed_read_stub FROM turns WHERE id=?", (uid1,)
+    ).fetchone()
+    row_uid2 = store.conn.execute(
+        "SELECT compressed_read_stub FROM turns WHERE id=?", (uid2,)
+    ).fetchone()
+    assert row_uid1[0] == 1, "uid1 should be marked as compressed_read_stub=1"
+    assert row_uid2[0] == 1, "uid2 should be marked as compressed_read_stub=1"
+
+    # Now evict with preserve_compressed_reads=True and a very tight cap
+    # The stub rows (uid1, uid2) should NOT be evicted
+    total_rows = len(store.window())
+    # Set cap to (total_rows - 2) — would normally evict 2 oldest rows
+    evicted = store.evict(
+        max_turns=total_rows - 2,
+        preserve_compressed_reads=True,
+    )
+
+    surviving_ids = {r["id"] for r in store.window()}
+    assert uid1 in surviving_ids, "Stub row uid1 should survive eviction"
+    assert uid2 in surviving_ids, "Stub row uid2 should survive eviction"
+
+    store.close()
+
+
+def test_preserve_compressed_reads_disabled_evicts_normally(home):
+    """With preserve_compressed_reads=False (default), stubs evict by normal FIFO."""
+    from mnemara.store import Store
+
+    store = Store("crr_normal_evict_t")
+    file_path = "/workspace/normal.py"
+
+    _, uid1 = _make_read_pair(store, file_path, "ver A\n" + "a" * 300, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, "ver B\n" + "b" * 300, "tu2")
+    _, uid3 = _make_read_pair(store, file_path, "ver C\n" + "c" * 300, "tu3")
+
+    # Compress WITHOUT preserve flag
+    result = store.compress_repeated_reads(
+        skip_pinned=True, preserve_compressed_reads=False
+    )
+    assert result["reads_compressed"] == 2
+
+    # Verify compressed_read_stub is NOT set
+    row_uid1 = store.conn.execute(
+        "SELECT compressed_read_stub FROM turns WHERE id=?", (uid1,)
+    ).fetchone()
+    assert (row_uid1[0] or 0) == 0, "preserve_compressed_reads=False → stub flag should be 0"
+
+    # Evict with flag disabled — stub rows are fair game
+    total_rows = len(store.window())
+    # Evict 2 rows (the two oldest, which are uid1's assistant row and uid1 itself)
+    evicted = store.evict(
+        max_turns=total_rows - 2,
+        preserve_compressed_reads=False,
+    )
+    assert evicted == 2
+
+    surviving_ids = {r["id"] for r in store.window()}
+    # uid1 (the oldest user row) and its assistant counterpart should have been evicted
+    assert uid1 not in surviving_ids, "Without preserve flag, oldest stub rows evict normally"
+
+    store.close()
+
+
+def test_slash_compress_reads_command(home):
+    """/compress reads slash command stubs repeated Reads and reports results."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("crr_slash_t")
+    app = tui_mod.MnemaraTUI("crr_slash_t")
+
+    # Insert two reads of the same file
+    file_path = "/workspace/slash_test.py"
+    content_a = "def alpha():\n    pass\n" + "a" * 300
+    content_b = "def alpha():\n    return 1\n" + "a" * 300
+
+    app.store.append_turn(
+        "assistant",
+        [{"type": "tool_use", "id": "tu1", "name": "Read",
+          "input": {"file_path": file_path}}],
+    )
+    app.store.append_turn(
+        "user",
+        [{"type": "tool_result", "tool_use_id": "tu1", "content": content_a}],
+    )
+    app.store.append_turn(
+        "assistant",
+        [{"type": "tool_use", "id": "tu2", "name": "Read",
+          "input": {"file_path": file_path}}],
+    )
+    app.store.append_turn(
+        "user",
+        [{"type": "tool_result", "tool_use_id": "tu2", "content": content_b}],
+    )
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/compress reads")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+            # Check that the store was compressed (sidebar: the chat render
+            # is hard to introspect, so we verify the store directly)
+            all_rows = app.store.window()
+            user_rows = [r for r in all_rows if r["role"] == "user"]
+            # At least one user row should be stubbed (the first Read result)
+            stubs = [
+                r for r in user_rows
+                if isinstance(r["content"], list)
+                and any(
+                    isinstance(b.get("content"), str)
+                    and (b["content"].startswith("(see turn")
+                         or b["content"].startswith("(historical state"))
+                    for b in r["content"]
+                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                )
+            ]
+            assert len(stubs) >= 1, (
+                f"Expected at least one stubbed Read after /compress reads; "
+                f"user rows: {[r['content'] for r in user_rows]}"
+            )
+
+    _asyncio.run(_run())
+    app.store.close()
