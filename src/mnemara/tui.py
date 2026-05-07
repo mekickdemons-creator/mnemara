@@ -300,7 +300,7 @@ def _parse_export_turns(turns_section: str) -> list[dict[str, Any]]:
 class _UserTextArea(TextArea):
     """Multi-line plain-text prompt area for the Mnemara panel.
 
-    Enter inserts a newline.  Ctrl+Enter submits.  Multi-line paste works
+    Enter inserts a newline.  Ctrl+S submits.  Multi-line paste works
     natively — no collapsing needed since TextArea handles newlines correctly.
 
     Tab moves focus out of the input rather than inserting whitespace
@@ -308,7 +308,7 @@ class _UserTextArea(TextArea):
     """
 
     BINDINGS = [
-        Binding("ctrl+enter", "app.submit_prompt",  "Send",        show=True),
+        Binding("ctrl+s",     "app.submit_prompt",  "Send",        show=True),
         Binding("escape",     "app.clear_input",    "Clear input", show=False),
         # Delegate page scroll to App so the chatlog scrolls even when input
         # has focus.  Without these, TextArea's own scroll handling intercepts
@@ -386,7 +386,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         )
         yield Static(self._status_text(), id="status")
         yield Static(
-            "[dim]Enter for newline · Ctrl+Enter to send · Esc to clear · Ctrl+C to quit[/dim]",
+            "[dim]Enter for newline · Ctrl+S to send · Esc to clear · Ctrl+C to quit[/dim]",
             id="keyhint",
         )
         yield _UserTextArea(
@@ -520,7 +520,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         rows = self.store.window()
         if not rows:
             log_widget.write(
-                "[dim]Tip: Enter inserts a newline. Ctrl+Enter sends.[/dim]"
+                "[dim]Tip: Enter inserts a newline. Ctrl+S sends.[/dim]"
             )
             log_widget.write("[dim](empty window — start chatting below)[/dim]")
             return
@@ -610,7 +610,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
     # ---------------------------------------------------------------- events
 
     async def action_submit_prompt(self) -> None:
-        """Ctrl+Enter handler: pull text from the TextArea and dispatch."""
+        """Ctrl+S handler: pull text from the TextArea and dispatch."""
         try:
             ta = self.query_one("#userinput", _UserTextArea)
         except Exception:
