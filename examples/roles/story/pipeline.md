@@ -32,14 +32,25 @@ Goal: surface 1-2 facts, observations, or domain details relevant to
 the user's story prompt. These will anchor the draft in something
 real.
 
-**Sources:**
-- If the user supplied research notes (in their prompt or in a
-  `research/` folder), USE those first. Cite by filename.
-- If a web-search tool is available, use it for one or two queries.
-  Cite by URL.
-- Otherwise, draw on training-data knowledge AND LABEL IT EXPLICITLY
-  as "(from training, unverified)". Do NOT pretend training-data
-  facts are sourced.
+**Sources, in priority order:**
+
+1. **User-supplied research notes** — if the user gave you research
+   in their prompt, or pointed at a `research/` folder, USE that
+   first. Cite by filename or quote.
+2. **Search tool** (if available) — call it for one or two queries
+   relevant to the prompt. Cite returned URLs.
+3. **Fetch tool** (if available, but no search tool) — pick ONE
+   canonical URL you know exists for the topic and fetch it. Good
+   defaults:
+   - `https://en.wikipedia.org/wiki/<Topic>` for general subjects
+   - `https://kernel.org/...`, `https://docs.python.org/...`,
+     project canonical sites for technical topics
+   - The arxiv abstract URL if you know the paper ID
+   USE FETCH WHEN YOU HAVE IT. Don't fall through to training data
+   if a real source is one tool call away.
+4. **Training-data knowledge** — only if 1-3 are unavailable.
+   LABEL IT EXPLICITLY as "(from training, unverified)". Never
+   pretend training-data facts are sourced.
 
 **Output format for Phase 1:**
 
