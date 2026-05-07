@@ -308,7 +308,8 @@ class _UserTextArea(TextArea):
     """
 
     BINDINGS = [
-        Binding("ctrl+enter", "app.submit_prompt", "Send", show=True),
+        Binding("ctrl+enter", "app.submit_prompt",  "Send",        show=True),
+        Binding("escape",     "app.clear_input",    "Clear input", show=False),
         # Delegate page scroll to App so the chatlog scrolls even when input
         # has focus.  Without these, TextArea's own scroll handling intercepts
         # the keys and the chatlog never receives them.
@@ -385,7 +386,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         )
         yield Static(self._status_text(), id="status")
         yield Static(
-            "[dim]Enter for newline · Ctrl+Enter to send · Ctrl+C to quit[/dim]",
+            "[dim]Enter for newline · Ctrl+Enter to send · Esc to clear · Ctrl+C to quit[/dim]",
             id="keyhint",
         )
         yield _UserTextArea(
@@ -619,6 +620,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
             return
         ta.clear()
         await self._handle_user_input(text)
+
+    def action_clear_input(self) -> None:
+        """Escape handler: discard whatever is in the input bar and refocus it."""
+        try:
+            ta = self.query_one("#userinput", _UserTextArea)
+        except Exception:
+            return
+        ta.clear()
+        ta.focus()
 
     async def _handle_user_input(self, text: str) -> None:
         """Process a submitted prompt: slash commands, queuing, or turn dispatch."""

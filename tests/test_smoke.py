@@ -617,6 +617,30 @@ def test_tui_submit_prompt_empty_is_noop(home):
     app.store.close()
 
 
+def test_tui_escape_clears_input(home):
+    """Escape (action_clear_input) wipes whatever is in the TextArea."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("esc_clear_t")
+    app = tui_mod.MnemaraTUI("esc_clear_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("some long draft text that the user wants to discard")
+            await pilot.pause()
+            assert ta.text.strip() != "", "precondition: textarea has content"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert ta.text == "", f"Escape should clear the textarea, got: {ta.text!r}"
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
 def test_tui_on_token_tolerates_missing_status_widget(home, monkeypatch):
     """on_token callback absorbs query_one failure and still accumulates the stream buffer."""
     import asyncio as _asyncio
