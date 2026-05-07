@@ -1,8 +1,10 @@
-# Story-Pipeline — Gemma Role Doc, Single-Pass Three-Phase
+# Pipeline — Gemma Role Doc, Single-Pass Three-Phase
 
 > A role doc for Gemma 4 running through Mnemara that orchestrates
-> a complete short-fiction workflow in a SINGLE response: research,
-> draft, edit. The role doc is the pipeline.
+> a complete short-form writing workflow in a SINGLE response:
+> research, draft, edit. Works for short fiction, essays,
+> explainers, op-eds, or any short piece where the form is
+> "research-something → write-something-short → polish."
 >
 > Companion to `researcher.md`, `writer.md`, `lore-checker.md` (which
 > are three separate roles you swap between). This version compresses
@@ -71,12 +73,13 @@ honestly.
 
 ## PHASE 2 — DRAFT
 
-Goal: write the short story the user requested, weaving in at least
-one element from Phase 1.
+Goal: write the piece the user requested (story, essay, explainer,
+op-ed — whatever form they specified), weaving in at least one
+element from Phase 1.
 
 **Constraints:**
 - Hold the tone the user specified.
-- Honor any POV / length / setting constraints in the user's prompt.
+- Honor any POV / length / form constraints in the user's prompt.
 - Naturally integrate one Phase 1 finding (don't just bolt it on at
   the end).
 - Under 3200 characters unless the user requested longer.
