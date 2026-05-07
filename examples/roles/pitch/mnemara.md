@@ -116,6 +116,15 @@ PyPI: `pip install mnemara` (Claude) or `pip install gemma-mnemara`
     30-60% of their context on stale Read/Bash output; these tools
     let the agent reclaim that budget without the user intervening.
 
+12. **Auto-evict-after-write with stub + audit trail.** Set
+    `auto_evict_after_write: true` in instance config and Mnemara
+    automatically calls `evict_write_pairs` after each write. This
+    stubs Read/Write `tool_use` blocks down to a small audit trail
+    — the block stays, with timestamp and ID preserved, but the
+    bulky `input` payload (file contents, diff bodies) is replaced
+    with a stub. Idempotent. Pin-aware. Defaults off; opt in for
+    coding agents that bloat fast.
+
 ---
 
 ## WHO IT'S FOR
@@ -137,12 +146,10 @@ service.
 
 ## ROADMAP (LABEL THESE AS NOT YET SHIPPED)
 
-- **Auto-eviction policy** — the eviction tools exist; what's not
-  yet shipped is automatic firing (e.g. evict Read/Write tool
-  pairs older than N turns, or after a successful follow-up
-  confirms the result is no longer needed). The agent can call
-  the eviction tools manually today; the policy layer to fire
-  them automatically is the planned 0.5.0 work.
+- **Time-based auto-eviction** — the after-write auto-policy ships
+  today; what's not yet shipped is firing based on age alone (e.g.
+  evict any Read/Write tool pair older than N turns, regardless of
+  whether a write followed). Planned for 0.5.0.
 - **Runtime Sentinel for the Gemma backend** — the runtime guard
   works against Claude via SDK hook events; porting it to Gemma's
   tool-call stream is straightforward once tool dispatch (which
