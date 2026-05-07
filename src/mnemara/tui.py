@@ -369,6 +369,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._spinner_timer = None
 
         self._render_history()
+        self._warn_if_context_near_limit()
         self._focus_input_after_refresh()
 
     def _focus_input_after_refresh(self) -> None:
@@ -381,6 +382,36 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self.call_after_refresh(_do_focus)
         except Exception:
             _do_focus()
+
+    # ---------------------------------------------------------------- startup checks
+
+    _CONTEXT_WARN_RATIO = 0.80  # warn when rolling window >= 80% of max_window_tokens
+
+    def _warn_if_context_near_limit(self) -> None:
+        """Post an inline warning if the rolling window is already near capacity.
+
+        This fires once on startup so the user can /evict or /clear before the
+        first API call fails with "Prompt is too long".
+        """
+        try:
+            max_tok = self.cfg.max_window_tokens
+            if max_tok <= 0:
+                return
+            estimated, _ = self.store.total_tokens()
+            if estimated < max_tok * self._CONTEXT_WARN_RATIO:
+                return
+            pct = int(100 * estimated / max_tok)
+            msg = (
+                f"[bold yellow]⚠ rolling window at {pct}% capacity[/bold yellow] "
+                f"(~{estimated:,} / {max_tok:,} tokens) — "
+                "use [bold]/evict N[/bold] to drop old turns or "
+                "[bold]/clear[/bold] to reset before sending, "
+                'otherwise your first message may fail with "Prompt is too long".'
+            )
+            log("context_warn_startup", estimated=estimated, max=max_tok, pct=pct)
+            self._chat().write(msg)
+        except Exception:
+            pass  # never crash startup over a warning
 
     # ---------------------------------------------------------------- chat log
 

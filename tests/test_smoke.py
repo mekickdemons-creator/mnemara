@@ -1148,6 +1148,73 @@ def test_run_turn_raises_on_is_error_result(monkeypatch):
     _asyncio.run(_go())
 
 
+def test_warn_if_context_near_limit_fires_above_threshold(home, monkeypatch):
+    """_warn_if_context_near_limit posts a warning when rolling window >= 80% capacity."""
+    import asyncio as _asyncio
+    from unittest.mock import MagicMock, patch
+
+    async def _go():
+        from mnemara.tui import MnemaraTUI
+        from mnemara.config import Config as MnemaraConfig, DEFAULT_MAX_TOKENS
+
+        app = MnemaraTUI.__new__(MnemaraTUI)
+        app.instance = "substrate"
+        app.cfg = MnemaraConfig()
+        app.cfg.max_window_tokens = DEFAULT_MAX_TOKENS  # 500_000
+
+        # Simulate the store reporting 85% usage
+        mock_store = MagicMock()
+        mock_store.total_tokens.return_value = (int(DEFAULT_MAX_TOKENS * 0.85), 0)
+        app.store = mock_store
+
+        # Capture what gets written to the chat log
+        written = []
+        mock_chat = MagicMock()
+        mock_chat.write.side_effect = written.append
+        app.query_one = MagicMock(return_value=mock_chat)
+
+        app._warn_if_context_near_limit()
+
+        assert written, "expected a warning message to be written"
+        msg = written[0]
+        assert "85%" in msg or "%" in msg, f"expected pct in message, got: {msg}"
+        assert "/evict" in msg, f"expected /evict hint in message, got: {msg}"
+        assert "/clear" in msg, f"expected /clear hint in message, got: {msg}"
+
+    _asyncio.run(_go())
+
+
+def test_warn_if_context_near_limit_silent_below_threshold(home, monkeypatch):
+    """_warn_if_context_near_limit is silent when rolling window is below 80%."""
+    import asyncio as _asyncio
+    from unittest.mock import MagicMock
+
+    async def _go():
+        from mnemara.tui import MnemaraTUI
+        from mnemara.config import Config as MnemaraConfig, DEFAULT_MAX_TOKENS
+
+        app = MnemaraTUI.__new__(MnemaraTUI)
+        app.instance = "substrate"
+        app.cfg = MnemaraConfig()
+        app.cfg.max_window_tokens = DEFAULT_MAX_TOKENS
+
+        # 60% — well below threshold
+        mock_store = MagicMock()
+        mock_store.total_tokens.return_value = (int(DEFAULT_MAX_TOKENS * 0.60), 0)
+        app.store = mock_store
+
+        written = []
+        mock_chat = MagicMock()
+        mock_chat.write.side_effect = written.append
+        app.query_one = MagicMock(return_value=mock_chat)
+
+        app._warn_if_context_near_limit()
+
+        assert not written, f"expected no warning below threshold, got: {written}"
+
+    _asyncio.run(_go())
+
+
 def test_parse_size_handles_suffixes_and_underscores():
     """tui._parse_size accepts plain ints, k/m suffixes, and underscores/commas."""
     from mnemara.tui import _parse_size
