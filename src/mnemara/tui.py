@@ -988,7 +988,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         )
 
     async def _slash_import(self, arg: str, chat: "RichLog") -> None:
-        """/import <path> — restore turns from a full export; show config/role_doc diffs."""
+        """/import <path> — restore turns from an export file (turns section only)."""
         arg = arg.strip()
         if not arg:
             chat.write("[red]usage: /import <path>[/red]")
@@ -1018,55 +1018,6 @@ class MnemaraTUI(App):  # type: ignore[misc]
             f"[green]imported {len(turns)} turn(s)[/green] "
             f"(replaced {old_count} previous turn(s) — {path.name})"
         )
-
-        # Config diff report
-        if "config" in sections:
-            cfg_raw = sections["config"].strip()
-            # Strip ```json ... ``` fences if present
-            if cfg_raw.startswith("```"):
-                cfg_raw = "\n".join(cfg_raw.split("\n")[1:])
-            if cfg_raw.endswith("```"):
-                cfg_raw = "\n".join(cfg_raw.split("\n")[:-1])
-            try:
-                imported_cfg = json.loads(cfg_raw.strip())
-                current_dict = dataclasses.asdict(self.cfg)
-                diffs = [
-                    f"  {k}: {current_dict.get(k)!r} → {v!r}"
-                    for k, v in imported_cfg.items()
-                    if current_dict.get(k) != v
-                ]
-                if diffs:
-                    chat.write("[dim]config differences (not applied — edit config.json and restart):[/dim]")
-                    for d in diffs:
-                        chat.write(f"[dim]{d}[/dim]")
-                else:
-                    chat.write("[dim]config: matches current session[/dim]")
-            except Exception:
-                chat.write("[dim]config section present but couldn't parse[/dim]")
-
-        # Role doc diff + save
-        if "role_doc" in sections:
-            imported_rd = sections["role_doc"].strip()
-            current_text = ""
-            if self.cfg.role_doc_path:
-                try:
-                    current_text = Path(self.cfg.role_doc_path).read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
-            if imported_rd == current_text:
-                chat.write("[dim]role_doc: matches current[/dim]")
-            else:
-                saved = Path("~/.mnemara").expanduser() / self.instance / "imported_role_doc.md"
-                try:
-                    saved.parent.mkdir(parents=True, exist_ok=True)
-                    saved.write_text(imported_rd + "\n", encoding="utf-8")
-                    chat.write(
-                        f"[yellow]role_doc: differs from current — saved to {saved}[/yellow]\n"
-                        "[dim]set role_doc_path in config.json and restart to apply[/dim]"
-                    )
-                except Exception as exc:
-                    chat.write(f"[yellow]role_doc: differs from current (save failed: {exc})[/yellow]")
-
         self._refresh_status()
 
     # ---------------------------------------------------------------- actions
