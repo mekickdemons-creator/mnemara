@@ -22,7 +22,9 @@ remain the source of truth for window/eviction.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -107,6 +109,7 @@ _EVICT_OLDER_THAN_TOOL = "mcp__mnemara_memory__evict_older_than"
 _PIN_ROW_TOOL = "mcp__mnemara_memory__pin_row"
 _UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
 _LIST_PINNED_TOOL = "mcp__mnemara_memory__list_pinned"
+_READ_SKELETON_TOOL = "read_skeleton"
 
 
 # Hard context ceilings per model family — the API's absolute token limit.
@@ -1594,9 +1597,15 @@ class AgentSession:
             _UNPIN_ROW_TOOL,
             _LIST_PINNED_TOOL,
         ]
+        if getattr(self.cfg, "read_skeleton_enabled", False):
+            allowed_tools.append(_READ_SKELETON_TOOL)
         for s in self.cfg.mcp_servers:
             # Permit any tool exposed by configured MCP servers.
             allowed_tools.append(f"mcp__{s.name}__*")
+
+        # File stat manifest injection (v0.7.0)
+        if getattr(self.cfg, "file_stat_manifest_enabled", False):
+            system_prompt = _inject_file_stat_manifest(system_prompt, self.store)
 
         runner = self.runner
         cfg = self.cfg
@@ -1984,3 +1993,51 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
 def _short(d: dict, n: int = 80) -> str:
     s = json.dumps(d, default=str)
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _inject_file_stat_manifest(system_prompt: str, store: Store) -> str:
+    """Append a live file state manifest table to the system_prompt.
+
+    Calls store.collect_read_stats() to find all files the agent has Read,
+    then stats each file on disk to determine freshness vs the cached hash.
+    If there are no reads in the store, the prompt is returned unchanged.
+    """
+    read_stats = store.collect_read_stats()
+    if not read_stats:
+        return system_prompt
+
+    rows: list[str] = []
+    for file_path, stats in sorted(read_stats.items()):
+        turn_id = stats["last_read_turn"]
+        cached_hash = stats["last_hash"]
+        last_size = stats["last_size"]
+        tokens_approx = last_size // 4
+
+        try:
+            stat = os.stat(file_path)
+            # Read current bytes and compute hash
+            with open(file_path, "rb") as fh:
+                current_bytes = fh.read()
+            current_hash = hashlib.sha256(current_bytes).hexdigest()[:8]
+            current_size_kb = round(stat.st_size / 1024, 1)
+            mtime_str = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+            cache_status = "fresh" if current_hash == cached_hash else "STALE"
+            rows.append(
+                f"| {file_path} | {current_size_kb} KB | {mtime_str} "
+                f"| turn {turn_id} | {cache_status} | ~{tokens_approx} |"
+            )
+        except (OSError, IOError):
+            rows.append(
+                f"| {file_path} | — | — | turn {turn_id} | gone | — |"
+            )
+
+    if not rows:
+        return system_prompt
+
+    header = (
+        "\n\n## File state manifest (live)\n"
+        "| path | size | mtime | last read | cache | tokens |\n"
+        "|---|---|---|---|---|---|\n"
+    )
+    table = header + "\n".join(rows)
+    return system_prompt + table

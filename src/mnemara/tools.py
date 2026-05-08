@@ -12,6 +12,7 @@ from . import paths
 from .config import Config
 from .logging_util import log
 from .permissions import PermissionStore, decide
+from .skeleton import extract_python_skeleton
 
 
 # JSONSchema-style tool definitions sent to the API.
@@ -79,6 +80,17 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "required": ["text"],
         },
     },
+    {
+        "name": "read_skeleton",
+        "description": "Return Python function and class signatures with docstrings only — no bodies. Use for dependency files where you only need the API surface. ~90% smaller than a full Read.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Absolute path to the Python file"},
+            },
+            "required": ["file_path"],
+        },
+    },
 ]
 
 
@@ -106,6 +118,8 @@ class ToolRunner:
                 return self._edit(params)
             if name == "WriteMemory":
                 return self._write_memory(params)
+            if name == "read_skeleton":
+                return (_read_skeleton(params), False)
             return (f"Unknown tool: {name}", True)
         except Exception as e:
             log("tool_error", tool=name, error=str(e))
@@ -217,6 +231,26 @@ class ToolRunner:
         category = params.get("category", "note")
         write_memory(self.instance, text, category, cfg=self.cfg)
         return ("Memory note appended.", False)
+
+
+def _read_skeleton(inp: dict) -> str:
+    """Read a Python file and return its skeleton (signatures + docstrings).
+
+    Returns an error string for non-Python files or missing files.
+    """
+    file_path = inp.get("file_path", "")
+    p = Path(file_path)
+    if p.suffix != ".py":
+        return (
+            f"read_skeleton supports Python only; use Read for {p.suffix} files."
+        )
+    if not p.exists():
+        return f"File not found: {file_path}"
+    try:
+        source = p.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading {file_path}: {e}"
+    return extract_python_skeleton(source)
 
 
 def write_memory(

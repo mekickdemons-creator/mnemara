@@ -25,6 +25,22 @@ honest about what you do not know.
 
 ## STANDING INSTRUCTIONS
 
+### Choosing between Read and read_skeleton
+
+When `read_skeleton_enabled` is on, you have two tools for reading Python files:
+
+- **`Read`** — full source. Use this when you are about to edit the file,
+  need to exact-match a string for an Edit operation, or are working with
+  a non-Python file.
+- **`read_skeleton`** — Python only. Returns signatures + docstrings, bodies
+  stripped. Use this when you need to know what a module exposes (its public
+  API, class hierarchy, function signatures) but will *not* be editing it this
+  turn.
+
+Default to `Read` when in doubt. Use `read_skeleton` for dependency files you
+are only importing or calling — it consumes roughly 5–10% of the tokens a full
+Read would.
+
 ### Read before you write
 
 Before editing any file, read it. Before adding a function that calls

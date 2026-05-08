@@ -1320,7 +1320,11 @@ class Store:
                 btype = block.get("type")
 
                 if btype == "tool_use":
-                    # Check if this is a Read tool call
+                    # Check if this is a Read tool call.
+                    # NOTE: case-sensitive "Read" intentionally excludes
+                    # "read_skeleton" (lowercase), so skeleton tool_uses are
+                    # never grouped with full Reads and are not subject to
+                    # compression.  Keep this check case-sensitive.
                     name = block.get("name", "")
                     if "Read" in name:
                         inp = block.get("input")
@@ -1513,6 +1517,85 @@ class Store:
             self._bump_eviction_stats(blocks=reads_compressed, bytes_=bytes_freed)
 
         return {"reads_compressed": reads_compressed, "bytes_freed": bytes_freed}
+
+    def collect_read_stats(self) -> dict[str, dict]:
+        """Walk all turns chronologically and collect stats about Read tool calls.
+
+        For each file_path that was Read, returns the MOST RECENT read's:
+          last_read_turn (int): the turn id of the most recent Read result
+          last_hash (str):      sha256[:8] of the content at that read
+          last_size (int):      len(content) at that read
+
+        Uses the same pattern as compress_repeated_reads: builds a
+        tool_use_id -> file_path map from assistant turns, then matches
+        tool_result blocks in user turns.
+
+        Returns an empty dict if no Read turns exist.
+        """
+        all_rows = list(self.conn.execute(
+            "SELECT id, content FROM turns ORDER BY id ASC"
+        ))
+
+        # Map tool_use_id -> file_path for Read calls
+        read_tool_use_map: dict[str, str] = {}
+
+        # file_path -> {last_read_turn, last_hash, last_size}
+        result: dict[str, dict] = {}
+
+        for row_id, content_str in all_rows:
+            try:
+                blocks = json.loads(content_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(blocks, list):
+                continue
+
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+
+                if btype == "tool_use":
+                    name = block.get("name", "")
+                    if "Read" in name:
+                        inp = block.get("input")
+                        if isinstance(inp, dict):
+                            fp = inp.get("file_path") or inp.get("path")
+                            if fp and isinstance(fp, str):
+                                tid = block.get("id")
+                                if tid:
+                                    read_tool_use_map[tid] = fp
+
+                elif btype == "tool_result":
+                    tool_use_id = block.get("tool_use_id")
+                    if not tool_use_id or tool_use_id not in read_tool_use_map:
+                        continue
+                    file_path = read_tool_use_map[tool_use_id]
+                    # Extract text content
+                    block_content = block.get("content")
+                    if isinstance(block_content, str):
+                        text = block_content
+                    elif isinstance(block_content, list):
+                        parts = []
+                        for cb in block_content:
+                            if isinstance(cb, dict) and cb.get("type") == "text":
+                                parts.append(cb.get("text", ""))
+                        text = "\n".join(p for p in parts if p)
+                    else:
+                        continue
+                    # Compute hash (sha256, first 8 hex chars)
+                    try:
+                        content_hash = hashlib.sha256(text.encode()).hexdigest()[:8]
+                    except Exception:
+                        continue
+                    # Overwrite on each pass — keeps only the MOST RECENT read
+                    result[file_path] = {
+                        "last_read_turn": row_id,
+                        "last_hash": content_hash,
+                        "last_size": len(text),
+                    }
+
+        return result
 
     def total_tokens(self) -> tuple[int, int]:
         """Return (estimated_stored_tokens, sum_output_tokens).
