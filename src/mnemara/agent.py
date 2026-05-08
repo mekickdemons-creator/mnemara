@@ -274,24 +274,26 @@ class AgentSession:
                 # Eviction failures must never crash a turn; audit-trail
                 # eviction is opportunistic.
                 log("auto_evict_pairs_error", error=str(exc))
-            # Also compress repeated Read results when the flag is on — this
-            # runs after evict_write_pairs so the write stubs don't interfere.
-            if getattr(self.cfg, "compress_repeated_reads", False):
-                try:
-                    cr_result = self.store.compress_repeated_reads(
-                        skip_pinned=True,
-                        preserve_compressed_reads=getattr(
-                            self.cfg, "preserve_compressed_reads", False
-                        ),
+        # Compress repeated Read results after every turn when the flag is on.
+        # Outside the auto_evict_after_write guard so it fires on read-heavy
+        # turns too, not just write turns. compress_repeated_reads is
+        # idempotent — already-stubbed rows are skipped in O(1).
+        if getattr(self.cfg, "compress_repeated_reads", False):
+            try:
+                cr_result = self.store.compress_repeated_reads(
+                    skip_pinned=True,
+                    preserve_compressed_reads=getattr(
+                        self.cfg, "preserve_compressed_reads", False
+                    ),
+                )
+                if cr_result.get("reads_compressed", 0) > 0:
+                    log(
+                        "auto_compress_reads",
+                        reads_compressed=cr_result["reads_compressed"],
+                        bytes_freed=cr_result["bytes_freed"],
                     )
-                    if cr_result.get("reads_compressed", 0) > 0:
-                        log(
-                            "auto_compress_reads",
-                            reads_compressed=cr_result["reads_compressed"],
-                            bytes_freed=cr_result["bytes_freed"],
-                        )
-                except Exception as exc:
-                    log("auto_compress_reads_error", error=str(exc))
+            except Exception as exc:
+                log("auto_compress_reads_error", error=str(exc))
         # Pass row_cap_slack so the row cap can "breathe" with the byte
         # budget after heavy block surgery. The slack is configured per
         # panel via cfg.row_cap_slack_when_token_headroom (default 0 =
