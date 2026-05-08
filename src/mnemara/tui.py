@@ -740,13 +740,19 @@ class MnemaraTUI(App):  # type: ignore[misc]
             # Only fetch rows ABOVE the persisted watermark — prevents backlog re-delivery
             # on every restart.  The watermark is advanced + saved after each detection
             # batch so future polls and restarts see only genuinely new messages.
+            # recipient_role filter: deliver rows addressed to THIS panel OR broadcast
+            # (recipient_role IS NULL).  Without this, every panel watching for
+            # "substrate"-authored messages would receive ALL substrate rows regardless
+            # of who they were addressed to — cross-panel leakage confirmed by
+            # cognition-researcher in the 2026-05-08 round-trip test (row 582).
             cur = conn.execute(
                 f"SELECT id, agent_role, task_id, payload_json, submitted_at "
                 f"FROM returns "
                 f"WHERE status='pending' AND agent_role IN ({placeholders}) "
                 f"AND id > ? "
+                f"AND (recipient_role IS NULL OR recipient_role = ?) "
                 f"ORDER BY id ASC LIMIT 20",
-                peer_roles + [self._peer_poll_watermark],
+                peer_roles + [self._peer_poll_watermark, self.instance],
             )
             for row_id, sender_role, task_id, payload_json, submitted_at in cur.fetchall():
                 try:

@@ -698,3 +698,66 @@ def test_status_bar_shows_badge_when_off_and_pending() -> None:
     tui.cfg.peer_poll_enabled = False
     status = MnemaraTUI._compute_status_text(tui)
     assert "⚡ 3" in status
+
+
+# ---------------------------------------------------------------------------
+# Recipient-role routing filter tests (regression for 2026-05-08 cross-panel leak)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_poll_delivers_rows_addressed_to_self(tmp_path: Path) -> None:
+    """Only rows with recipient_role=<self.instance> or NULL are delivered.
+
+    Regression for 2026-05-08 observation: without the recipient_role filter,
+    every panel watching for 'substrate'-authored messages received ALL substrate
+    rows regardless of who they were addressed to (cross-panel leakage).
+    """
+    import sqlite3
+
+    db = _make_muninn_db(tmp_path)
+    # Row 1: addressed to THIS panel ('substrate') — should be delivered
+    _seed_return(db, agent_role="theseus", task_id="for-me",
+                 payload={"msg": "addressed to substrate"},
+                 recipient_role="substrate")
+    # Row 2: addressed to a different panel — should NOT be delivered
+    _seed_return(db, agent_role="theseus", task_id="not-for-me",
+                 payload={"msg": "addressed to majordomo"},
+                 recipient_role="majordomo")
+    # Row 3: broadcast (recipient_role=NULL) — should be delivered
+    _seed_return(db, agent_role="theseus", task_id="broadcast",
+                 payload={"msg": "broadcast to all"},
+                 recipient_role=None)
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui.instance = "substrate"
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Only rows 1 (targeted to substrate) and 3 (broadcast) should be in pending
+    assert len(tui._peer_pending_rows) == 2
+    task_ids = {r["task_id"] for r in tui._peer_pending_rows}
+    assert "for-me" in task_ids
+    assert "broadcast" in task_ids
+    assert "not-for-me" not in task_ids
+
+
+@pytest.mark.asyncio
+async def test_poll_skips_rows_addressed_to_other_panels(tmp_path: Path) -> None:
+    """Messages addressed to a different panel are completely invisible to this one."""
+    db = _make_muninn_db(tmp_path)
+    _seed_return(db, agent_role="theseus", task_id="for-majordomo",
+                 payload={"msg": "secret for majordomo"},
+                 recipient_role="majordomo")
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui.instance = "substrate"
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Nothing delivered — the message was not for this panel
+    assert len(tui._peer_pending_rows) == 0
+    tui._process_peer_messages.assert_not_awaited()
