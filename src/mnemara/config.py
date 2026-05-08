@@ -186,6 +186,16 @@ class Config:
     # pin_label). Lets stub rows outlive their turn-count age.
     compress_repeated_reads: bool = False
     preserve_compressed_reads: bool = False
+    # v0.7.0 — skeleton reads + file stat manifest
+    # read_skeleton_enabled: when True, the read_skeleton tool is registered
+    # in the agent's allowed_tools so Claude can call it to get Python API
+    # surfaces (~90% smaller than a full Read).
+    # file_stat_manifest_enabled: when True, a live markdown table of every
+    # file the agent has Read is injected at the bottom of the system_prompt,
+    # showing current size/mtime and whether the cached content is fresh or
+    # STALE relative to the current on-disk hash.
+    read_skeleton_enabled: bool = False
+    file_stat_manifest_enabled: bool = False
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7
@@ -269,6 +279,8 @@ class Config:
             runtime_sentinel=bool(d.get("runtime_sentinel", False)),
             compress_repeated_reads=bool(d.get("compress_repeated_reads", False)),
             preserve_compressed_reads=bool(d.get("preserve_compressed_reads", False)),
+            read_skeleton_enabled=bool(d.get("read_skeleton_enabled", False)),
+            file_stat_manifest_enabled=bool(d.get("file_stat_manifest_enabled", False)),
             graph_enabled=bool(d.get("graph_enabled", True)),
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),

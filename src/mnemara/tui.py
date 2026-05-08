@@ -73,7 +73,7 @@ from .config import Config
 from .logging_util import log, set_log_path
 from .permissions import PermissionStore
 from .store import Store
-from .tools import ToolRunner
+from .tools import ToolRunner, _read_skeleton
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +797,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._slash_compress_reads(chat)
             return
 
+        if cmd == "/skeleton":
+            await self._slash_skeleton(arg)
+            return
+
         chat.write(
             f"[dim]unknown command: {cmd} — try /help for a full list[/dim]"
         )
@@ -947,6 +951,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception as exc:
             chat.write(f"[red]compress reads error: {exc}[/red]")
         self._refresh_status()
+
+    async def _slash_skeleton(self, arg: str) -> None:
+        """/skeleton <path> — display Python skeleton (signatures + docstrings only)."""
+        chat = self.query_one("#chatlog", RichLog)
+        if not arg:
+            chat.write("usage: /skeleton <path>")
+            return
+        result = _read_skeleton({"file_path": arg.strip()})
+        if len(result) > 2000:
+            result = result[:2000] + "\n[dim]... (truncated)[/dim]"
+        chat.write(result)
 
     def _slash_help(self, chat: "RichLog") -> None:
         """/help — list available slash commands."""
