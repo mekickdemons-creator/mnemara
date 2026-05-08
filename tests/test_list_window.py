@@ -1,6 +1,11 @@
 """Tests for list_window store method and MCP tool, plus inspect_context include_rows."""
 from __future__ import annotations
 
+# Skip entire module when claude_agent_sdk is not installed (gemma package).
+# _make_session() patches agent_mod.query which only exists when the SDK is present.
+import pytest
+pytest.importorskip("claude_agent_sdk")
+
 import asyncio
 import json
 from pathlib import Path

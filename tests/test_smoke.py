@@ -1,6 +1,12 @@
 """Smoke tests — no network. Exercise store, config, tools, CLI plumbing."""
 from __future__ import annotations
 
+# Skip entire module when claude_agent_sdk is not installed (gemma package).
+# Main's agent.py re-exports sdk.query; without the SDK, many tests fail at
+# import time or at the agent_mod.query attribute lookup.
+import pytest
+pytest.importorskip("claude_agent_sdk")
+
 import os
 import tempfile
 from pathlib import Path

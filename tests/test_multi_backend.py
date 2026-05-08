@@ -3,13 +3,18 @@
 No real network: Ollama embed calls are monkeypatched to deterministic
 fake vectors. RAG graceful-degradation tested by forcing the embed call
 to raise ConnectionError.
+
+NOTE: Skipped on gemma package (no claude_agent_sdk dep).
 """
 from __future__ import annotations
 
+# Skip entire module when claude_agent_sdk is not installed (gemma package).
+# AgentSession construction in multi-backend tests requires the SDK.
+import pytest
+pytest.importorskip("claude_agent_sdk")
+
 import json
 from pathlib import Path
-
-import pytest
 
 
 @pytest.fixture

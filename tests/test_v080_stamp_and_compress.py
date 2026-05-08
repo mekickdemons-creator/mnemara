@@ -4,16 +4,22 @@ rewritten collect_read_stats, and end-to-end turn_async pipeline.
 These tests exercise the REAL data paths that v0.6.0/v0.7.0 tests missed
 because they relied on fabricated tool_result rows (which are never persisted
 in production).
+
+NOTE: Skipped on gemma package (no claude_agent_sdk dep).
 """
 from __future__ import annotations
+
+# Skip entire module when claude_agent_sdk is not installed (gemma package).
+# The end-to-end turn_async test patches agent_mod.query which only exists
+# when the SDK is present.
+import pytest
+pytest.importorskip("claude_agent_sdk")
 
 import asyncio
 import hashlib
 import json
 from pathlib import Path
 from typing import Any
-
-import pytest
 
 
 # ---------------------------------------------------------------------------
