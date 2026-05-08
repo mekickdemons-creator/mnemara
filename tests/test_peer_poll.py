@@ -521,3 +521,180 @@ def test_status_bar_no_badge_when_empty() -> None:
     tui = _make_status_tui(0)
     status = MnemaraTUI._compute_status_text(tui)
     assert "⚡" not in status
+
+
+# ---------------------------------------------------------------------------
+# Inbox toggle tests
+# ---------------------------------------------------------------------------
+
+def _make_toggle_tui(tmp_path: Path, *, peer_poll_enabled: bool = True) -> MagicMock:
+    """Build a TUI-like mock suitable for testing action_check_inbox toggle."""
+    from mnemara import config as config_mod
+
+    cfg = config_mod.Config.from_dict({
+        "peer_poll_enabled": peer_poll_enabled,
+        "peer_poll_interval_seconds": 30,
+        "architect_db_path": "/unused.db",
+        "peer_poll_roles": "theseus",
+        "model": "claude-sonnet-4-6",
+    })
+
+    tui = MagicMock()
+    tui.cfg = cfg
+    tui.instance = "substrate"
+    tui._busy = False
+    tui._peer_pending_rows = []
+    tui._chat.return_value = MagicMock()
+    tui._handle_user_input = AsyncMock()
+    tui._refresh_status = MagicMock()
+    tui._update_inbox_button = MagicMock()
+    tui._process_peer_messages = AsyncMock()
+    return tui
+
+
+@pytest.mark.asyncio
+async def test_inbox_toggle_flips_config_and_saves(tmp_path: Path) -> None:
+    """action_check_inbox toggles peer_poll_enabled and persists via config_mod.save."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_toggle_tui(tmp_path, peer_poll_enabled=True)
+
+    with patch.object(config_mod, "save") as mock_save:
+        # First call: ON -> OFF
+        await MnemaraTUI.action_check_inbox(tui)
+        assert tui.cfg.peer_poll_enabled is False
+        mock_save.assert_called_once_with("substrate", tui.cfg)
+
+        mock_save.reset_mock()
+
+        # Second call: OFF -> ON
+        await MnemaraTUI.action_check_inbox(tui)
+        assert tui.cfg.peer_poll_enabled is True
+        mock_save.assert_called_once_with("substrate", tui.cfg)
+
+
+@pytest.mark.asyncio
+async def test_inbox_toggle_updates_button_each_time(tmp_path: Path) -> None:
+    """action_check_inbox calls _update_inbox_button after every toggle."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_toggle_tui(tmp_path, peer_poll_enabled=False)
+
+    with patch.object(config_mod, "save"):
+        await MnemaraTUI.action_check_inbox(tui)  # OFF -> ON
+        assert tui._update_inbox_button.call_count == 1
+
+        await MnemaraTUI.action_check_inbox(tui)  # ON -> OFF
+        assert tui._update_inbox_button.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_inbox_toggle_on_drains_pending_when_idle(tmp_path: Path) -> None:
+    """Toggling ON when there are pending rows immediately drains them."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_toggle_tui(tmp_path, peer_poll_enabled=False)
+    tui._peer_pending_rows = [
+        {"row_id": 99, "sender_role": "theseus", "task_id": "t",
+         "payload": {}, "submitted_at": "2026-05-08"},
+    ]
+
+    with patch.object(config_mod, "save"):
+        # OFF -> ON: should call _process_peer_messages since idle + pending
+        await MnemaraTUI.action_check_inbox(tui)
+
+    tui._process_peer_messages.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_inbox_toggle_on_no_drain_when_busy(tmp_path: Path) -> None:
+    """Toggling ON while busy does NOT immediately drain pending rows."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_toggle_tui(tmp_path, peer_poll_enabled=False)
+    tui._busy = True
+    tui._peer_pending_rows = [
+        {"row_id": 99, "sender_role": "theseus", "task_id": "t",
+         "payload": {}, "submitted_at": "2026-05-08"},
+    ]
+
+    with patch.object(config_mod, "save"):
+        await MnemaraTUI.action_check_inbox(tui)
+
+    # Still toggled ON
+    assert tui.cfg.peer_poll_enabled is True
+    # But _process_peer_messages should NOT fire while busy
+    tui._process_peer_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_skips_when_peer_poll_disabled(tmp_path: Path) -> None:
+    """_poll_peer_messages is a complete no-op when peer_poll_enabled=False.
+
+    No SQLite read, no badge update, no LLM turn — detection is fully skipped.
+    """
+    from mnemara.tui import MnemaraTUI
+
+    db = _make_muninn_db(tmp_path)
+    _seed_return(db, agent_role="theseus", task_id="t1",
+                 payload={"msg": "should be ignored"})
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    # Disable polling
+    tui.cfg.peer_poll_enabled = False
+    tui._process_peer_messages = AsyncMock()
+
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Nothing should have been detected or processed
+    assert len(tui._peer_pending_rows) == 0
+    assert tui._peer_poll_watermark == 0  # unchanged
+    tui._process_peer_messages.assert_not_awaited()
+    tui._refresh_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Button label tests
+# ---------------------------------------------------------------------------
+
+def test_inbox_button_label_on() -> None:
+    """_inbox_button_label returns '⚡ Inbox: ON' when peer_poll_enabled=True."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = MagicMock()
+    tui.cfg = config_mod.Config.from_dict({
+        "peer_poll_enabled": True,
+        "model": "claude-sonnet-4-6",
+    })
+    label = MnemaraTUI._inbox_button_label(tui)
+    assert label == "⚡ Inbox: ON"
+
+
+def test_inbox_button_label_off() -> None:
+    """_inbox_button_label returns '📭 Inbox: OFF' when peer_poll_enabled=False."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = MagicMock()
+    tui.cfg = config_mod.Config.from_dict({
+        "peer_poll_enabled": False,
+        "model": "claude-sonnet-4-6",
+    })
+    label = MnemaraTUI._inbox_button_label(tui)
+    assert label == "📭 Inbox: OFF"
+
+
+def test_status_bar_shows_badge_when_off_and_pending() -> None:
+    """⚡ N badge appears even when peer_poll_enabled=False (messages accumulating)."""
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_status_tui(3)
+    # Simulate polling is OFF but messages are still pending from before the toggle
+    tui.cfg.peer_poll_enabled = False
+    status = MnemaraTUI._compute_status_text(tui)
+    assert "⚡ 3" in status

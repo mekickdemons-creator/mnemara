@@ -232,6 +232,13 @@ class Config:
     peer_poll_interval_seconds: int = 30
     architect_db_path: str = ""
     peer_poll_roles: str = "theseus"
+    # peer_poll_batch: when True (default), all pending rows are processed in
+    # a single LLM turn — N messages = 1 API call.  Set to False for
+    # turn-by-turn mode: one row per LLM turn, with automatic chaining via
+    # _send_turn's finally block.  Use False when peers send large-context
+    # payloads or when running a small/local model that can't handle a
+    # multi-message batch reliably.
+    peer_poll_batch: bool = True
 
     @classmethod
     def default(cls) -> "Config":
@@ -325,6 +332,7 @@ class Config:
             peer_poll_interval_seconds=int(d.get("peer_poll_interval_seconds", 30)),
             architect_db_path=str(d.get("architect_db_path", "")),
             peer_poll_roles=str(d.get("peer_poll_roles", "theseus")),
+            peer_poll_batch=bool(d.get("peer_poll_batch", True)),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:

@@ -178,6 +178,34 @@ Screen {
 #btn-quit:focus {
     border: tall #a05050;
 }
+
+#btn-inbox {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 16;
+    margin-left: 1;
+}
+
+#btn-inbox:hover {
+    background: #2a4f7a;
+    color: #8fb6e6;
+}
+
+#btn-inbox:focus {
+    border: tall #6f9ad9;
+}
+
+.inbox-off {
+    background: #3a3a3a;
+    color: #888888;
+    border: tall #555555;
+}
+
+.inbox-off:hover {
+    background: #444444;
+    color: #aaaaaa;
+}
 """
 
 # ---------------------------------------------------------------------------
@@ -470,7 +498,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         )
         with Horizontal(id="btn-row"):
             yield Button("Send  ⌃S", id="btn-send")
-            yield Button("⚡ Inbox", id="btn-inbox")
+            yield Button(self._inbox_button_label(), id="btn-inbox")
             yield Button("Quit  ⌃C", id="btn-quit")
         yield Footer()
 
@@ -524,6 +552,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._spinner_timer = self.set_interval(0.15, self._tick_spinner)
         except Exception:
             self._spinner_timer = None
+
+        # Sync inbox button CSS class to the loaded config state.
+        self._update_inbox_button()
 
         self._render_history()
         self._warn_if_context_near_limit()
@@ -600,6 +631,24 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     # ---------------------------------------------------------------- peer poll
 
+    def _inbox_button_label(self) -> str:
+        """Return the inbox button label matching current peer_poll_enabled state."""
+        if self.cfg.peer_poll_enabled:
+            return "⚡ Inbox: ON"
+        return "📭 Inbox: OFF"
+
+    def _update_inbox_button(self) -> None:
+        """Sync the inbox button label and CSS class to current peer_poll_enabled."""
+        try:
+            btn = self.query_one("#btn-inbox", Button)
+            btn.label = self._inbox_button_label()
+            if self.cfg.peer_poll_enabled:
+                btn.remove_class("inbox-off")
+            else:
+                btn.add_class("inbox-off")
+        except Exception:
+            pass  # widget may not be mounted yet (e.g. during compose)
+
     def _watermark_path(self) -> Path:
         return Path.home() / ".mnemara" / self.instance / "peer_poll_watermark"
 
@@ -657,7 +706,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         Detection/processing split keeps token cost at zero on empty polls and
         batches N arriving messages into exactly 1 API call instead of N.
+
+        When peer_poll_enabled is False the method returns immediately — no
+        SQLite read, no badge update, no LLM turn.  The ⚡ N badge in the
+        status bar is NOT suppressed: messages that were already pending before
+        the toggle stay visible so the user can see they are accumulating.
         """
+        # Guard: skip all detection work when polling is toggled OFF.
+        if not self.cfg.peer_poll_enabled:
+            return
+
         import sqlite3 as _sqlite3
 
         db_path = self.cfg.architect_db_path or str(
@@ -920,11 +978,33 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self.action_quit()
 
     async def action_check_inbox(self) -> None:
-        """Process any pending peer messages immediately (Inbox button / /inbox)."""
-        if not self._peer_pending_rows:
-            self._chat().write("[dim]inbox: no pending peer messages[/dim]")
-            return
-        await self._process_peer_messages()
+        """Toggle peer message delivery on/off (Inbox button / /inbox).
+
+        Flips cfg.peer_poll_enabled, persists to config.json, updates the
+        button label + style live, and logs the new state to debug.log.
+        When toggled ON, any already-pending rows are processed immediately
+        if the agent is idle.
+        """
+        self.cfg.peer_poll_enabled = not self.cfg.peer_poll_enabled
+        new_state = self.cfg.peer_poll_enabled
+
+        try:
+            config_mod.save(self.instance, self.cfg)
+        except Exception as exc:
+            self._chat().write(f"[red]inbox: config save failed: {exc}[/red]")
+
+        self._update_inbox_button()
+        log("peer_poll_toggled", enabled=new_state, instance=self.instance)
+
+        state_label = "ON" if new_state else "OFF"
+        self._chat().write(
+            f"[dim]inbox: peer message delivery toggled "
+            f"[bold]{state_label}[/bold] (persisted)[/dim]"
+        )
+
+        # When turned ON, immediately drain any messages that accumulated while OFF.
+        if new_state and self._peer_pending_rows and not self._busy:
+            await self._process_peer_messages()
 
     async def _handle_user_input(self, text: str) -> None:
         """Process a submitted prompt: slash commands, queuing, or turn dispatch."""
@@ -1283,7 +1363,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
-            "  /inbox                  — process any pending peer messages now",
+            "  /inbox                  — toggle peer message delivery on/off",
             "  /name <label>           — set response label (e.g. /name Majordomo)",
             "  /name                   — clear label, revert to \"assistant\"",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",
