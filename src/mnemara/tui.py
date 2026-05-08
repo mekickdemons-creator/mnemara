@@ -804,6 +804,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self._slash_skeleton(arg)
             return
 
+        if cmd == "/name":
+            self._slash_name(arg, chat)
+            return
+
         chat.write(
             f"[dim]unknown command: {cmd} — try /help for a full list[/dim]"
         )
@@ -966,6 +970,27 @@ class MnemaraTUI(App):  # type: ignore[misc]
             result = result[:2000] + "\n[dim]... (truncated)[/dim]"
         chat.write(result)
 
+    def _slash_name(self, arg: str, chat: "RichLog") -> None:
+        """/name [label] — set or clear the display name shown on responses."""
+        import json
+
+        label = arg.strip()
+        self.cfg.display_name = label
+        cfg_path = Path.home() / ".mnemara" / self.cfg.instance / "config.json"
+        try:
+            raw: dict = json.loads(cfg_path.read_text())
+            if label:
+                raw["display_name"] = label
+            else:
+                raw.pop("display_name", None)
+            cfg_path.write_text(json.dumps(raw, indent=2))
+            if label:
+                chat.write(f'[green]display name set to "{label}" and saved to config[/green]')
+            else:
+                chat.write('[dim]display name cleared — responses will show "assistant"[/dim]')
+        except Exception as exc:
+            chat.write(f"[red]name updated in memory but config save failed: {exc}[/red]")
+
     def _slash_help(self, chat: "RichLog") -> None:
         """/help — list available slash commands."""
         lines = [
@@ -981,6 +1006,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
+            "  /name <label>           — set response label (e.g. /name Majordomo)",
+            "  /name                   — clear label, revert to \"assistant\"",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",
             "  /import <path>          — restore turns from a full export file",
             "  /stop                   — cancel active streaming turn",
