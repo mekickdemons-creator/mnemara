@@ -972,18 +972,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     def _slash_name(self, arg: str, chat: "RichLog") -> None:
         """/name [label] — set or clear the display name shown on responses."""
-        import json
-
         label = arg.strip()
         self.cfg.display_name = label
-        cfg_path = Path.home() / ".mnemara" / self.cfg.instance / "config.json"
         try:
-            raw: dict = json.loads(cfg_path.read_text())
-            if label:
-                raw["display_name"] = label
-            else:
-                raw.pop("display_name", None)
-            cfg_path.write_text(json.dumps(raw, indent=2))
+            config_mod.save(self.instance, self.cfg)
             if label:
                 chat.write(f'[green]display name set to "{label}" and saved to config[/green]')
             else:
