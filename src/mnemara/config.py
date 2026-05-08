@@ -289,6 +289,7 @@ class Config:
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),
             replay_policy_path=str(d.get("replay_policy_path", "") or ""),
+            display_name=str(d.get("display_name", "")),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:
