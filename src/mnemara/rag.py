@@ -125,7 +125,12 @@ class LanceDBStore:
         try:
             self._connect()
             emb = self._embed(question)
-            search = self._table.search(emb).limit(max(1, int(k)))
+            # Use cosine distance so _distance values are in [0, 1] and the
+            # CLUSTER_DISTANCE / DUP_DISTANCE constants in replay.py hold.
+            # Without .metric("cosine") LanceDB defaults to L2, which for
+            # un-normalized embeddings yields distances in the tens-to-hundreds
+            # range — far above the 0.35 CLUSTER_DISTANCE threshold.
+            search = self._table.search(emb).metric("cosine").limit(max(1, int(k)))
             if kind:
                 search = search.where(f"kind = '{kind}'", prefilter=True)
             rows = search.to_list()

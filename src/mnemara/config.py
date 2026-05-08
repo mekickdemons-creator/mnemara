@@ -205,6 +205,14 @@ class Config:
     replay_default_days: int = 7
     replay_default_threshold: int = 3
     replay_policy_path: str = ""  # empty = use default at <instance>/wiki/replay_policy.md
+    # v0.9.0 — category-gated replay clustering.
+    # When True, clustering only considers (atom, candidate) pairs where
+    # category matches.  Prevents category noise (e.g. "solve" atoms being
+    # diluted by cosine distance to "architecture" atoms) from washing real
+    # recurrence below CLUSTER_DISTANCE.  Near-duplicate detection is
+    # intentionally left category-blind (a dup is a dup regardless of
+    # category).  Default False → backward-compatible: existing behaviour.
+    replay_cluster_within_category: bool = False
 
     @classmethod
     def default(cls) -> "Config":
@@ -289,6 +297,9 @@ class Config:
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),
             replay_policy_path=str(d.get("replay_policy_path", "") or ""),
+            replay_cluster_within_category=bool(
+                d.get("replay_cluster_within_category", False)
+            ),
             display_name=str(d.get("display_name", "")),
         )
 
