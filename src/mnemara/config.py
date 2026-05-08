@@ -213,6 +213,19 @@ class Config:
     # intentionally left category-blind (a dup is a dup regardless of
     # category).  Default False → backward-compatible: existing behaviour.
     replay_cluster_within_category: bool = False
+    # v0.11.0 — autonomous peer-to-peer message polling.
+    # When enabled, the TUI polls muninn.db on a background timer for messages
+    # from peer panels and injects them as agent turns so the panel can ack +
+    # reply without producer relay.
+    # architect_db_path: empty = auto-detect ~/workspace/architect/muninn.db
+    # peer_poll_roles:   comma-separated sender roles to watch, e.g.
+    #                    "theseus,majordomo,cognition-researcher"
+    # peer_poll_interval_seconds: how often to poll (default 90 — within the
+    #   5-min prompt-cache TTL window to keep cache warm between turns).
+    peer_poll_enabled: bool = False
+    peer_poll_interval_seconds: int = 90
+    architect_db_path: str = ""
+    peer_poll_roles: str = "theseus"
 
     @classmethod
     def default(cls) -> "Config":
@@ -302,6 +315,10 @@ class Config:
                 d.get("replay_cluster_within_category", False)
             ),
             display_name=str(d.get("display_name", "")),
+            peer_poll_enabled=bool(d.get("peer_poll_enabled", False)),
+            peer_poll_interval_seconds=int(d.get("peer_poll_interval_seconds", 90)),
+            architect_db_path=str(d.get("architect_db_path", "")),
+            peer_poll_roles=str(d.get("peer_poll_roles", "theseus")),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:

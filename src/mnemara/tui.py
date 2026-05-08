@@ -424,6 +424,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._stream_buffer = ""
         self._queued_input: str | None = None  # input received while busy; fires after turn
 
+        # Peer-poll state (v0.11.0 autonomous inter-panel messaging).
+        self._delivered_peer_row_ids: set[int] = set()
+        self._peer_poll_timer = None  # set in on_mount when peer_poll_enabled
+
         # Spinner state.
         _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
         self._SPINNER_FRAMES = _SPINNER_FRAMES
@@ -519,6 +523,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._warn_if_context_near_limit()
         self._focus_input_after_refresh()
 
+        # Start autonomous peer-message poller if configured.
+        if self.cfg.peer_poll_enabled:
+            try:
+                interval = max(30, self.cfg.peer_poll_interval_seconds)
+                self._peer_poll_timer = self.set_interval(
+                    interval, self._poll_peer_messages
+                )
+                log("peer_poll_started", interval=interval, roles=self.cfg.peer_poll_roles)
+            except Exception:
+                self._peer_poll_timer = None
+
     def _focus_input_after_refresh(self) -> None:
         def _do_focus() -> None:
             try:
@@ -574,6 +589,92 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._refresh_status()
         except Exception:
             pass  # never crash startup over a warning
+
+    # ---------------------------------------------------------------- peer poll
+
+    async def _poll_peer_messages(self) -> None:
+        """Background timer: poll muninn.db for messages from peer panels.
+
+        Fires every peer_poll_interval_seconds (default 90).  Delivers at most
+        ONE message per tick — if the agent is busy, skip this tick entirely
+        (the row has not been added to _delivered_peer_row_ids, so it will be
+        re-discovered and delivered on the next tick after the turn completes).
+
+        The injected turn tells the agent to ack and submit a return using the
+        existing MCP tools it already knows how to call.
+        """
+        import sqlite3 as _sqlite3
+
+        db_path = self.cfg.architect_db_path or str(
+            Path.home() / "workspace" / "architect" / "muninn.db"
+        )
+        peer_roles = [
+            r.strip()
+            for r in self.cfg.peer_poll_roles.split(",")
+            if r.strip()
+        ]
+        if not peer_roles:
+            return
+
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except Exception:
+            return
+
+        try:
+            placeholders = ",".join("?" * len(peer_roles))
+            cur = conn.execute(
+                f"SELECT id, agent_role, task_id, payload_json, submitted_at "
+                f"FROM returns "
+                f"WHERE status='pending' AND agent_role IN ({placeholders}) "
+                f"ORDER BY id ASC LIMIT 20",
+                peer_roles,
+            )
+            rows = cur.fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        for row_id, sender_role, task_id, payload_json, submitted_at in rows:
+            if row_id in self._delivered_peer_row_ids:
+                continue
+            # If a turn is in flight, skip this tick entirely — retry next tick.
+            # Do NOT add to _delivered_peer_row_ids yet so we re-discover it.
+            if self._busy:
+                break
+            # Claim the row before yielding so a concurrent tick can't re-deliver.
+            self._delivered_peer_row_ids.add(row_id)
+
+            try:
+                payload = json.loads(payload_json) if payload_json else {}
+            except Exception:
+                payload = {"raw": payload_json}
+
+            topic = task_id or "(no topic)"
+            payload_pretty = json.dumps(payload, indent=2)
+            message = (
+                f"[PEER MESSAGE from {sender_role} — row_id={row_id} — topic={topic}]\n\n"
+                f"{payload_pretty}\n\n"
+                f"Process this message per your role doc protocol:\n"
+                f"1. Call mcp__architect__ack_return(row_id={row_id})\n"
+                f"2. Submit your response via mcp__architect__submit_return("
+                f'role="{self.instance}", task_id="{topic}", '
+                f'payload={{"status": "done", "summary": "..."}})'
+            )
+
+            self._chat().write(
+                f"[dim]📨 incoming from [bold]{sender_role}[/bold] "
+                f"(row_id={row_id} · topic: {topic})[/dim]"
+            )
+            log("peer_message_received", sender=sender_role, row_id=row_id, topic=topic)
+
+            await self._handle_user_input(message)
+            # One message per tick — let the agent process it before the next.
+            break
 
     # ---------------------------------------------------------------- chat log
 
