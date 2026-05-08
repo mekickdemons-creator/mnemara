@@ -217,13 +217,19 @@ class Config:
     # When enabled, the TUI polls muninn.db on a background timer for messages
     # from peer panels and injects them as agent turns so the panel can ack +
     # reply without producer relay.
+    #
+    # Detection is a pure SQLite read (zero tokens).  Processing only fires
+    # one batched LLM turn when the agent is next idle — N messages always
+    # cost exactly 1 API call regardless of how many arrive between polls.
+    #
     # architect_db_path: empty = auto-detect ~/workspace/architect/muninn.db
     # peer_poll_roles:   comma-separated sender roles to watch, e.g.
     #                    "theseus,majordomo,cognition-researcher"
-    # peer_poll_interval_seconds: how often to poll (default 90 — within the
-    #   5-min prompt-cache TTL window to keep cache warm between turns).
+    # peer_poll_interval_seconds: how often to run the SQLite detection pass.
+    #   Default 30 s — always under the 5-min awareness requirement, cheap
+    #   enough to run continuously (no LLM cost on zero-result polls).
     peer_poll_enabled: bool = False
-    peer_poll_interval_seconds: int = 90
+    peer_poll_interval_seconds: int = 30
     architect_db_path: str = ""
     peer_poll_roles: str = "theseus"
 
@@ -316,7 +322,7 @@ class Config:
             ),
             display_name=str(d.get("display_name", "")),
             peer_poll_enabled=bool(d.get("peer_poll_enabled", False)),
-            peer_poll_interval_seconds=int(d.get("peer_poll_interval_seconds", 90)),
+            peer_poll_interval_seconds=int(d.get("peer_poll_interval_seconds", 30)),
             architect_db_path=str(d.get("architect_db_path", "")),
             peer_poll_roles=str(d.get("peer_poll_roles", "theseus")),
         )

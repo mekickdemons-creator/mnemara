@@ -425,7 +425,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._queued_input: str | None = None  # input received while busy; fires after turn
 
         # Peer-poll state (v0.11.0 autonomous inter-panel messaging).
+        # _delivered_peer_row_ids: rows claimed by detection; prevents re-detection.
+        # _peer_pending_rows: detected but not yet processed; batched into one LLM turn.
         self._delivered_peer_row_ids: set[int] = set()
+        self._peer_pending_rows: list[dict] = []
         self._peer_poll_timer = None  # set in on_mount when peer_poll_enabled
 
         # Spinner state.
@@ -465,6 +468,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         )
         with Horizontal(id="btn-row"):
             yield Button("Send  ⌃S", id="btn-send")
+            yield Button("⚡ Inbox", id="btn-inbox")
             yield Button("Quit  ⌃C", id="btn-quit")
         yield Footer()
 
@@ -593,15 +597,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
     # ---------------------------------------------------------------- peer poll
 
     async def _poll_peer_messages(self) -> None:
-        """Background timer: poll muninn.db for messages from peer panels.
+        """Background timer: DETECT new peer messages in muninn.db (zero LLM cost).
 
-        Fires every peer_poll_interval_seconds (default 90).  Delivers at most
-        ONE message per tick — if the agent is busy, skip this tick entirely
-        (the row has not been added to _delivered_peer_row_ids, so it will be
-        re-discovered and delivered on the next tick after the turn completes).
+        Fires every peer_poll_interval_seconds (default 30 s).  This method
+        only reads SQLite and updates _peer_pending_rows — it never starts an
+        LLM turn.  Actual processing (one batched LLM turn) is deferred to
+        _process_peer_messages(), which fires when the agent is next idle.
 
-        The injected turn tells the agent to ack and submit a return using the
-        existing MCP tools it already knows how to call.
+        Detection/processing split keeps token cost at zero on empty polls and
+        batches N arriving messages into exactly 1 API call instead of N.
         """
         import sqlite3 as _sqlite3
 
@@ -621,6 +625,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             return
 
+        new_rows: list[dict] = []
         try:
             placeholders = ",".join("?" * len(peer_roles))
             cur = conn.execute(
@@ -630,51 +635,92 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 f"ORDER BY id ASC LIMIT 20",
                 peer_roles,
             )
-            rows = cur.fetchall()
+            for row_id, sender_role, task_id, payload_json, submitted_at in cur.fetchall():
+                if row_id in self._delivered_peer_row_ids:
+                    continue
+                # Claim immediately — prevents re-detection on the next tick.
+                self._delivered_peer_row_ids.add(row_id)
+                try:
+                    payload = json.loads(payload_json) if payload_json else {}
+                except Exception:
+                    payload = {"raw": payload_json}
+                new_rows.append({
+                    "row_id": row_id,
+                    "sender_role": sender_role,
+                    "task_id": task_id or "(no topic)",
+                    "payload": payload,
+                    "submitted_at": submitted_at,
+                })
         except Exception:
-            rows = []
+            pass
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
 
-        for row_id, sender_role, task_id, payload_json, submitted_at in rows:
-            if row_id in self._delivered_peer_row_ids:
-                continue
-            # If a turn is in flight, skip this tick entirely — retry next tick.
-            # Do NOT add to _delivered_peer_row_ids yet so we re-discover it.
-            if self._busy:
-                break
-            # Claim the row before yielding so a concurrent tick can't re-deliver.
-            self._delivered_peer_row_ids.add(row_id)
+        if new_rows:
+            self._peer_pending_rows.extend(new_rows)
+            for r in new_rows:
+                log("peer_ping_detected",
+                    sender=r["sender_role"], row_id=r["row_id"], topic=r["task_id"])
+            # Show ⚡ badge in status bar immediately (no LLM cost).
+            self._refresh_status()
+            # If idle right now, process immediately; otherwise let the
+            # _send_turn finally block drain them after the current turn ends.
+            if not self._busy:
+                await self._process_peer_messages()
 
-            try:
-                payload = json.loads(payload_json) if payload_json else {}
-            except Exception:
-                payload = {"raw": payload_json}
+    async def _process_peer_messages(self) -> None:
+        """Batch ALL pending peer rows into ONE LLM turn (called when idle).
 
-            topic = task_id or "(no topic)"
-            payload_pretty = json.dumps(payload, indent=2)
-            message = (
-                f"[PEER MESSAGE from {sender_role} — row_id={row_id} — topic={topic}]\n\n"
-                f"{payload_pretty}\n\n"
-                f"Process this message per your role doc protocol:\n"
-                f"1. Call mcp__architect__ack_return(row_id={row_id})\n"
-                f"2. Submit your response via mcp__architect__submit_return("
-                f'role="{self.instance}", task_id="{topic}", '
-                f'payload={{"status": "done", "summary": "..."}})'
+        N messages → 1 API call.  Called from:
+        - _poll_peer_messages() when not busy at detection time
+        - _send_turn()'s finally block after each turn completes
+        - action_check_inbox() (Inbox button / /inbox command)
+        """
+        if not self._peer_pending_rows or self._busy:
+            return
+
+        rows = list(self._peer_pending_rows)
+        self._peer_pending_rows.clear()
+        self._refresh_status()
+
+        count = len(rows)
+        header = f"[PEER MESSAGES — {count} pending]\n\n"
+        parts: list[str] = []
+        for i, r in enumerate(rows, 1):
+            row_id = r["row_id"]
+            sender = r["sender_role"]
+            topic = r["task_id"]
+            payload_pretty = json.dumps(r["payload"], indent=2)
+            parts.append(
+                f"--- Message {i}/{count}: from {sender} "
+                f"(row_id={row_id}, topic={topic}) ---\n{payload_pretty}"
             )
 
-            self._chat().write(
-                f"[dim]📨 incoming from [bold]{sender_role}[/bold] "
-                f"(row_id={row_id} · topic: {topic})[/dim]"
-            )
-            log("peer_message_received", sender=sender_role, row_id=row_id, topic=topic)
+        ack_lines = "\n".join(
+            f"  mcp__architect__ack_return(row_id={r['row_id']})" for r in rows
+        )
+        footer = (
+            f"\nFor each message, per your role doc protocol:\n"
+            f"1. Ack each row:\n{ack_lines}\n"
+            f"2. Submit your responses via mcp__architect__submit_return("
+            f'role="{self.instance}", task_id=<topic>, payload={{...}})'
+        )
 
-            await self._handle_user_input(message)
-            # One message per tick — let the agent process it before the next.
-            break
+        message = header + "\n\n".join(parts) + footer
+
+        # Show a single chat notice for all batched messages.
+        senders = ", ".join(r["sender_role"] for r in rows)
+        self._chat().write(
+            f"[dim]📨 [bold]{count}[/bold] peer message(s) from "
+            f"[bold]{senders}[/bold] — processing now[/dim]"
+        )
+        log("peer_messages_processing", count=count,
+            row_ids=[r["row_id"] for r in rows])
+
+        await self._handle_user_input(message)
 
     # ---------------------------------------------------------------- chat log
 
@@ -740,9 +786,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             ev_str = "0r"
         queue_str = " [yellow]⏸ queued[/yellow]" if self._queued_input is not None else ""
+        inbox_count = len(self._peer_pending_rows)
+        inbox_str = f" [bold yellow]⚡ {inbox_count}[/bold yellow]" if inbox_count > 0 else ""
         return (
             f"turns: {nturns} | tokens: {tin}/{self.cfg.max_window_tokens} (out: {tout} cum) | "
-            f"model: {self.cfg.model} | evicted: {ev_str}{queue_str}"
+            f"model: {self.cfg.model} | evicted: {ev_str}{queue_str}{inbox_str}"
         )
 
     def _status_text(self) -> str:
@@ -798,11 +846,20 @@ class MnemaraTUI(App):  # type: ignore[misc]
         ta.focus()
 
     async def on_button_pressed(self, event: "Button.Pressed") -> None:
-        """Handle Send and Quit button clicks."""
+        """Handle Send, Inbox, and Quit button clicks."""
         if event.button.id == "btn-send":
             await self.action_submit_prompt()
+        elif event.button.id == "btn-inbox":
+            await self.action_check_inbox()
         elif event.button.id == "btn-quit":
             await self.action_quit()
+
+    async def action_check_inbox(self) -> None:
+        """Process any pending peer messages immediately (Inbox button / /inbox)."""
+        if not self._peer_pending_rows:
+            self._chat().write("[dim]inbox: no pending peer messages[/dim]")
+            return
+        await self._process_peer_messages()
 
     async def _handle_user_input(self, text: str) -> None:
         """Process a submitted prompt: slash commands, queuing, or turn dispatch."""
@@ -887,13 +944,21 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._busy = False
             self._refresh_status()
             self._focus_input_after_refresh()
-            # Drain the input queue — fire the next message automatically.
+            # Drain the user input queue — fire the next message automatically.
             if self._queued_input is not None:
                 queued = self._queued_input
                 self._queued_input = None
                 self._refresh_status()
                 self.run_worker(
                     self._send_turn(queued),
+                    name="mnemara_turn",
+                    group="turn",
+                    exclusive=True,
+                )
+            # Drain any peer messages that arrived while we were busy.
+            elif self._peer_pending_rows:
+                self.run_worker(
+                    self._process_peer_messages(),
                     name="mnemara_turn",
                     group="turn",
                     exclusive=True,
@@ -957,6 +1022,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd == "/name":
             self._slash_name(arg, chat)
+            return
+
+        if cmd == "/inbox":
+            await self.action_check_inbox()
             return
 
         chat.write(
@@ -1149,6 +1218,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
+            "  /inbox                  — process any pending peer messages now",
             "  /name <label>           — set response label (e.g. /name Majordomo)",
             "  /name                   — clear label, revert to \"assistant\"",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",
