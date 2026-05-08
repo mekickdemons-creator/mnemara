@@ -1249,16 +1249,79 @@ class Store:
             n_stubbed += 1
         return new_blocks, n_stubbed
 
+    def stamp_read_cache(
+        self,
+        file_path: str,
+        content: str,
+        content_hash: str,
+    ) -> bool:
+        """Stamp _cached_content and _cached_hash into the most-recent persisted
+        tool_use block for the given file_path.
+
+        Called from the UserMessage callback in _run_turn when a Read
+        tool_result arrives.  The tool_result itself is NOT persisted (by
+        design); instead we back-patch the already-persisted tool_use block
+        so downstream analysis (compress_repeated_reads, collect_read_stats)
+        can walk tool_use rows and find the content without needing
+        tool_result rows.
+
+        Returns True if a matching row was found and updated, False otherwise.
+        """
+        # Find the most-recently inserted tool_use block with name=="Read"
+        # and input.file_path == file_path.
+        rows = self.conn.execute(
+            "SELECT id, content FROM turns ORDER BY id DESC"
+        ).fetchall()
+
+        for row_id, content_str in rows:
+            try:
+                blocks = json.loads(content_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(blocks, list):
+                continue
+            # Scan blocks in reverse to find the latest matching tool_use
+            for i in range(len(blocks) - 1, -1, -1):
+                blk = blocks[i]
+                if not isinstance(blk, dict):
+                    continue
+                if blk.get("type") != "tool_use":
+                    continue
+                if blk.get("name") != "Read":
+                    continue
+                inp = blk.get("input")
+                if not isinstance(inp, dict):
+                    continue
+                fp = inp.get("file_path") or inp.get("path")
+                if fp != file_path:
+                    continue
+                # Found the matching block — stamp it
+                new_inp = dict(inp)
+                new_inp["_cached_content"] = content
+                new_inp["_cached_hash"] = content_hash
+                blocks[i] = dict(blk)
+                blocks[i]["input"] = new_inp
+                new_str = json.dumps(blocks)
+                self.conn.execute(
+                    "UPDATE turns SET content=? WHERE id=?",
+                    (new_str, row_id),
+                )
+                self.conn.commit()
+                return True
+        return False
+
     def compress_repeated_reads(
         self,
         skip_pinned: bool = True,
         min_bytes: int = 200,
         preserve_compressed_reads: bool = False,
     ) -> dict:
-        """Compress historical Read tool_results for files read multiple times.
+        """Compress historical Read tool_use blocks for files read multiple times.
 
-        For each file that has been Read 2+ times in the rolling window,
-        keep the LAST Read at full fidelity and replace earlier Reads with:
+        Walks stored tool_use blocks that have _cached_content stamped by
+        stamp_read_cache().  For each file that has been Read 2+ times in the
+        rolling window, keep the LAST Read at full fidelity and replace earlier
+        Reads with:
           - an "unchanged" pointer if the content hash matches the last Read
           - a unified diff against the last Read otherwise
 
@@ -1267,7 +1330,7 @@ class Store:
 
         Args:
           skip_pinned: if True (default), rows with pin_label IS NOT NULL
-            are skipped over and their Read tool_results are preserved.
+            are skipped over and their Read tool_use blocks are preserved.
           min_bytes: minimum content length to compress. Reads shorter than
             this are kept full (compression overhead exceeds savings).
           preserve_compressed_reads: if True, mark modified rows with
@@ -1277,36 +1340,19 @@ class Store:
         Returns:
           {"reads_compressed": N, "bytes_freed": M}
         """
-        # Walk all stored turns chronologically; collect Read tool_use blocks
-        # paired with their immediately following tool_result blocks.
-        # The content column stores a JSON list of blocks (tool_use, tool_result,
-        # text, thinking, etc.). We need to find tool_use blocks with name
-        # containing "Read" and extract the file_path from their input, then
-        # find the tool_result block that carries the file content.
-        #
-        # NOTE: tool_result blocks live in *user* turns (they come back from
-        # the SDK in UserMessage entries). The assistant turn carries tool_use
-        # blocks. So we need to scan BOTH roles to build the map:
-        #   - assistant turn: tool_use {name: "Read", input: {file_path: ...}}
-        #   - user turn (next): tool_result {tool_use_id: ..., content: [...]}
-        #
-        # We build a {tool_use_id -> file_path} map from assistant turns,
-        # then look up tool_results by tool_use_id in user turns.
+        # Walk all stored turns chronologically; collect tool_use blocks
+        # with name=="Read" and _cached_content in their input dict.
+        # These were stamped by stamp_read_cache() when the tool_result arrived.
 
         all_rows = list(self.conn.execute(
-            "SELECT id, content, pin_label FROM turns ORDER BY id ASC"
+            "SELECT id, content, pin_label, compressed_read_stub FROM turns ORDER BY id ASC"
         ))
 
-        # Map tool_use_id -> file_path for Read calls
-        read_tool_use_map: dict[str, str] = {}
-
-        # For each file_path, accumulate (turn_id, tool_use_id, content_hash,
-        # full_content, block_index_in_content) in chronological order.
-        # block_index_in_content is the index of the tool_result block within
-        # the content list of that turn.
+        # For each file_path, accumulate entries in chronological order.
+        # Each entry: {turn_id, block_index, content_hash, full_content, pin_label, compressed}
         file_reads: dict[str, list[dict]] = {}
 
-        for row_id, content_str, pin_label in all_rows:
+        for row_id, content_str, pin_label, compressed_stub in all_rows:
             try:
                 blocks = json.loads(content_str)
             except (json.JSONDecodeError, TypeError):
@@ -1314,61 +1360,35 @@ class Store:
             if not isinstance(blocks, list):
                 continue
 
-            for block in blocks:
+            for block_idx, block in enumerate(blocks):
                 if not isinstance(block, dict):
                     continue
-                btype = block.get("type")
+                if block.get("type") != "tool_use":
+                    continue
+                # Case-sensitive "Read" — excludes "read_skeleton"
+                if block.get("name") != "Read":
+                    continue
+                inp = block.get("input")
+                if not isinstance(inp, dict):
+                    continue
+                # Only process blocks stamped with _cached_content
+                cached_content = inp.get("_cached_content")
+                if cached_content is None:
+                    continue
+                cached_hash = inp.get("_cached_hash", "")
+                fp = inp.get("file_path") or inp.get("path")
+                if not fp or not isinstance(fp, str):
+                    continue
 
-                if btype == "tool_use":
-                    # Check if this is a Read tool call.
-                    # NOTE: case-sensitive "Read" intentionally excludes
-                    # "read_skeleton" (lowercase), so skeleton tool_uses are
-                    # never grouped with full Reads and are not subject to
-                    # compression.  Keep this check case-sensitive.
-                    name = block.get("name", "")
-                    if "Read" in name:
-                        inp = block.get("input")
-                        if isinstance(inp, dict):
-                            fp = inp.get("file_path") or inp.get("path")
-                            if fp and isinstance(fp, str):
-                                tid = block.get("id")
-                                if tid:
-                                    read_tool_use_map[tid] = fp
-
-                elif btype == "tool_result":
-                    # Match against a Read tool_use_id
-                    tool_use_id = block.get("tool_use_id")
-                    if not tool_use_id or tool_use_id not in read_tool_use_map:
-                        continue
-                    file_path = read_tool_use_map[tool_use_id]
-                    # Extract text content from the tool_result
-                    block_content = block.get("content")
-                    if isinstance(block_content, str):
-                        text = block_content
-                    elif isinstance(block_content, list):
-                        # List of content blocks — extract text
-                        parts = []
-                        for cb in block_content:
-                            if isinstance(cb, dict) and cb.get("type") == "text":
-                                parts.append(cb.get("text", ""))
-                        text = "\n".join(p for p in parts if p)
-                    else:
-                        continue
-                    # Compute hash
-                    try:
-                        content_hash = hashlib.md5(text.encode()).hexdigest()
-                    except Exception:
-                        continue
-                    entry = {
-                        "turn_id": row_id,
-                        "tool_use_id": tool_use_id,
-                        "content_hash": content_hash,
-                        "full_content": text,
-                        "pin_label": pin_label,
-                    }
-                    if file_path not in file_reads:
-                        file_reads[file_path] = []
-                    file_reads[file_path].append(entry)
+                entry = {
+                    "turn_id": row_id,
+                    "block_index": block_idx,
+                    "content_hash": cached_hash,
+                    "full_content": cached_content,
+                    "pin_label": pin_label,
+                    "compressed_stub": compressed_stub,
+                }
+                file_reads.setdefault(fp, []).append(entry)
 
         reads_compressed = 0
         bytes_freed = 0
@@ -1377,34 +1397,30 @@ class Store:
             if len(reads) < 2:
                 continue
 
-            # Determine the effective "last" Read: skip entries whose content
-            # looks like a file-deleted error (starts with "Error" or similar).
-            # The last full-content entry is our canonical reference.
+            # Find the last non-stubbed entry as the canonical reference
             last_entry = None
             for entry in reversed(reads):
                 c = entry["full_content"]
-                # Skip already-stubbed entries as the reference
                 if c.startswith("(see turn") or c.startswith("(historical state"):
                     continue
                 last_entry = entry
                 break
 
             if last_entry is None:
-                # All entries are already stubbed — skip
                 continue
 
             last_turn_id = last_entry["turn_id"]
             last_hash = last_entry["content_hash"]
             last_content = last_entry["full_content"]
 
-            # Process all entries except the last full one
+            # Compress all earlier entries
             for entry in reads:
                 if entry is last_entry:
                     continue
 
                 turn_id = entry["turn_id"]
                 content = entry["full_content"]
-                tool_use_id = entry["tool_use_id"]
+                block_index = entry["block_index"]
                 entry_pin = entry["pin_label"]
 
                 # Pin check
@@ -1432,15 +1448,15 @@ class Store:
                         last_content.splitlines(keepends=True),
                         fromfile=f"turn {turn_id}",
                         tofile=f"turn {last_turn_id}",
-                        lineterm="",
                     ))
                     stub = (
                         f"(historical state at turn {turn_id}; "
-                        f"diff vs latest read at turn {last_turn_id}:)\n"
+                        f"diff vs latest read at turn {last_turn_id}:\n"
                         + "".join(diff_lines)
+                        + ")"
                     )
 
-                # Find the turn row and update it
+                # Load the row, update the specific tool_use block's input
                 row_data = self.conn.execute(
                     "SELECT content FROM turns WHERE id = ?", (turn_id,)
                 ).fetchone()
@@ -1456,44 +1472,21 @@ class Store:
 
                 orig_str = row_data[0]
                 modified = False
-                new_blocks = []
-                for blk in row_blocks:
+                new_blocks = list(row_blocks)
+                # Update the tool_use block at block_index
+                if block_index < len(new_blocks):
+                    target_blk = new_blocks[block_index]
                     if (
-                        isinstance(blk, dict)
-                        and blk.get("type") == "tool_result"
-                        and blk.get("tool_use_id") == tool_use_id
+                        isinstance(target_blk, dict)
+                        and target_blk.get("type") == "tool_use"
+                        and target_blk.get("name") == "Read"
                     ):
-                        # Replace the content with the stub
-                        new_blk = dict(blk)
-                        old_content = blk.get("content")
-                        if isinstance(old_content, str):
-                            new_blk["content"] = stub
-                        elif isinstance(old_content, list):
-                            # Replace text blocks with stub, preserve structure
-                            new_content_blocks = []
-                            replaced = False
-                            for cb in old_content:
-                                if (
-                                    isinstance(cb, dict)
-                                    and cb.get("type") == "text"
-                                    and not replaced
-                                ):
-                                    new_content_blocks.append({"type": "text", "text": stub})
-                                    replaced = True
-                                elif isinstance(cb, dict) and cb.get("type") == "text":
-                                    # Skip extra text blocks (replaced by stub)
-                                    pass
-                                else:
-                                    new_content_blocks.append(cb)
-                            if not replaced:
-                                new_content_blocks.append({"type": "text", "text": stub})
-                            new_blk["content"] = new_content_blocks
-                        else:
-                            new_blk["content"] = stub
-                        new_blocks.append(new_blk)
+                        new_blk = dict(target_blk)
+                        new_inp = dict(target_blk.get("input") or {})
+                        new_inp["_cached_content"] = stub
+                        new_blk["input"] = new_inp
+                        new_blocks[block_index] = new_blk
                         modified = True
-                    else:
-                        new_blocks.append(blk)
 
                 if not modified:
                     continue
@@ -1523,21 +1516,18 @@ class Store:
 
         For each file_path that was Read, returns the MOST RECENT read's:
           last_read_turn (int): the turn id of the most recent Read result
-          last_hash (str):      sha256[:8] of the content at that read
-          last_size (int):      len(content) at that read
+          last_hash (str):      sha256[:8] of the content at that read (from _cached_hash)
+          last_size (int):      len(_cached_content) at that read
 
-        Uses the same pattern as compress_repeated_reads: builds a
-        tool_use_id -> file_path map from assistant turns, then matches
-        tool_result blocks in user turns.
+        Walks tool_use blocks that have been stamped with _cached_content by
+        stamp_read_cache().  tool_result blocks are NOT persisted, so this
+        method operates on the enriched tool_use input dicts.
 
-        Returns an empty dict if no Read turns exist.
+        Returns an empty dict if no stamped Read turns exist.
         """
         all_rows = list(self.conn.execute(
             "SELECT id, content FROM turns ORDER BY id ASC"
         ))
-
-        # Map tool_use_id -> file_path for Read calls
-        read_tool_use_map: dict[str, str] = {}
 
         # file_path -> {last_read_turn, last_hash, last_size}
         result: dict[str, dict] = {}
@@ -1553,47 +1543,27 @@ class Store:
             for block in blocks:
                 if not isinstance(block, dict):
                     continue
-                btype = block.get("type")
-
-                if btype == "tool_use":
-                    name = block.get("name", "")
-                    if "Read" in name:
-                        inp = block.get("input")
-                        if isinstance(inp, dict):
-                            fp = inp.get("file_path") or inp.get("path")
-                            if fp and isinstance(fp, str):
-                                tid = block.get("id")
-                                if tid:
-                                    read_tool_use_map[tid] = fp
-
-                elif btype == "tool_result":
-                    tool_use_id = block.get("tool_use_id")
-                    if not tool_use_id or tool_use_id not in read_tool_use_map:
-                        continue
-                    file_path = read_tool_use_map[tool_use_id]
-                    # Extract text content
-                    block_content = block.get("content")
-                    if isinstance(block_content, str):
-                        text = block_content
-                    elif isinstance(block_content, list):
-                        parts = []
-                        for cb in block_content:
-                            if isinstance(cb, dict) and cb.get("type") == "text":
-                                parts.append(cb.get("text", ""))
-                        text = "\n".join(p for p in parts if p)
-                    else:
-                        continue
-                    # Compute hash (sha256, first 8 hex chars)
-                    try:
-                        content_hash = hashlib.sha256(text.encode()).hexdigest()[:8]
-                    except Exception:
-                        continue
-                    # Overwrite on each pass — keeps only the MOST RECENT read
-                    result[file_path] = {
-                        "last_read_turn": row_id,
-                        "last_hash": content_hash,
-                        "last_size": len(text),
-                    }
+                if block.get("type") != "tool_use":
+                    continue
+                if block.get("name") != "Read":
+                    continue
+                inp = block.get("input")
+                if not isinstance(inp, dict):
+                    continue
+                # Only count stamped blocks
+                cached_content = inp.get("_cached_content")
+                if cached_content is None:
+                    continue
+                fp = inp.get("file_path") or inp.get("path")
+                if not fp or not isinstance(fp, str):
+                    continue
+                cached_hash = inp.get("_cached_hash", "")
+                # Overwrite on each pass — keeps only the MOST RECENT read
+                result[fp] = {
+                    "last_read_turn": row_id,
+                    "last_hash": cached_hash,
+                    "last_size": len(str(cached_content)),
+                }
 
         return result
 
