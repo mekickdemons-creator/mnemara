@@ -86,8 +86,9 @@ def _make_tui(tmp_path: Path, db_path: str, peer_roles: str = "theseus",
     tui.cfg = cfg
     tui.instance = "substrate"
     tui._busy = busy
-    tui._delivered_peer_row_ids = set()
+    tui._peer_poll_watermark = 0
     tui._peer_pending_rows = []
+    tui._save_peer_poll_watermark = MagicMock()
     tui._chat.return_value = MagicMock()
     tui._handle_user_input = AsyncMock()
     tui._refresh_status = MagicMock()
@@ -145,8 +146,8 @@ async def test_poll_detect_fills_pending_no_lm_when_busy(tmp_path: Path) -> None
 
     await MnemaraTUI._poll_peer_messages(tui)
 
-    # Row must be claimed (will not be re-detected next tick).
-    assert row_id in tui._delivered_peer_row_ids
+    # Watermark must have advanced to >= row_id (will not be re-detected on restart).
+    assert tui._peer_poll_watermark >= row_id
     # Row must be in the pending list waiting for next idle window.
     assert any(r["row_id"] == row_id for r in tui._peer_pending_rows)
     # _process_peer_messages must NOT have fired (agent was busy).
@@ -169,7 +170,7 @@ async def test_poll_detect_triggers_process_when_idle(tmp_path: Path) -> None:
 
     await MnemaraTUI._poll_peer_messages(tui)
 
-    assert row_id in tui._delivered_peer_row_ids
+    assert tui._peer_poll_watermark >= row_id
     tui._process_peer_messages.assert_awaited_once()
 
 
@@ -210,22 +211,34 @@ async def test_poll_skips_non_pending_rows(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_poll_skips_already_delivered(tmp_path: Path) -> None:
-    """A row already in _delivered_peer_row_ids is not re-claimed."""
+async def test_poll_skips_rows_at_or_below_watermark(tmp_path: Path) -> None:
+    """Rows at or below the watermark are not re-delivered (restart safety).
+
+    This is the core fix for the stale-message-flood bug: when a panel restarts,
+    the watermark is loaded from disk and historical rows (id <= watermark) are
+    silently skipped.  Only rows with id > watermark are delivered.
+    """
     from mnemara.tui import MnemaraTUI
 
     db = _make_muninn_db(tmp_path)
-    row_id = _seed_return(db, agent_role="theseus", task_id="t1",
-                          payload={"msg": "hi"})
+    old_row_id = _seed_return(db, agent_role="theseus", task_id="old",
+                              payload={"msg": "stale"})
+    new_row_id = _seed_return(db, agent_role="theseus", task_id="new",
+                              payload={"msg": "fresh"})
 
     tui = _make_tui(tmp_path, str(db))
-    tui._delivered_peer_row_ids.add(row_id)
+    # Simulate a restart where watermark was saved after old_row was processed.
+    tui._peer_poll_watermark = old_row_id
     tui._process_peer_messages = AsyncMock()
 
     await MnemaraTUI._poll_peer_messages(tui)
 
-    assert len(tui._peer_pending_rows) == 0
-    tui._process_peer_messages.assert_not_awaited()
+    # Only the new row should be pending.
+    assert len(tui._peer_pending_rows) == 1
+    assert tui._peer_pending_rows[0]["row_id"] == new_row_id
+    # Watermark advanced to the new row.
+    assert tui._peer_poll_watermark == new_row_id
+    tui._process_peer_messages.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -243,8 +256,8 @@ async def test_poll_batches_multiple_rows_in_one_detection(tmp_path: Path) -> No
 
     await MnemaraTUI._poll_peer_messages(tui)
 
-    # All three rows claimed in one detection pass.
-    assert {row_id_1, row_id_2, row_id_3} == tui._delivered_peer_row_ids
+    # All three rows claimed in one detection pass; watermark advanced to max.
+    assert tui._peer_poll_watermark == max(row_id_1, row_id_2, row_id_3)
     assert len(tui._peer_pending_rows) == 3
     # _process_peer_messages called exactly once (not once per row).
     tui._process_peer_messages.assert_awaited_once()
@@ -266,7 +279,7 @@ async def test_poll_multi_role_filter(tmp_path: Path) -> None:
 
     await MnemaraTUI._poll_peer_messages(tui)
 
-    assert row_theseus in tui._delivered_peer_row_ids
+    assert tui._peer_poll_watermark >= row_theseus
     assert len(tui._peer_pending_rows) == 1
 
 
@@ -282,6 +295,51 @@ async def test_poll_handles_missing_db_gracefully(tmp_path: Path) -> None:
     await MnemaraTUI._poll_peer_messages(tui)
     assert len(tui._peer_pending_rows) == 0
     tui._process_peer_messages.assert_not_awaited()
+
+
+def test_load_watermark_bootstraps_to_current_max_on_first_run(tmp_path: Path) -> None:
+    """On first enable (no watermark file), _load_peer_poll_watermark sets watermark
+    to the current max row_id so all existing rows are skipped on the first poll.
+
+    This is the direct regression test for the stale-message-flood bug: when
+    peer_poll_enabled is first set to True, panels should not be flooded with
+    every historical pending return in muninn.db.
+    """
+    from mnemara.tui import MnemaraTUI
+
+    db = _make_muninn_db(tmp_path)
+    row_1 = _seed_return(db, agent_role="theseus", task_id="old1", payload={"x": 1})
+    row_2 = _seed_return(db, agent_role="theseus", task_id="old2", payload={"x": 2})
+    row_3 = _seed_return(db, agent_role="majordomo", task_id="old3", payload={"x": 3})
+
+    tui = _make_tui(tmp_path, str(db))
+    # Watermark file does NOT exist — simulates first run.
+    assert not (tmp_path / "peer_poll_watermark").exists()
+    # _watermark_path must return a path inside tmp_path (not real ~/.mnemara).
+    tui._watermark_path = MagicMock(return_value=tmp_path / "peer_poll_watermark")
+
+    MnemaraTUI._load_peer_poll_watermark(tui)
+
+    # Watermark should be set to max existing row_id.
+    assert tui._peer_poll_watermark == max(row_1, row_2, row_3)
+    # _save_peer_poll_watermark must have been called to persist the bootstrap value.
+    tui._save_peer_poll_watermark.assert_called_once()
+
+
+def test_load_watermark_reads_persisted_value(tmp_path: Path) -> None:
+    """On restart, _load_peer_poll_watermark reads the saved watermark from disk."""
+    from mnemara.tui import MnemaraTUI
+
+    db = _make_muninn_db(tmp_path)
+    wm_file = tmp_path / "peer_poll_watermark"
+    wm_file.write_text("42")
+
+    tui = _make_tui(tmp_path, str(db))
+    tui._watermark_path = MagicMock(return_value=wm_file)
+
+    MnemaraTUI._load_peer_poll_watermark(tui)
+
+    assert tui._peer_poll_watermark == 42
 
 
 # ---------------------------------------------------------------------------

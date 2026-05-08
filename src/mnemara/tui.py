@@ -425,9 +425,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._queued_input: str | None = None  # input received while busy; fires after turn
 
         # Peer-poll state (v0.11.0 autonomous inter-panel messaging).
-        # _delivered_peer_row_ids: rows claimed by detection; prevents re-detection.
+        # _peer_poll_watermark: persisted high-watermark (max row_id seen so far).
+        #   Only rows with id > watermark are delivered.  Persists across restarts so
+        #   historical backlog is never re-delivered.  Loaded from disk in on_mount.
         # _peer_pending_rows: detected but not yet processed; batched into one LLM turn.
-        self._delivered_peer_row_ids: set[int] = set()
+        self._peer_poll_watermark: int = 0
         self._peer_pending_rows: list[dict] = []
         self._peer_poll_timer = None  # set in on_mount when peer_poll_enabled
 
@@ -530,11 +532,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
         # Start autonomous peer-message poller if configured.
         if self.cfg.peer_poll_enabled:
             try:
+                self._load_peer_poll_watermark()
                 interval = max(30, self.cfg.peer_poll_interval_seconds)
                 self._peer_poll_timer = self.set_interval(
                     interval, self._poll_peer_messages
                 )
-                log("peer_poll_started", interval=interval, roles=self.cfg.peer_poll_roles)
+                log("peer_poll_started", interval=interval, roles=self.cfg.peer_poll_roles,
+                    watermark=self._peer_poll_watermark)
             except Exception:
                 self._peer_poll_timer = None
 
@@ -596,6 +600,53 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     # ---------------------------------------------------------------- peer poll
 
+    def _watermark_path(self) -> Path:
+        return Path.home() / ".mnemara" / self.instance / "peer_poll_watermark"
+
+    def _load_peer_poll_watermark(self) -> None:
+        """Load the persisted high-watermark from disk.
+
+        If no watermark file exists (first run with peer poll enabled), initialize
+        to the current max row_id in muninn.db so that all pre-existing rows in the
+        returns table are silently skipped — only messages submitted AFTER this
+        startup will be delivered.  This prevents the 'stale message flood' on first
+        enable.
+        """
+        import sqlite3 as _sqlite3
+
+        wm_path = self._watermark_path()
+        if wm_path.exists():
+            try:
+                self._peer_poll_watermark = int(wm_path.read_text().strip())
+                return
+            except Exception:
+                pass  # corrupted — re-initialize below
+
+        # No watermark file: bootstrap to current max row_id so backlog is skipped.
+        db_path = self.cfg.architect_db_path or str(
+            Path.home() / "workspace" / "architect" / "muninn.db"
+        )
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM returns").fetchone()
+                self._peer_poll_watermark = row[0] if row else 0
+            finally:
+                conn.close()
+        except Exception:
+            self._peer_poll_watermark = 0
+
+        self._save_peer_poll_watermark()
+        log("peer_poll_watermark_init", watermark=self._peer_poll_watermark)
+
+    def _save_peer_poll_watermark(self) -> None:
+        """Persist the current watermark to disk."""
+        try:
+            wm_path = self._watermark_path()
+            wm_path.write_text(str(self._peer_poll_watermark))
+        except Exception:
+            pass  # never crash over watermark persistence
+
     async def _poll_peer_messages(self) -> None:
         """Background timer: DETECT new peer messages in muninn.db (zero LLM cost).
 
@@ -628,18 +679,18 @@ class MnemaraTUI(App):  # type: ignore[misc]
         new_rows: list[dict] = []
         try:
             placeholders = ",".join("?" * len(peer_roles))
+            # Only fetch rows ABOVE the persisted watermark — prevents backlog re-delivery
+            # on every restart.  The watermark is advanced + saved after each detection
+            # batch so future polls and restarts see only genuinely new messages.
             cur = conn.execute(
                 f"SELECT id, agent_role, task_id, payload_json, submitted_at "
                 f"FROM returns "
                 f"WHERE status='pending' AND agent_role IN ({placeholders}) "
+                f"AND id > ? "
                 f"ORDER BY id ASC LIMIT 20",
-                peer_roles,
+                peer_roles + [self._peer_poll_watermark],
             )
             for row_id, sender_role, task_id, payload_json, submitted_at in cur.fetchall():
-                if row_id in self._delivered_peer_row_ids:
-                    continue
-                # Claim immediately — prevents re-detection on the next tick.
-                self._delivered_peer_row_ids.add(row_id)
                 try:
                     payload = json.loads(payload_json) if payload_json else {}
                 except Exception:
@@ -660,6 +711,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 pass
 
         if new_rows:
+            # Advance watermark to highest id seen; persist immediately so a crash
+            # or restart won't re-deliver these rows.
+            max_id = max(r["row_id"] for r in new_rows)
+            if max_id > self._peer_poll_watermark:
+                self._peer_poll_watermark = max_id
+                self._save_peer_poll_watermark()
+
             self._peer_pending_rows.extend(new_rows)
             for r in new_rows:
                 log("peer_ping_detected",
@@ -682,8 +740,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
         if not self._peer_pending_rows or self._busy:
             return
 
-        rows = list(self._peer_pending_rows)
-        self._peer_pending_rows.clear()
+        # Batch mode (default): consume all pending rows in one LLM turn.
+        # Turn-by-turn mode (peer_poll_batch=False): consume only the first
+        # row; the remainder stay in _peer_pending_rows and are drained by
+        # _send_turn's finally block after this turn completes.
+        if self.cfg.peer_poll_batch:
+            rows = list(self._peer_pending_rows)
+            self._peer_pending_rows.clear()
+        else:
+            rows = [self._peer_pending_rows.pop(0)]
         self._refresh_status()
 
         count = len(rows)
