@@ -196,11 +196,23 @@ class Config:
     # STALE relative to the current on-disk hash.
     read_skeleton_enabled: bool = False
     file_stat_manifest_enabled: bool = False
+    # display — cosmetic label shown in the TUI chat log instead of "assistant"
+    # Set to e.g. "Substrate-engineer" or "Majordomo" to make panel identity
+    # visible at a glance. Empty string = keep default "assistant".
+    display_name: str = ""
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7
     replay_default_threshold: int = 3
     replay_policy_path: str = ""  # empty = use default at <instance>/wiki/replay_policy.md
+    # v0.9.0 — category-gated replay clustering.
+    # When True, clustering only considers (atom, candidate) pairs where
+    # category matches.  Prevents category noise (e.g. "solve" atoms being
+    # diluted by cosine distance to "architecture" atoms) from washing real
+    # recurrence below CLUSTER_DISTANCE.  Near-duplicate detection is
+    # intentionally left category-blind (a dup is a dup regardless of
+    # category).  Default False → backward-compatible: existing behaviour.
+    replay_cluster_within_category: bool = False
 
     @classmethod
     def default(cls) -> "Config":
@@ -237,6 +249,7 @@ class Config:
                 ToolPolicy(tool="PinRow", mode="allow"),
                 ToolPolicy(tool="UnpinRow", mode="allow"),
                 ToolPolicy(tool="ListPinned", mode="allow"),
+                ToolPolicy(tool="ListWindow", mode="allow"),
             ]
         )
 
@@ -285,6 +298,10 @@ class Config:
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),
             replay_policy_path=str(d.get("replay_policy_path", "") or ""),
+            replay_cluster_within_category=bool(
+                d.get("replay_cluster_within_category", False)
+            ),
+            display_name=str(d.get("display_name", "")),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:

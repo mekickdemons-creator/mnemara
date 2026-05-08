@@ -427,6 +427,81 @@ def test_structured_write_memory_payload(home):
     assert "] legacy" in text2
 
 
+def test_write_memory_20_rapid_calls_all_succeed(home, monkeypatch):
+    """Regression test for write_memory stream-closed errors (v0.10.1).
+
+    Calls write_memory 20 times in rapid succession via the _registered_tools
+    MCP handler — the same code path used in production panels.  All 20 calls
+    must return ok=True and all 20 entries must appear in the memory file.
+
+    Root cause being guarded: tools_mod.write_memory is synchronous and may
+    do blocking I/O (file append + optional RAG HTTP embed + graph edges).
+    When called directly from the async _write_memory_tool handler without
+    offloading to a thread, rapid back-to-back calls block the event loop,
+    starve _read_messages, and fill the CLI subprocess's stdout pipe — causing
+    the bidirectional control stream to deadlock and produce "stream closed"
+    errors at 30-50% failure rate.  The fix is asyncio.to_thread() in the
+    handler so blocking I/O runs off-loop.
+    """
+    import asyncio as _asyncio
+    from mnemara import agent as agent_mod, config, paths
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("wm_rapid_t")
+    cfg = config.load("wm_rapid_t")
+    store = Store("wm_rapid_t")
+    perms = PermissionStore("wm_rapid_t")
+    runner = ToolRunner("wm_rapid_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    async def _fake_query(*, prompt, options, transport=None):
+        async for _ in prompt:
+            break
+        if False:
+            yield None
+
+    monkeypatch.setattr(agent_mod, "query", _fake_query)
+
+    session = agent_mod.AgentSession(cfg, store, runner)
+    session.turn("init")
+
+    handler = session._registered_tools.get("write_memory")
+    assert handler is not None, "write_memory must be in _registered_tools"
+
+    N = 20
+    markers = [f"RAPID_ENTRY_{i:02d}" for i in range(N)]
+
+    async def _run() -> list[bool]:
+        results = []
+        for i, marker in enumerate(markers):
+            result = await handler({"text": marker, "category": "rapid_test"})
+            content = result.get("content", [])
+            text = content[0]["text"] if content else ""
+            is_ok = not result.get("is_error", False) and "error" not in text.lower()
+            results.append(is_ok)
+        return results
+
+    call_results = _asyncio.run(_run())
+
+    # All 20 calls must return success
+    failures = [markers[i] for i, ok in enumerate(call_results) if not ok]
+    assert not failures, f"{len(failures)}/20 calls returned error: {failures}"
+    assert all(call_results), f"call results: {call_results}"
+
+    # All 20 entries must be present in the memory file
+    mem_dir = paths.memory_dir("wm_rapid_t")
+    mem_files = list(mem_dir.glob("*.md"))
+    assert mem_files, "no memory file created"
+    combined = "\n".join(f.read_text() for f in mem_files)
+    missing = [m for m in markers if m not in combined]
+    assert not missing, (
+        f"{len(missing)}/20 entries missing from memory file: {missing!r}"
+    )
+
+    store.close()
+
+
 def test_session_stats_dump_merges(home):
     import json as _json
     from datetime import datetime, timezone
@@ -583,6 +658,86 @@ def test_cli_list_show_clear(home):
     assert r.exit_code == 0
 
 
+def test_migrate_all_brings_panels_to_current_schema(home, tmp_path):
+    """Instances that pre-date a schema column get it after `mnemara migrate --all`."""
+    import sqlite3
+    from click.testing import CliRunner
+    from mnemara.cli import main
+    from mnemara import config as config_mod, paths
+
+    # Create two instances via init (which runs _migrate_schema, giving them current schema)
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--instance", "mig_a", "--role", ""])
+    runner.invoke(main, ["init", "--instance", "mig_b", "--role", ""])
+
+    # Simulate a pre-v0.6 database by dropping the compressed_read_stub column
+    # (SQLite doesn't support DROP COLUMN before 3.35; recreate the table instead)
+    for name in ("mig_a", "mig_b"):
+        db = paths.db_path(name)
+        conn = sqlite3.connect(str(db))
+        # Check if the column exists first
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
+        if "compressed_read_stub" in cols:
+            # Recreate the table without the column
+            conn.executescript("""
+                BEGIN;
+                CREATE TABLE turns_old AS SELECT id, ts, role, content, tokens_in,
+                    tokens_out, pin_label FROM turns;
+                DROP TABLE turns;
+                CREATE TABLE turns (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tokens_in INTEGER DEFAULT 0,
+                    tokens_out INTEGER DEFAULT 0,
+                    pin_label TEXT
+                );
+                INSERT INTO turns SELECT * FROM turns_old;
+                DROP TABLE turns_old;
+                COMMIT;
+            """)
+        conn.close()
+
+    # Verify the column is now missing in both
+    for name in ("mig_a", "mig_b"):
+        db = paths.db_path(name)
+        conn = sqlite3.connect(str(db))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
+        conn.close()
+        assert "compressed_read_stub" not in cols, f"{name} still has column before migrate"
+
+    # Run migrate --all
+    result = runner.invoke(main, ["migrate", "--all"])
+    assert result.exit_code == 0, result.output
+    assert "migrated" in result.output
+
+    # Column should now be present in both
+    for name in ("mig_a", "mig_b"):
+        db = paths.db_path(name)
+        conn = sqlite3.connect(str(db))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
+        conn.close()
+        assert "compressed_read_stub" in cols, f"{name} missing column after migrate"
+
+
+def test_migrate_idempotent_on_current_schema(home):
+    """Running migrate twice on a current-schema instance produces no errors."""
+    from click.testing import CliRunner
+    from mnemara.cli import main
+
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--instance", "mig_idem", "--role", ""])
+
+    # First migrate
+    r1 = runner.invoke(main, ["migrate", "--instance", "mig_idem"])
+    assert r1.exit_code == 0, r1.output
+    assert "migrated" in r1.output
+
+    # Second migrate — must also succeed (no error on existing column)
+    r2 = runner.invoke(main, ["migrate", "--instance", "mig_idem"])
+    assert r2.exit_code == 0, r2.output
+    assert "migrated" in r2.output
 
 
 
@@ -4994,10 +5149,19 @@ def test_run_turn_acloses_query_gen_on_normal_completion(monkeypatch):
 # ----------------------------------------------------------------------
 
 def _make_read_pair(store, file_path: str, content: str, tu_id: str) -> tuple[int, int]:
-    """Helper: insert an assistant Read tool_use + user tool_result pair.
+    """Helper: insert an assistant Read tool_use block stamped with _cached_content.
 
-    Returns (assistant_row_id, user_row_id).
+    Simulates the v0.8.0 stamp_read_cache() path that runs in production when
+    a Read tool_result arrives in the UserMessage callback. The tool_result row
+    is NOT persisted (by design); we stamp content directly into the tool_use
+    block's input JSON.
+
+    Returns (assistant_row_id, assistant_row_id) — both values are the same
+    row so callers using ``_, uid = _make_read_pair(...)`` get the assistant
+    row id as ``uid``.
     """
+    import hashlib as _hashlib
+    content_hash = _hashlib.sha256(content.encode()).hexdigest()[:8]
     asst_id = store.append_turn(
         "assistant",
         [
@@ -5005,21 +5169,15 @@ def _make_read_pair(store, file_path: str, content: str, tu_id: str) -> tuple[in
                 "type": "tool_use",
                 "id": tu_id,
                 "name": "Read",
-                "input": {"file_path": file_path},
+                "input": {
+                    "file_path": file_path,
+                    "_cached_content": content,
+                    "_cached_hash": content_hash,
+                },
             }
         ],
     )
-    user_id = store.append_turn(
-        "user",
-        [
-            {
-                "type": "tool_result",
-                "tool_use_id": tu_id,
-                "content": content,
-            }
-        ],
-    )
-    return asst_id, user_id
+    return asst_id, asst_id
 
 
 _LONG_CONTENT = "x" * 300  # 300 bytes — above min_bytes=200 threshold
@@ -5032,7 +5190,8 @@ def test_compress_repeated_reads_keeps_latest_full(home):
     store = Store("crr_latest_full_t")
     file_path = "/workspace/foo.py"
 
-    # Three reads with different content
+    # Three reads with different content — _make_read_pair stamps _cached_content
+    # into the tool_use block (the v0.8.0 approach; tool_result rows not persisted)
     _, uid1 = _make_read_pair(store, file_path, "version one\n" + _LONG_CONTENT, "tu1")
     _, uid2 = _make_read_pair(store, file_path, "version two\n" + _LONG_CONTENT, "tu2")
     _, uid3 = _make_read_pair(store, file_path, "version three\n" + _LONG_CONTENT, "tu3")
@@ -5044,20 +5203,20 @@ def test_compress_repeated_reads_keeps_latest_full(home):
     assert "bytes_freed" in result
 
     rows = store.window()
-    # Find the three user rows (uid1, uid2, uid3) by id
-    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    # Find the three assistant rows (uid1, uid2, uid3) by id
+    asst_rows = {r["id"]: r for r in rows if r["role"] == "assistant"}
 
     # Latest (uid3) stays full
-    latest_content = user_rows[uid3]["content"][0]["content"]
-    assert latest_content == "version three\n" + _LONG_CONTENT, (
-        f"Latest should stay full, got: {latest_content[:80]}"
+    latest_cached = asst_rows[uid3]["content"][0]["input"]["_cached_content"]
+    assert latest_cached == "version three\n" + _LONG_CONTENT, (
+        f"Latest should stay full, got: {latest_cached[:80]}"
     )
 
-    # Earlier two are stubbed
+    # Earlier two are stubbed (their _cached_content replaced with stub text)
     for uid in (uid1, uid2):
-        content = user_rows[uid]["content"][0]["content"]
-        assert content.startswith("(see turn") or content.startswith("(historical state"), (
-            f"Earlier read at uid={uid} should be stubbed, got: {content[:80]}"
+        cached = asst_rows[uid]["content"][0]["input"]["_cached_content"]
+        assert cached.startswith("(see turn") or cached.startswith("(historical state"), (
+            f"Earlier read at uid={uid} should be stubbed, got: {cached[:80]}"
         )
 
     store.close()
@@ -5079,19 +5238,19 @@ def test_compress_repeated_reads_unchanged_uses_pointer(home):
     assert result["reads_compressed"] == 2
 
     rows = store.window()
-    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    asst_rows = {r["id"]: r for r in rows if r["role"] == "assistant"}
 
     # Stubs for uid1 and uid2 use "content unchanged" pattern
     for uid in (uid1, uid2):
-        content_cell = user_rows[uid]["content"][0]["content"]
-        assert "content unchanged" in content_cell, (
-            f"Expected 'content unchanged' stub, got: {content_cell[:120]}"
+        cached = asst_rows[uid]["content"][0]["input"]["_cached_content"]
+        assert "content unchanged" in cached, (
+            f"Expected 'content unchanged' stub, got: {cached[:120]}"
         )
         # Should reference the last turn
-        assert str(user_rows[uid3]["id"]) in content_cell
+        assert str(asst_rows[uid3]["id"]) in cached
 
-    # Latest unchanged
-    assert user_rows[uid3]["content"][0]["content"] == content
+    # Latest unchanged (uid3 still has original _cached_content)
+    assert asst_rows[uid3]["content"][0]["input"]["_cached_content"] == content
 
     store.close()
 
@@ -5113,10 +5272,10 @@ def test_compress_repeated_reads_modified_uses_diff(home):
     assert result["reads_compressed"] == 1
 
     rows = store.window()
-    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    asst_rows = {r["id"]: r for r in rows if r["role"] == "assistant"}
 
-    # uid1 gets a diff stub
-    stub = user_rows[uid1]["content"][0]["content"]
+    # uid1 gets a diff stub in _cached_content
+    stub = asst_rows[uid1]["content"][0]["input"]["_cached_content"]
     assert stub.startswith("(historical state"), (
         f"Expected diff stub prefix, got: {stub[:80]}"
     )
@@ -5126,7 +5285,7 @@ def test_compress_repeated_reads_modified_uses_diff(home):
     )
 
     # uid2 stays full
-    assert user_rows[uid2]["content"][0]["content"] == v2
+    assert asst_rows[uid2]["content"][0]["input"]["_cached_content"] == v2
 
     store.close()
 
@@ -5159,15 +5318,15 @@ def test_compress_repeated_reads_preserves_pre_edit_read(home):
     assert result["reads_compressed"] == 1
 
     rows = store.window()
-    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    asst_rows = {r["id"]: r for r in rows if r["role"] == "assistant"}
 
     # Second (last) Read stays full — Edit's old_string base is still intact
-    assert user_rows[uid2]["content"][0]["content"] == content_after, (
+    assert asst_rows[uid2]["content"][0]["input"]["_cached_content"] == content_after, (
         "Last Read must stay full so pre-write old_string exact-match works"
     )
 
     # First Read is stubbed
-    stub = user_rows[uid1]["content"][0]["content"]
+    stub = asst_rows[uid1]["content"][0]["input"]["_cached_content"]
     assert stub.startswith("(see turn") or stub.startswith("(historical state"), (
         f"First Read should be stubbed, got: {stub[:80]}"
     )
@@ -5192,10 +5351,10 @@ def test_compress_repeated_reads_skips_binary(home):
     )
 
     rows = store.window()
-    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    asst_rows = {r["id"]: r for r in rows if r["role"] == "assistant"}
     # Both reads preserved as-is
     for uid in (uid1, uid2):
-        assert user_rows[uid]["content"][0]["content"] == binary_content
+        assert asst_rows[uid]["content"][0]["input"]["_cached_content"] == binary_content
 
     store.close()
 
@@ -5217,15 +5376,15 @@ def test_compress_repeated_reads_skips_tiny_file(home):
     )
 
     rows = store.window()
-    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    asst_rows = {r["id"]: r for r in rows if r["role"] == "assistant"}
     for uid in (uid1, uid2):
-        assert user_rows[uid]["content"][0]["content"] == tiny_content
+        assert asst_rows[uid]["content"][0]["input"]["_cached_content"] == tiny_content
 
     store.close()
 
 
 def test_compress_repeated_reads_pin_aware(home):
-    """Pinned row's Read tool_result is not stubbed when skip_pinned=True."""
+    """Pinned row's Read tool_use block is not stubbed when skip_pinned=True."""
     from mnemara.store import Store
 
     store = Store("crr_pin_t")
@@ -5235,7 +5394,7 @@ def test_compress_repeated_reads_pin_aware(home):
     _, uid1 = _make_read_pair(store, file_path, content, "tu1")
     _, uid2 = _make_read_pair(store, file_path, content, "tu2")
 
-    # Pin the user row that holds the first tool_result (uid1)
+    # Pin the assistant row that holds the first tool_use (uid1)
     store.pin_row(uid1, "finding")
 
     result = store.compress_repeated_reads(skip_pinned=True)
@@ -5244,9 +5403,9 @@ def test_compress_repeated_reads_pin_aware(home):
     )
 
     rows = store.window()
-    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    asst_rows = {r["id"]: r for r in rows if r["role"] == "assistant"}
     # Both reads preserved because the only candidate (uid1) is pinned
-    assert user_rows[uid1]["content"][0]["content"] == content
+    assert asst_rows[uid1]["content"][0]["input"]["_cached_content"] == content
 
     store.close()
 
@@ -5258,7 +5417,9 @@ def test_preserve_compressed_reads_survives_eviction(home):
     store = Store("crr_preserve_t")
     file_path = "/workspace/big.py"
 
-    # Create 3 reads — first two will be stubbed
+    # Create 3 reads — first two will be stubbed.
+    # _make_read_pair stamps _cached_content into the assistant row; uid* are
+    # all assistant row ids under the v0.8.0 design.
     _, uid1 = _make_read_pair(store, file_path, "version A\n" + "a" * 300, "tu1")
     _, uid2 = _make_read_pair(store, file_path, "version B\n" + "b" * 300, "tu2")
     _, uid3 = _make_read_pair(store, file_path, "version C\n" + "c" * 300, "tu3")
@@ -5269,7 +5430,7 @@ def test_preserve_compressed_reads_survives_eviction(home):
     )
     assert result["reads_compressed"] == 2
 
-    # Verify compressed_read_stub is set on the stubbed rows
+    # Verify compressed_read_stub is set on the stubbed assistant rows
     row_uid1 = store.conn.execute(
         "SELECT compressed_read_stub FROM turns WHERE id=?", (uid1,)
     ).fetchone()
@@ -5312,7 +5473,7 @@ def test_preserve_compressed_reads_disabled_evicts_normally(home):
     )
     assert result["reads_compressed"] == 2
 
-    # Verify compressed_read_stub is NOT set
+    # Verify compressed_read_stub is NOT set on the assistant rows
     row_uid1 = store.conn.execute(
         "SELECT compressed_read_stub FROM turns WHERE id=?", (uid1,)
     ).fetchone()
@@ -5320,7 +5481,7 @@ def test_preserve_compressed_reads_disabled_evicts_normally(home):
 
     # Evict with flag disabled — stub rows are fair game
     total_rows = len(store.window())
-    # Evict 2 rows (the two oldest, which are uid1's assistant row and uid1 itself)
+    # Evict 2 rows (the two oldest, which are uid1 and uid2 assistant rows)
     evicted = store.evict(
         max_turns=total_rows - 2,
         preserve_compressed_reads=False,
@@ -5328,7 +5489,7 @@ def test_preserve_compressed_reads_disabled_evicts_normally(home):
     assert evicted == 2
 
     surviving_ids = {r["id"] for r in store.window()}
-    # uid1 (the oldest user row) and its assistant counterpart should have been evicted
+    # uid1 (the oldest assistant row) should have been evicted
     assert uid1 not in surviving_ids, "Without preserve flag, oldest stub rows evict normally"
 
     store.close()
@@ -5337,34 +5498,34 @@ def test_preserve_compressed_reads_disabled_evicts_normally(home):
 def test_slash_compress_reads_command(home):
     """/compress reads slash command stubs repeated Reads and reports results."""
     import asyncio as _asyncio
+    import hashlib as _hashlib
     import mnemara.config as config_mod
     import mnemara.tui as tui_mod
 
     config_mod.init_instance("crr_slash_t")
     app = tui_mod.MnemaraTUI("crr_slash_t")
 
-    # Insert two reads of the same file
+    # Insert two reads of the same file stamped with _cached_content
+    # (v0.8.0 approach: tool_result rows not persisted; content in tool_use input)
     file_path = "/workspace/slash_test.py"
     content_a = "def alpha():\n    pass\n" + "a" * 300
     content_b = "def alpha():\n    return 1\n" + "a" * 300
 
+    def _sha8(c): return _hashlib.sha256(c.encode()).hexdigest()[:8]
+
     app.store.append_turn(
         "assistant",
         [{"type": "tool_use", "id": "tu1", "name": "Read",
-          "input": {"file_path": file_path}}],
-    )
-    app.store.append_turn(
-        "user",
-        [{"type": "tool_result", "tool_use_id": "tu1", "content": content_a}],
+          "input": {"file_path": file_path,
+                    "_cached_content": content_a,
+                    "_cached_hash": _sha8(content_a)}}],
     )
     app.store.append_turn(
         "assistant",
         [{"type": "tool_use", "id": "tu2", "name": "Read",
-          "input": {"file_path": file_path}}],
-    )
-    app.store.append_turn(
-        "user",
-        [{"type": "tool_result", "tool_use_id": "tu2", "content": content_b}],
+          "input": {"file_path": file_path,
+                    "_cached_content": content_b,
+                    "_cached_hash": _sha8(content_b)}}],
     )
 
     async def _run():
@@ -5374,25 +5535,26 @@ def test_slash_compress_reads_command(home):
             await app.run_action("submit_prompt")
             await pilot.pause(0.1)
 
-            # Check that the store was compressed (sidebar: the chat render
-            # is hard to introspect, so we verify the store directly)
+            # Check that the store was compressed (verify store directly)
             all_rows = app.store.window()
-            user_rows = [r for r in all_rows if r["role"] == "user"]
-            # At least one user row should be stubbed (the first Read result)
+            asst_rows = [r for r in all_rows if r["role"] == "assistant"]
+            # At least one assistant row should have a stubbed _cached_content
             stubs = [
-                r for r in user_rows
+                r for r in asst_rows
                 if isinstance(r["content"], list)
                 and any(
-                    isinstance(b.get("content"), str)
-                    and (b["content"].startswith("(see turn")
-                         or b["content"].startswith("(historical state"))
+                    isinstance(b.get("input", {}).get("_cached_content"), str)
+                    and (
+                        b["input"]["_cached_content"].startswith("(see turn")
+                        or b["input"]["_cached_content"].startswith("(historical state")
+                    )
                     for b in r["content"]
-                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                    if isinstance(b, dict) and b.get("type") == "tool_use"
                 )
             ]
             assert len(stubs) >= 1, (
                 f"Expected at least one stubbed Read after /compress reads; "
-                f"user rows: {[r['content'] for r in user_rows]}"
+                f"asst rows: {[r['content'] for r in asst_rows]}"
             )
 
     _asyncio.run(_run())

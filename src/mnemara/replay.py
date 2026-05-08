@@ -187,7 +187,14 @@ def cluster_atoms(
                 continue
             if dist < DUP_DISTANCE:
                 dup_pairs.append((atom, matched, dist))
-            if dist < CLUSTER_DISTANCE and matched not in members:
+            # Category gate: when replay_cluster_within_category is set,
+            # only accumulate cluster members whose category matches the
+            # centroid atom.  Near-dup detection (above) stays category-blind
+            # intentionally — a duplicate is a duplicate regardless of tag.
+            within_cat = not getattr(cfg, "replay_cluster_within_category", False) or (
+                matched.category == atom.category
+            )
+            if dist < CLUSTER_DISTANCE and matched not in members and within_cat:
                 members.append(matched)
         if len(members) >= threshold:
             kinds: dict[str, int] = {}

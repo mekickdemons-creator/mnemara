@@ -109,7 +109,8 @@ _EVICT_OLDER_THAN_TOOL = "mcp__mnemara_memory__evict_older_than"
 _PIN_ROW_TOOL = "mcp__mnemara_memory__pin_row"
 _UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
 _LIST_PINNED_TOOL = "mcp__mnemara_memory__list_pinned"
-_READ_SKELETON_TOOL = "read_skeleton"
+_READ_SKELETON_TOOL = "mcp__mnemara_memory__read_skeleton"
+_LIST_WINDOW_TOOL = "mcp__mnemara_memory__list_window"
 
 
 # Hard context ceilings per model family — the API's absolute token limit.
@@ -220,14 +221,55 @@ class AgentSession:
 
         options = self._build_options(system_prompt)
 
+        # Capture Read tool_results for content stamping (v0.8.0).
+        # Maps tool_use_id -> (file_path, content, content_hash).
+        # Populated by the wrapped on_tool_result callback during _run_turn;
+        # used after append_turn to stamp _cached_content into the persisted
+        # tool_use blocks via store.stamp_read_cache().
+        _read_results_by_id: dict[str, tuple[str, str, str]] = {}
+        # tool_use_id -> file_path, built from assistant_blocks after run.
+        # We pre-populate from in-flight on_tool_use if available, but the
+        # reliable source is assistant_blocks returned by _run_turn.
+
+        _captured_read_tool_ids: dict[str, str] = {}  # tool_use_id -> file_path
+
+        _outer_on_tool_use = on_tool_use
+
+        async def _stamping_on_tool_use(name: str, inp: dict) -> None:
+            # Track Read tool_use_ids in flight so we can match tool_results.
+            # Note: the SDK may not expose tool_use_id here, so we also
+            # rebuild the mapping from assistant_blocks after the turn.
+            if _outer_on_tool_use is not None:
+                r = _outer_on_tool_use(name, inp)
+                if asyncio.iscoroutine(r):
+                    await r
+
+        _outer_on_tool_result = on_tool_result
+
+        async def _stamping_on_tool_result(
+            tool_use_id: str, content: Any, is_error: bool
+        ) -> None:
+            # Capture non-error string results for potential Read stamping.
+            # Matching to file_path is done after append_turn using
+            # assistant_blocks (tool_use_id -> name/input mapping).
+            if not is_error and isinstance(content, str):
+                # Binary check: skip if null bytes in first 512 bytes
+                if "\x00" not in content[:512]:
+                    h = hashlib.sha256(content.encode()).hexdigest()[:8]
+                    _read_results_by_id[tool_use_id] = (content, h)
+            if _outer_on_tool_result is not None:
+                r = _outer_on_tool_result(tool_use_id, content, is_error)
+                if asyncio.iscoroutine(r):
+                    await r
+
         try:
             result = await _run_turn(
                 prompt,
                 options,
                 self.cfg.stream,
                 on_token=on_token,
-                on_tool_use=on_tool_use,
-                on_tool_result=on_tool_result,
+                on_tool_use=_stamping_on_tool_use,
+                on_tool_result=_stamping_on_tool_result,
                 sentinel=self._sentinel,
             )
         except RuntimeError as _overflow_exc:
@@ -252,6 +294,31 @@ class AgentSession:
             tokens_in=total_in,
             tokens_out=total_out,
         )
+        # Stamp _cached_content into Read tool_use blocks (v0.8.0).
+        # Build tool_use_id -> file_path from the just-collected assistant_blocks,
+        # then stamp each captured Read tool_result into the persisted row.
+        if _read_results_by_id:
+            # Map tool_use_id -> file_path from assistant_blocks
+            _id_to_fp: dict[str, str] = {}
+            for blk in (assistant_blocks or []):
+                if (
+                    isinstance(blk, dict)
+                    and blk.get("type") == "tool_use"
+                    and blk.get("name") == "Read"
+                ):
+                    tid = blk.get("id")
+                    inp = blk.get("input") or {}
+                    fp = inp.get("file_path") or inp.get("path")
+                    if tid and fp:
+                        _id_to_fp[tid] = fp
+            for tid, (content, content_hash) in _read_results_by_id.items():
+                fp = _id_to_fp.get(tid)
+                if fp:
+                    try:
+                        self.store.stamp_read_cache(fp, content, content_hash)
+                    except Exception as exc:
+                        log("stamp_read_cache_error", error=str(exc))
+
         # Auto-evict-after-write: if the toggle is on AND the just-persisted
         # turn contains any Edit/Write/MultiEdit/NotebookEdit tool_use, stub
         # their bulky body content (and matching prior Read specs for the
@@ -494,12 +561,26 @@ class AgentSession:
                         payload_dict = parsed
                 except (ValueError, TypeError):
                     payload_dict = None
-            tools_mod.write_memory(
-                session.runner.instance,
-                args.get("text", "") or "",
-                args.get("category", "note") or "note",
-                payload=payload_dict,
-                cfg=session.cfg,
+            instance = session.runner.instance
+            text = args.get("text", "") or ""
+            category = args.get("category", "note") or "note"
+            cfg = session.cfg
+            # Run the synchronous write_memory (which may do blocking I/O: file
+            # append + optional RAG HTTP embed call + graph edge computation) in
+            # a thread so the event loop stays free.  Without this, rapid-fire
+            # write_memory calls block the asyncio loop while the embedding HTTP
+            # request runs, starving _read_messages and preventing it from
+            # draining the CLI subprocess's stdout pipe.  When the pipe buffer
+            # fills (~64 KB on Linux), the CLI blocks trying to write more
+            # output and the bidirectional control stream deadlocks, producing
+            # "stream closed" errors at the transport layer.
+            await asyncio.to_thread(
+                tools_mod.write_memory,
+                instance,
+                text,
+                category,
+                payload_dict,
+                cfg,
             )
             session.memory_writes += 1
             cat = args.get("category", "") or ""
@@ -515,10 +596,12 @@ class AgentSession:
             "inspect_context",
             "Report Mnemara's view of the current session: turn count, token "
             "totals, eviction count, role doc info, configured MCP servers, "
-            "and tool permission summary. Returns a JSON dict.",
-            {},
+            "and tool permission summary. Pass include_rows=true to also "
+            "include the 50 most-recent rolling-window rows with summaries "
+            "(same format as list_window). Returns a JSON dict.",
+            {"include_rows": bool},
         )
-        async def _inspect_context_tool(_args: dict[str, Any]) -> dict[str, Any]:
+        async def _inspect_context_tool(args: dict[str, Any]) -> dict[str, Any]:
             cfg = session.cfg
             tin, tout = session.store.total_tokens()
             n_turns = len(session.store.window())
@@ -549,6 +632,11 @@ class AgentSession:
                     {"tool": t.tool, "mode": t.mode} for t in cfg.allowed_tools
                 ],
             }
+            # include_rows: append rolling-window rows when requested
+            include_rows = args.get("include_rows", False)
+            if include_rows:
+                window_data = session.store.list_window(limit=50, offset=0, role="")
+                info["rows"] = window_data.get("rows", [])
             return {
                 "content": [
                     {"type": "text", "text": json.dumps(info, indent=2)}
@@ -1520,6 +1608,45 @@ class AgentSession:
                 "content": [{"type": "text", "text": json.dumps(result)}]
             }
 
+        @tool(
+            "read_skeleton",
+            "Return Python function and class signatures with docstrings only "
+            "— no bodies. Use for dependency files where you only need the API "
+            "surface. ~90% smaller than a full Read.",
+            {"file_path": str},
+        )
+        async def _read_skeleton_tool(args: dict[str, Any]) -> dict[str, Any]:
+            result = tools_mod._read_skeleton(args)
+            return {"content": [{"type": "text", "text": result}]}
+
+        @tool(
+            "list_window",
+            "List rolling-window rows with lightweight summaries. Returns "
+            "{ok, rows, total} where each row has {row_id, timestamp, role, "
+            "summary}. summary is the first 80 chars of text content; for "
+            "assistant rows with structured blocks, the first text block's "
+            "text is extracted (tool_use blocks show as '[tool_use <name>]'). "
+            "Use limit (max 200, default 50) and offset for pagination. "
+            "Filter to a specific speaker with role='user' or role='assistant'. "
+            "Rows are returned most-recent first (highest row_id first). "
+            "Use row_ids from this list with pin_row to pin specific turns.",
+            {"limit": int, "offset": int, "role": str},
+        )
+        async def _list_window_tool(args: dict[str, Any]) -> dict[str, Any]:
+            try:
+                limit = int(args.get("limit") or 50)
+            except (TypeError, ValueError):
+                limit = 50
+            try:
+                offset = int(args.get("offset") or 0)
+            except (TypeError, ValueError):
+                offset = 0
+            role = (args.get("role") or "").strip()
+            result = session.store.list_window(limit=limit, offset=offset, role=role)
+            return {
+                "content": [{"type": "text", "text": json.dumps(result)}]
+            }
+
         registered = [
             _write_memory_tool,
             _inspect_context_tool,
@@ -1548,7 +1675,10 @@ class AgentSession:
             _unpin_row_tool,
             _list_pinned_tool,
             _evict_older_than_tool,
+            _list_window_tool,
         ]
+        if getattr(self.cfg, "read_skeleton_enabled", False):
+            registered.append(_read_skeleton_tool)
         # Expose handlers by name for in-process testing / introspection.
         self._registered_tools = {
             getattr(t, "name", None) or "?": getattr(t, "handler", None)
@@ -1596,6 +1726,7 @@ class AgentSession:
             _PIN_ROW_TOOL,
             _UNPIN_ROW_TOOL,
             _LIST_PINNED_TOOL,
+            _LIST_WINDOW_TOOL,
         ]
         if getattr(self.cfg, "read_skeleton_enabled", False):
             allowed_tools.append(_READ_SKELETON_TOOL)
@@ -1987,6 +2118,10 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "UnpinRow", ""
     if tool_name == _LIST_PINNED_TOOL or tool_name.endswith("__list_pinned"):
         return "ListPinned", ""
+    if tool_name == _LIST_WINDOW_TOOL or tool_name.endswith("__list_window"):
+        return "ListWindow", ""
+    if tool_name == _READ_SKELETON_TOOL or tool_name.endswith("__read_skeleton"):
+        return "Read", str(tool_input.get("file_path") or "")
     return None, ""
 
 

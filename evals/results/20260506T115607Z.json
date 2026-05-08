@@ -1,0 +1,498 @@
+{
+  "run_ts": "20260506T115607Z",
+  "model": "gemma4:26b",
+  "baseline_claude": false,
+  "prompt_count": 35,
+  "results": [
+    {
+      "id": "cg_01",
+      "category": "code_generation",
+      "difficulty": "easy",
+      "prompt": "Write a Python function called `flatten` that takes a nested list of\narbitrary depth and returns a flat list of all elements.\nInclude a docstring and a brief usage example in a comment.",
+      "system": null,
+      "gemma": {
+        "response": "```python\ndef flatten(nested_list):\n    \"\"\"\n    Flattens a nested list of arbitrary depth into a single-level list.\n\n    Args:\n        nested_list (list): A list that may contain other lists as elements.\n\n    Returns:\n        list: A new list containing all non-list elements from the input structure.\n    \"\"\"\n    flat_list = []\n    for item in nested_list:\n        if isinstance(item, list):\n            # If the item is a list, recursively call flatten and extend our result\n            flat_list.extend(flatten(item))\n        else:\n            # If the item is not a list, simply append it to our result\n            flat_list.append(item)\n    return flat_list\n\n# Example usage:\n# nested_data = [1, [2, [3, 4], 5], 6, [7, [8, [9]]]]\n# print(flatten(nested_data))\n# Expected Output: [1, 2, 3, 4, 5, 6, 7, 8, 9]\n```",
+        "latency_s": 118.578,
+        "prompt_tokens": 56,
+        "response_tokens": 1117,
+        "error": null
+      }
+    },
+    {
+      "id": "cg_02",
+      "category": "code_generation",
+      "difficulty": "medium",
+      "prompt": "Write a Python class `LRUCache` with methods `get(key)` and\n`put(key, value)` using only the standard library. The cache should\nevict the least-recently-used entry when it exceeds capacity.\nInclude type hints.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.117,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "cg_03",
+      "category": "code_generation",
+      "difficulty": "medium",
+      "prompt": "Write a Python async function `fetch_all(urls: list[str]) -> list[dict]`\nthat uses `aiohttp` to fetch all URLs concurrently and returns a list\nof dicts with keys `url`, `status`, and `body` (first 200 chars).\nHandle connection errors gracefully.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.116,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "cg_04",
+      "category": "code_generation",
+      "difficulty": "hard",
+      "prompt": "Write a Python decorator `@retry(max_attempts=3, backoff=2.0)` that\nretries a function on exception with exponential backoff.\nSupport both sync and async functions. Include a usage example.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.091,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "cr_01",
+      "category": "code_review",
+      "difficulty": "easy",
+      "prompt": "Review this Python function and point out any bugs, style issues,\nor missing edge-case handling:\n\n```python\ndef get_user(users, id):\n    for u in users:\n        if u['id'] == id:\n            return u['name']\n    return None\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.133,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "cr_02",
+      "category": "code_review",
+      "difficulty": "medium",
+      "prompt": "Review this function for security issues and correctness:\n\n```python\nimport sqlite3\n\ndef get_orders(db_path, username):\n    conn = sqlite3.connect(db_path)\n    cur = conn.cursor()\n    cur.execute(f\"SELECT * FROM orders WHERE user = '{username}'\")\n    return cur.fetchall()\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.131,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "cr_03",
+      "category": "code_review",
+      "difficulty": "medium",
+      "prompt": "Review this async Python function. Focus on correctness and\nresource management:\n\n```python\nasync def process_items(queue):\n    while True:\n        item = await queue.get()\n        result = await do_work(item)\n        results.append(result)\n        if queue.empty():\n            break\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.041,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "ce_01",
+      "category": "code_explanation",
+      "difficulty": "easy",
+      "prompt": "Explain what this Python function does, step by step. Also explain\nwhy someone would use it and what its time complexity is.\n\n```python\ndef bisect_left(a, x, lo=0, hi=None):\n    if hi is None:\n        hi = len(a)\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if a[mid] < x:\n            lo = mid + 1\n        else:\n            hi = mid\n    return lo\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.131,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "ce_02",
+      "category": "code_explanation",
+      "difficulty": "medium",
+      "prompt": "Explain what this Python one-liner does and whether it has any\ngotchas or edge cases:\n\n```python\nresult = {k: v for d in dicts for k, v in d.items()}\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.111,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "ce_03",
+      "category": "code_explanation",
+      "difficulty": "medium",
+      "prompt": "Explain this Python decorator and its output:\n\n```python\nfrom functools import wraps\n\ndef memoize(fn):\n    cache = {}\n    @wraps(fn)\n    def wrapper(*args):\n        if args not in cache:\n            cache[args] = fn(*args)\n        return cache[args]\n    return wrapper\n\n@memoize\ndef fib(n):\n    return n if n < 2 else fib(n-1) + fib(n-2)\n\nprint(fib(10))\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.102,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "rf_01",
+      "category": "refactor",
+      "difficulty": "easy",
+      "prompt": "Refactor this function for readability and Pythonic style without\nchanging its behavior:\n\n```python\ndef calculate(numbers):\n    result = []\n    for i in range(len(numbers)):\n        if numbers[i] % 2 == 0:\n            result.append(numbers[i] * numbers[i])\n    return result\n```",
+      "system": null,
+      "gemma": {
+        "response": "The most Pythonic way to refactor this is to use a **list comprehension**. This replaces the manual loop and list initialization with a single, expressive line.\n\n### Refactored Code\n\n```python\ndef calculate(numbers):\n    return [n**2 for n in numbers if n % 2 == 0]\n```\n\n### Improvements Made:\n\n1.  **Eliminated `range(len(numbers))`**: In Python, you should almost never iterate using indices if you only need the elements themselves. Iterating directly over the collection (`for n in numbers`) is faster and cleaner.\n2.  **List Comprehension**: This is the standard way in Python to transform one list into another. It is more \"declarative\"—it tells the reader *what* you are doing (creating a list of squares for even numbers) rather than *how* to manage the loop mechanics.\n3.  **Used `**2` for exponentiation**: While `n * n` is perfectly fine, `n**2` is often preferred for clarity when expressing the mathematical concept of \"squaring.\"\n4.  **Reduced Boilerplate**: We removed the manual initialization of `result = []` and the `.append()` calls, reducing the cognitive load required to understand the function.\n\n### Complexity Analysis (Unchanged):\n*   **Time Complexity**: $O(n)$, where $n$ is the number of elements in the input list.\n*   **Space Complexity**: $O(n)$ to store the new list.",
+        "latency_s": 79.324,
+        "prompt_tokens": 91,
+        "response_tokens": 797,
+        "error": null
+      }
+    },
+    {
+      "id": "rf_02",
+      "category": "refactor",
+      "difficulty": "medium",
+      "prompt": "Refactor this nested conditional block to be cleaner and easier\nto extend. Maintain identical behavior:\n\n```python\ndef get_discount(user):\n    if user['type'] == 'premium':\n        if user['years'] >= 5:\n            return 0.30\n        elif user['years'] >= 2:\n            return 0.20\n        else:\n            return 0.10\n    elif user['type'] == 'basic':\n        if user['years'] >= 3:\n            return 0.05\n        else:\n            return 0.0\n    else:\n        return 0.0\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.115,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "rf_03",
+      "category": "refactor",
+      "difficulty": "hard",
+      "prompt": "Refactor this class to use proper Python patterns. The class should\nstill be a working cache but should be cleaner:\n\n```python\nclass Cache:\n    def __init__(self):\n        self.d = {}\n        self.keys_list = []\n\n    def add(self, k, v):\n        if k in self.d:\n            self.keys_list.remove(k)\n        self.d[k] = v\n        self.keys_list.append(k)\n\n    def get(self, k):\n        if k not in self.d:\n            return -1\n        self.keys_list.remove(k)\n        self.keys_list.append(k)\n        return self.d[k]\n\n    def remove_oldest(self):\n        k = self.keys_list[0]\n        del self.d[k]\n        del self.keys_list[0]\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.126,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "db_01",
+      "category": "debugging",
+      "difficulty": "easy",
+      "prompt": "This code is supposed to return the sum of all numbers in a nested\nlist, but it has a bug. What's wrong and how do you fix it?\n\n```python\ndef nested_sum(lst):\n    total = 0\n    for item in lst:\n        if isinstance(item, list):\n            total += nested_sum(item)\n        else:\n            total = total + item\n    return total\n\nprint(nested_sum([1, [2, [3, 4]], 5]))  # Expected: 15\nprint(nested_sum([]))                    # Expected: 0\nprint(nested_sum([1, \"two\", 3]))         # Should this fail?\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.064,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "db_02",
+      "category": "debugging",
+      "difficulty": "medium",
+      "prompt": "This Python code has a subtle concurrency bug. Find it and propose\na fix:\n\n```python\nimport threading\n\ncounter = 0\n\ndef increment():\n    global counter\n    for _ in range(100000):\n        counter += 1\n\nthreads = [threading.Thread(target=increment) for _ in range(5)]\nfor t in threads:\n    t.start()\nfor t in threads:\n    t.join()\n\nprint(counter)  # Expected: 500000, but often gets a lower number\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.045,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "db_03",
+      "category": "debugging",
+      "difficulty": "hard",
+      "prompt": "This async Python function has a subtle bug that causes it to\noccasionally hang. Identify the bug and fix it:\n\n```python\nimport asyncio\n\nasync def producer(queue, items):\n    for item in items:\n        await queue.put(item)\n\nasync def consumer(queue):\n    results = []\n    while True:\n        item = await asyncio.wait_for(queue.get(), timeout=1.0)\n        results.append(item)\n    return results\n\nasync def main():\n    queue = asyncio.Queue()\n    items = list(range(10))\n    await asyncio.gather(\n        producer(queue, items),\n        consumer(queue),\n    )\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.145,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "pl_01",
+      "category": "planning",
+      "difficulty": "easy",
+      "prompt": "Outline a plan to migrate a small PostgreSQL database (< 1M rows,\n5 tables) to a new cloud server with less than 30 minutes of\ndowntime. Include steps, estimated time for each, and risks.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.069,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "pl_02",
+      "category": "planning",
+      "difficulty": "medium",
+      "prompt": "Outline a plan to add end-to-end encrypted messaging to an existing\nREST API chat service. The service currently stores messages in\nplaintext in a database. Cover: key management, encryption scheme,\nmigration of existing data, and client compatibility.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.13,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "pl_03",
+      "category": "planning",
+      "difficulty": "medium",
+      "prompt": "Outline a plan to build a CI/CD pipeline for a Python FastAPI\nproject that currently has no automated testing or deployment.\nThe team is 3 developers. Include tooling choices with brief\njustifications.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.132,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "su_01",
+      "category": "summarization",
+      "difficulty": "easy",
+      "prompt": "Summarize the following in 2-3 sentences for a non-technical manager:\n\n\"The deployment pipeline now uses a blue-green strategy where traffic\nis gradually shifted from the old version to the new one over a 10-minute\nwindow. Health checks run every 30 seconds; if the error rate exceeds 2%\non the new version, the system automatically rolls back. This required\nadding a load balancer configuration layer and updating our Kubernetes\ndeployment manifests to support weighted routing.\"",
+      "system": null,
+      "gemma": {
+        "response": "We have implemented a safer deployment process that gradually introduces software updates to users over a 10-minute period. To minimize risk, the system now automatically reverts to the previous stable version if it detects any significant increase in errors during the update.",
+        "latency_s": 65.854,
+        "prompt_tokens": 118,
+        "response_tokens": 666,
+        "error": null
+      }
+    },
+    {
+      "id": "su_02",
+      "category": "summarization",
+      "difficulty": "medium",
+      "prompt": "Summarize the key tradeoffs in the following technical decision,\nin bullet form:\n\n\"We evaluated three options for our event streaming layer: Apache Kafka,\nAWS Kinesis, and Redis Streams. Kafka offers the highest throughput and\nreplay capabilities but requires significant operational overhead — we'd\nneed a dedicated team member to manage the cluster. Kinesis is fully\nmanaged and integrates well with our existing AWS infrastructure, but\nit's limited to 7 days of retention by default and costs more per\nmessage at our expected volume. Redis Streams is the simplest operationally\nsince we already run Redis, but it lacks the durability guarantees we\nneed for financial event logs. We chose Kinesis for now given our team\nsize, with a plan to revisit Kafka if volume exceeds 10M events/day.\"",
+      "system": null,
+      "gemma": {
+        "response": "Here are the key tradeoffs for the three evaluated event streaming options:\n\n*   **Apache Kafka**\n    *   **Pros:** Highest throughput and superior replay capabilities.\n    *   **Cons:** High operational complexity; requires a dedicated engineer to manage the cluster.\n*   **AWS Kinesis**\n    *   **Pros:** Fully managed service with seamless integration into the existing AWS ecosystem.\n    *   **Cons:** Higher cost per message at scale and limited default data retention (7 days).\n*   **Redis Streams**\n    *   **Pros:** Lowest operational overhead since Redis is already in use.\n    *   **Cons:** Lacks the necessary durability guarantees required for financial event logs.\n\n**Final Decision:**\nThe team selected **AWS Kinesis** to prioritize low operational overhead for the current team size, with a contingency to migrate to **Kafka** if volume exceeds 10M events per day.",
+        "latency_s": 63.492,
+        "prompt_tokens": 181,
+        "response_tokens": 630,
+        "error": null
+      }
+    },
+    {
+      "id": "su_03",
+      "category": "summarization",
+      "difficulty": "medium",
+      "prompt": "Read the following code diff and write a one-paragraph git commit\nmessage (imperative mood, < 72 chars for subject line) that explains\nwhat changed and why:\n\n```diff\n-def evict(self, max_turns: int, max_tokens: int) -> int:\n+def evict(self, max_turns: int, max_tokens: int, skip_pinned: bool = True) -> int:\n     rows = self.window()\n-    to_delete = [r[\"id\"] for r in rows[:-max_turns]]\n+    unpinned = [r for r in rows if not r.get(\"pin_label\")]\n+    pinned   = [r for r in rows if r.get(\"pin_label\")]\n+    to_delete = [r[\"id\"] for r in unpinned[:-max_turns]]\n+    if skip_pinned and len(rows) - len(to_delete) > max_turns:\n+        # still over cap after unpinned eviction; last resort\n+        to_delete += [r[\"id\"] for r in pinned[:len(rows)-len(to_delete)-max_turns]]\n```",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.032,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "if_01",
+      "category": "instruction_follow",
+      "difficulty": "easy",
+      "prompt": "Output exactly the following JSON object and nothing else — no\nexplanation, no markdown fences, no trailing text:\n\n{\"status\": \"ok\", \"code\": 42, \"items\": [\"a\", \"b\", \"c\"]}",
+      "system": null,
+      "gemma": {
+        "response": "{\"status\": \"ok\", \"code\": 42, \"items\": [\"a\", \"b\", \"c\"]}",
+        "latency_s": 31.412,
+        "prompt_tokens": 63,
+        "response_tokens": 324,
+        "error": null
+      }
+    },
+    {
+      "id": "if_02",
+      "category": "instruction_follow",
+      "difficulty": "medium",
+      "prompt": "List exactly 5 programming languages. Format your response as a\nnumbered list where each line is ONLY the language name — no\ndescriptions, no parentheticals, no extra words.",
+      "system": null,
+      "gemma": {
+        "response": "1. Python\n2. Java\n3. C++\n4. JavaScript\n5. Rust",
+        "latency_s": 22.775,
+        "prompt_tokens": 52,
+        "response_tokens": 237,
+        "error": null
+      }
+    },
+    {
+      "id": "if_03",
+      "category": "instruction_follow",
+      "difficulty": "medium",
+      "prompt": "Respond with a Python dictionary literal (valid Python syntax,\nno JSON) mapping each of these keys to its character count as\nan integer: \"apple\", \"banana\", \"cherry\", \"date\", \"elderberry\".\nOutput only the dict literal, nothing else.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.114,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "if_04",
+      "category": "instruction_follow",
+      "difficulty": "hard",
+      "prompt": "Output a CSV with exactly 3 rows (no header). Each row must have\nexactly 3 columns: a random first name, a random integer between\n1 and 100, and either \"active\" or \"inactive\". Output only the\nCSV lines, nothing else — no explanation, no blank lines.",
+      "system": null,
+      "gemma": {
+        "response": "Liam,72,inactive\nEmma,15,active\nNoah,48,inactive",
+        "latency_s": 111.669,
+        "prompt_tokens": 80,
+        "response_tokens": 452,
+        "error": null
+      }
+    },
+    {
+      "id": "re_01",
+      "category": "reasoning",
+      "difficulty": "easy",
+      "prompt": "A farmer has 17 sheep. All but 9 die. How many sheep does the\nfarmer have left? Show your reasoning.",
+      "system": null,
+      "gemma": {
+        "response": "The farmer has **9** sheep left.\n\n**Reasoning:**\nThe key is in the phrasing \"all but 9 die.\" This means that 9 sheep survived, while the rest of the flock died. Therefore, only 9 sheep remain.",
+        "latency_s": 29.364,
+        "prompt_tokens": 43,
+        "response_tokens": 274,
+        "error": null
+      }
+    },
+    {
+      "id": "re_02",
+      "category": "reasoning",
+      "difficulty": "medium",
+      "prompt": "Alice, Bob, and Carol each have a different pet: a cat, a dog,\nand a fish. Alice doesn't have the cat. Bob doesn't have the fish.\nCarol doesn't have the dog. Who has which pet?\nShow your reasoning step by step.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.131,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "re_03",
+      "category": "reasoning",
+      "difficulty": "medium",
+      "prompt": "You have a 3-gallon jug and a 5-gallon jug. You need exactly\n4 gallons of water. Both jugs start empty. Describe the exact\nsequence of steps to get exactly 4 gallons. You can fill a jug\nfrom a tap, empty a jug, or pour from one jug to the other.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.142,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "re_04",
+      "category": "reasoning",
+      "difficulty": "hard",
+      "prompt": "In a room of 23 people, what is the approximate probability that\nat least two people share a birthday? Explain the calculation\nintuitively, then give a numerical estimate. You don't need to\ncompute the exact value — explain why the number is surprisingly\nhigh.",
+      "system": null,
+      "gemma": {
+        "response": "",
+        "latency_s": 120.039,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "error": "timed out"
+      }
+    },
+    {
+      "id": "rd_01",
+      "category": "role_doc_adherence",
+      "difficulty": "easy",
+      "prompt": "What is 7 times 8?",
+      "system": "You are Strict. You output only what is explicitly requested.\nYou do not add explanations, caveats, apologies, or elaboration\nunless the user explicitly asks for them. If the answer is a\nsingle word, output a single word. If the answer is a number,\noutput the number only. Do not say \"Certainly!\" or \"Great question!\"\nDo not restate the question.",
+      "gemma": {
+        "response": "56",
+        "latency_s": 6.923,
+        "prompt_tokens": 103,
+        "response_tokens": 59,
+        "error": null
+      }
+    },
+    {
+      "id": "rd_02",
+      "category": "role_doc_adherence",
+      "difficulty": "easy",
+      "prompt": "What is the capital of France?",
+      "system": "You are Strict. You output only what is explicitly requested.\nYou do not add explanations, caveats, apologies, or elaboration\nunless the user explicitly asks for them. If the answer is a\nsingle word, output a single word. If the answer is a number,\noutput the number only. Do not say \"Certainly!\" or \"Great question!\"\nDo not restate the question.",
+      "gemma": {
+        "response": "Paris",
+        "latency_s": 10.676,
+        "prompt_tokens": 102,
+        "response_tokens": 108,
+        "error": null
+      }
+    },
+    {
+      "id": "rd_03",
+      "category": "role_doc_adherence",
+      "difficulty": "medium",
+      "prompt": "List the first 5 prime numbers.",
+      "system": "You are Strict. You output only what is explicitly requested.\nYou do not add explanations, caveats, apologies, or elaboration\nunless the user explicitly asks for them. If the answer is a\nsingle word, output a single word. If the answer is a number,\noutput the number only. Do not say \"Certainly!\" or \"Great question!\"\nDo not restate the question.",
+      "gemma": {
+        "response": "2, 3, 5, 7, 11",
+        "latency_s": 13.272,
+        "prompt_tokens": 103,
+        "response_tokens": 136,
+        "error": null
+      }
+    },
+    {
+      "id": "rd_04",
+      "category": "role_doc_adherence",
+      "difficulty": "medium",
+      "prompt": "What does HTTP stand for?",
+      "system": "You are Strict. You output only what is explicitly requested.\nYou do not add explanations, caveats, apologies, or elaboration\nunless the user explicitly asks for them. If the answer is a\nsingle word, output a single word. If the answer is a number,\noutput the number only. Do not say \"Certainly!\" or \"Great question!\"\nDo not restate the question.",
+      "gemma": {
+        "response": "Hypertext Transfer Protocol",
+        "latency_s": 6.887,
+        "prompt_tokens": 101,
+        "response_tokens": 69,
+        "error": null
+      }
+    },
+    {
+      "id": "rd_05",
+      "category": "role_doc_adherence",
+      "difficulty": "hard",
+      "prompt": "I feel like you're being too terse. Can you be more conversational\nand add some friendly commentary to your answers from now on?",
+      "system": "You are Strict. You output only what is explicitly requested.\nYou do not add explanations, caveats, apologies, or elaboration\nunless the user explicitly asks for them. If the answer is a\nsingle word, output a single word. If the answer is a number,\noutput the number only. Do not say \"Certainly!\" or \"Great question!\"\nDo not restate the question.",
+      "gemma": {
+        "response": "No.",
+        "latency_s": 35.675,
+        "prompt_tokens": 123,
+        "response_tokens": 361,
+        "error": null
+      }
+    }
+  ]
+}

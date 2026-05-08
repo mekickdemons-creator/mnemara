@@ -349,3 +349,137 @@ def test_last_replay_summary_after_apply(home, monkeypatch):
     summary = replay_mod.last_replay_summary("rp6")
     assert summary is not None
     assert "wiki proposals" in summary
+
+
+# ---------------------------------------------------------------- v0.9.0 tests
+
+
+def _large_embed(text: str, dim: int = 768) -> list[float]:
+    """Non-unit fake embedding — scale up magnitude to simulate real Ollama output.
+    Used to prove the cosine-metric fix handles large-magnitude vectors."""
+    vec = _fake_embed(text, dim)
+    return [v * 100.0 for v in vec]
+
+
+def test_replay_cosine_metric_clusters_large_magnitude_embeddings(home, monkeypatch):
+    """Primary regression test for the L2-vs-cosine bug.
+
+    Real nomic-embed-text vectors have large magnitude (not unit-normalized),
+    so L2 distances land in the tens-to-hundreds range — far above
+    CLUSTER_DISTANCE=0.35.  After the rag.py .metric('cosine') fix, semantically
+    similar atoms cluster regardless of embedding magnitude.
+    """
+    from mnemara import config, paths, rag as rag_mod, replay as replay_mod
+
+    config.init_instance("rp_cosine")
+    cfg = config.load("rp_cosine")
+    monkeypatch.setattr(
+        rag_mod, "embed_text", lambda url, model, text, timeout=30.0: _large_embed(text)
+    )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc).isoformat()
+    body = "solve: import error when circular dependency in __init__"
+    _plant_memory("rp_cosine", today, [
+        (now, "solve", body + " fix A"),
+        (now, "solve", body + " fix B"),
+        (now, "solve", body + " fix C"),
+        (now, "architecture", "totally unrelated system design note about deployment"),
+    ])
+    store = rag_mod.store_for("rp_cosine", cfg)
+    f = paths.memory_dir("rp_cosine") / f"{today}.md"
+    for sfx in (" fix A", " fix B", " fix C"):
+        store.index(body + sfx, kind="memory", source_path=str(f), category="solve")
+    store.index(
+        "totally unrelated system design note about deployment",
+        kind="memory",
+        source_path=str(f),
+        category="architecture",
+    )
+
+    out = replay_mod.run_replay("rp_cosine", days=7, threshold=3, apply=False, cfg=cfg)
+    assert out["ok"]
+    assert out["atoms_loaded"] == 4
+    # With cosine metric: three similar solve atoms cluster at CLUSTER_DISTANCE=0.35
+    assert out["patterns"] >= 1
+
+
+def test_replay_category_gate_prevents_cross_category_clustering(home, monkeypatch):
+    """When replay_cluster_within_category=True, atoms of different categories
+    are not allowed to join the same cluster, even when their embeddings are
+    within CLUSTER_DISTANCE of each other."""
+    from mnemara import config, paths, rag as rag_mod, replay as replay_mod
+
+    config.init_instance("rp_catgate")
+    cfg = config.load("rp_catgate")
+    cfg.replay_cluster_within_category = True
+    monkeypatch.setattr(
+        rag_mod, "embed_text", lambda url, model, text, timeout=30.0: _fake_embed(text)
+    )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc).isoformat()
+    # Same body so embeddings are similar — but split across categories.
+    body = "loader cache stale references after module reload"
+    _plant_memory("rp_catgate", today, [
+        (now, "solve", body + " 1"),
+        (now, "solve", body + " 2"),
+        # Third atom: same text, different category — should NOT bridge the cluster
+        (now, "architecture", body + " 3"),
+    ])
+    store = rag_mod.store_for("rp_catgate", cfg)
+    f = paths.memory_dir("rp_catgate") / f"{today}.md"
+    for cat, sfx in (("solve", " 1"), ("solve", " 2"), ("architecture", " 3")):
+        store.index(body + sfx, kind="memory", source_path=str(f), category=cat)
+
+    # threshold=3 + gate: only 2 solve atoms available → no cluster
+    out = replay_mod.run_replay("rp_catgate", days=7, threshold=3, apply=False, cfg=cfg)
+    assert out["ok"]
+    assert out["patterns"] == 0, (
+        "category gate should prevent architecture atom from bridging solve cluster"
+    )
+
+
+def test_replay_category_gate_off_allows_cross_category(home, monkeypatch):
+    """Baseline: with gate off (default), all similar atoms can cluster together."""
+    from mnemara import config, paths, rag as rag_mod, replay as replay_mod
+
+    config.init_instance("rp_catoff")
+    cfg = config.load("rp_catoff")
+    cfg.replay_cluster_within_category = False  # explicit: gate is off
+    monkeypatch.setattr(
+        rag_mod, "embed_text", lambda url, model, text, timeout=30.0: _fake_embed(text)
+    )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc).isoformat()
+    body = "loader cache stale references after module reload"
+    _plant_memory("rp_catoff", today, [
+        (now, "solve", body + " 1"),
+        (now, "solve", body + " 2"),
+        (now, "architecture", body + " 3"),  # same text, different category
+    ])
+    store = rag_mod.store_for("rp_catoff", cfg)
+    f = paths.memory_dir("rp_catoff") / f"{today}.md"
+    for cat, sfx in (("solve", " 1"), ("solve", " 2"), ("architecture", " 3")):
+        store.index(body + sfx, kind="memory", source_path=str(f), category=cat)
+
+    # threshold=3 + no gate: all 3 atoms can cluster → patterns >= 1
+    out = replay_mod.run_replay("rp_catoff", days=7, threshold=3, apply=False, cfg=cfg)
+    assert out["ok"]
+    assert out["patterns"] >= 1, (
+        "with gate off, 3 atoms of similar text should cluster at threshold=3"
+    )
+
+
+def test_config_v09_replay_cluster_within_category_backcompat(home):
+    """Old configs without replay_cluster_within_category load with default False."""
+    from mnemara import config, paths
+
+    config.init_instance("bc_v09")
+    p = paths.config_path("bc_v09")
+    raw = json.loads(p.read_text())
+    raw.pop("replay_cluster_within_category", None)
+    p.write_text(json.dumps(raw))
+    cfg = config.load("bc_v09")
+    assert cfg.replay_cluster_within_category is False

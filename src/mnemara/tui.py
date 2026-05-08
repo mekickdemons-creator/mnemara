@@ -555,13 +555,14 @@ class MnemaraTUI(App):  # type: ignore[misc]
             text = _flatten_text_blocks(content)
             log_widget.write(f"[b cyan]you:[/b cyan] {text}")
         elif role == "assistant":
+            label = self.cfg.display_name or "assistant"
             if isinstance(content, list):
                 for b in content:
                     if not isinstance(b, dict):
                         continue
                     t = b.get("type")
                     if t == "text" and b.get("text"):
-                        log_widget.write(f"[b green]assistant:[/b green] {b['text']}")
+                        log_widget.write(f"[b green]{label}:[/b green] {b['text']}")
                     elif t == "tool_use":
                         name = b.get("name", "?")
                         inp = b.get("input") or {}
@@ -572,7 +573,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
                         c = b.get("content")
                         log_widget.write(f"[dim]  result: {str(c)[:200]}[/dim]")
             else:
-                log_widget.write(f"[b green]assistant:[/b green] {content}")
+                log_widget.write(f"[b green]{label}:[/b green] {content}")
 
     # ---------------------------------------------------------------- status / spinner
 
@@ -706,7 +707,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 on_tool_result=on_tool_result,
             )
             if self._stream_buffer:
-                chat.write(f"[b green]assistant:[/b green] {self._stream_buffer}")
+                label = self.cfg.display_name or "assistant"
+                chat.write(f"[b green]{label}:[/b green] {self._stream_buffer}")
         except asyncio.CancelledError:
             try:
                 self.store.append_turn(
@@ -716,7 +718,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             except Exception:
                 pass
             if self._stream_buffer:
-                chat.write(f"[b green]assistant:[/b green] [dim]{self._stream_buffer}[/dim]")
+                label = self.cfg.display_name or "assistant"
+                chat.write(f"[b green]{label}:[/b green] [dim]{self._stream_buffer}[/dim]")
             chat.write("[dim]⏹ turn interrupted[/dim]")
             raise
         except Exception as exc:
@@ -800,6 +803,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
         if cmd == "/skeleton":
             await self._slash_skeleton(arg)
             return
+
+        if cmd == "/name":
+            self._slash_name(arg, chat)
+            return
+
 
         chat.write(
             f"[dim]unknown command: {cmd} — try /help for a full list[/dim]"
@@ -963,6 +971,20 @@ class MnemaraTUI(App):  # type: ignore[misc]
             result = result[:2000] + "\n[dim]... (truncated)[/dim]"
         chat.write(result)
 
+    def _slash_name(self, arg: str, chat: "RichLog") -> None:
+        """/name [label] — set or clear the display name shown on responses."""
+        label = arg.strip()
+        self.cfg.display_name = label
+        try:
+            config_mod.save(self.instance, self.cfg)
+            if label:
+                chat.write(f'[green]display name set to "{label}" and saved to config[/green]')
+            else:
+                chat.write('[dim]display name cleared — responses will show "assistant"[/dim]')
+        except Exception as exc:
+            chat.write(f"[red]name updated in memory but config save failed: {exc}[/red]")
+
+
     def _slash_help(self, chat: "RichLog") -> None:
         """/help — list available slash commands."""
         lines = [
@@ -978,6 +1000,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
+            "  /name <label>           — set response label (e.g. /name Majordomo)",
+            "  /name                   — clear label, revert to \"assistant\"",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",
             "  /import <path>          — restore turns from a full export file",
             "  /stop                   — cancel active streaming turn",
