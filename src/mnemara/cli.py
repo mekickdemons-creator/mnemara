@@ -29,17 +29,8 @@ def main() -> None:
 def init_cmd(instance: str, role_doc: str | None) -> None:
     """Create ~/.mnemara/<instance>/ with a default config."""
     if paths.instance_dir(instance).exists():
-        cfg_path = paths.config_path(instance)
-        # If config.json is missing or empty, repair rather than block.
-        if not cfg_path.exists() or cfg_path.stat().st_size == 0:
-            console.print(f"[yellow]Instance dir exists but config is empty — repairing:[/yellow] {cfg_path}")
-            config_mod.save(instance, config_mod.Config.default())
-            console.print(f"[green]repaired[/green] {cfg_path}")
-            console.print(f"\nRun: [bold]mnemara role --instance {instance} --set <path>[/bold] to set a role doc.")
-            return
-        else:
-            console.print(f"[red]Instance already exists:[/red] {paths.instance_dir(instance)}")
-            sys.exit(1)
+        console.print(f"[red]Instance already exists:[/red] {paths.instance_dir(instance)}")
+        sys.exit(1)
     if not role_doc:
         try:
             role_doc = click.prompt("Role doc path (blank for none)", default="", show_default=False).strip()
@@ -165,13 +156,57 @@ def delete_cmd(instance: str, force: bool) -> None:
 
 @main.command("role")
 @click.option("--instance", required=True)
-@click.option("--set", "role_path", required=True)
-def role_cmd(instance: str, role_path: str) -> None:
-    """Set role_doc_path for an instance without entering the REPL."""
+@click.option("--set", "role_path", default=None, help="Path to a local role doc.")
+@click.option(
+    "--set-from-url",
+    "role_url",
+    default=None,
+    help="Download a role doc from an https:// URL into the instance dir.",
+)
+def role_cmd(instance: str, role_path: str | None, role_url: str | None) -> None:
+    """Set role_doc_path for an instance without entering the REPL.
+
+    Pass either --set <path> for a local file, or --set-from-url <https://...>
+    to download once into the instance dir. Downloaded role docs are stored
+    locally; Mnemara never re-fetches the URL at runtime.
+    """
+    if not role_path and not role_url:
+        raise click.UsageError("provide either --set or --set-from-url")
+    if role_path and role_url:
+        raise click.UsageError("--set and --set-from-url are mutually exclusive")
+
     cfg = config_mod.load(instance)
-    cfg.role_doc_path = str(Path(role_path).expanduser())
+
+    if role_url:
+        if not role_url.startswith("https://"):
+            raise click.UsageError("--set-from-url requires an https:// URL")
+        import urllib.request
+        dest = paths.instance_dir(instance) / "role.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with urllib.request.urlopen(role_url, timeout=30) as resp:
+                data = resp.read()
+        except Exception as exc:
+            raise click.ClickException(f"failed to download role doc: {exc}")
+        if len(data) > 1_000_000:
+            raise click.ClickException(
+                f"role doc too large ({len(data)} bytes; cap is 1 MB)"
+            )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise click.ClickException("role doc is not valid UTF-8")
+        dest.write_text(text)
+        cfg.role_doc_path = str(dest)
+        console.print(
+            f"[green]downloaded[/green] {role_url}\n"
+            f"[green]role doc set to[/green] {cfg.role_doc_path}"
+        )
+    else:
+        cfg.role_doc_path = str(Path(role_path).expanduser())
+        console.print(f"[green]role doc set to[/green] {cfg.role_doc_path}")
+
     config_mod.save(instance, cfg)
-    console.print(f"[green]role doc set to[/green] {cfg.role_doc_path}")
 
 
 @main.command("replay")

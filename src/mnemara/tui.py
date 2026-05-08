@@ -5,14 +5,17 @@ Three features, nothing else:
   2. Token-count eviction only             (row cap is not enforced here)
   3. Spinner during streaming turns
 
-Slash commands: /quit, /exit, /models, /swap, /tokens, /export, and /stop.
+Slash commands: /quit, /exit, /models, /swap, /tokens, /export, /import, and /stop.
 No block surgery, no pin system, no copy.
 """
 from __future__ import annotations
 
 import asyncio
 import atexit
+import dataclasses
+import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +25,7 @@ try:
     from textual import events as _txt_events
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.widgets import Footer, Header, Input, RichLog, Static
+    from textual.widgets import Footer, Header, Input, RichLog, Static, TextArea
     _TEXTUAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _TEXTUAL_AVAILABLE = False
@@ -30,8 +33,6 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-_USERINPUT_PASTE_CAP = 16_000
 
 # Escape sequences for all mouse-tracking modes Mnemara may enable.
 # Written to /dev/tty at process exit as a last-resort safety net in case
@@ -67,7 +68,7 @@ atexit.register(_tty_mouse_reset)
 
 from . import config as config_mod
 from . import paths
-from .gemma_agent import GemmaSession as AgentSession
+from .agent import AgentSession
 from .config import Config
 from .logging_util import log, set_log_path
 from .permissions import PermissionStore
@@ -108,16 +109,34 @@ Screen {
     padding: 0 1;
 }
 
+#keyhint {
+    height: 1;
+    background: #11151e;
+    color: #636b7a;
+    padding: 0 1;
+}
+
 #userinput {
-    height: 3;
-    min-height: 3;
+    height: auto;
+    min-height: 4;
+    max-height: 10;
     border: round #4d6fa3;
     background: #11151e;
     color: #ffffff;
+    padding: 0 1;
 }
 
 #userinput:focus {
     border: round #6f9ad9;
+}
+
+#userinput > .text-area--cursor {
+    background: #6f9ad9;
+    color: #11151e;
+}
+
+#userinput > .text-area--selection {
+    background: #2a3f5f;
 }
 """
 
@@ -176,15 +195,48 @@ def _flatten_text_blocks(content: Any) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _render_export_rows(rows: list[dict[str, Any]], instance: str) -> str:
+def _render_full_export(
+    rows: list[dict[str, Any]],
+    instance: str,
+    cfg_json: str = "",
+    role_doc_text: str = "",
+) -> str:
+    """Render a full round-trippable export with config, role_doc, and turns.
+
+    Sections are delimited by <!-- mnemara:begin:NAME --> / <!-- mnemara:end:NAME -->
+    markers so _parse_export_sections() can extract them unambiguously.
+    """
     ts = datetime.now(timezone.utc).isoformat()
-    lines = [
-        f"# Mnemara Export: {instance}",
+    lines: list[str] = [
+        f"# Mnemara Full Export: {instance}",
         "",
+        "- mnemara-export-version: 1",
         f"- exported_at: {ts}",
+        f"- instance: {instance}",
         f"- turns: {len(rows)}",
         "",
     ]
+
+    if cfg_json:
+        lines += [
+            "<!-- mnemara:begin:config -->",
+            "```json",
+            cfg_json,
+            "```",
+            "<!-- mnemara:end:config -->",
+            "",
+        ]
+
+    if role_doc_text:
+        lines += [
+            "<!-- mnemara:begin:role_doc -->",
+            role_doc_text.rstrip(),
+            "",
+            "<!-- mnemara:end:role_doc -->",
+            "",
+        ]
+
+    lines.append("<!-- mnemara:begin:turns -->")
     for row in rows:
         role = str(row.get("role", "unknown"))
         row_ts = str(row.get("ts", ""))
@@ -195,37 +247,97 @@ def _render_export_rows(rows: list[dict[str, Any]], instance: str) -> str:
         text = _flatten_text_blocks(row.get("content", ""))
         lines.append(text or "(no text content)")
         lines.append("")
+    lines.append("<!-- mnemara:end:turns -->")
+
     return "\n".join(lines).rstrip() + "\n"
 
 
+# Compiled once at import time; used by both export and import paths.
+_SECTION_RE = re.compile(
+    r"<!-- mnemara:begin:(\w+) -->\n(.*?)<!-- mnemara:end:\1 -->",
+    re.DOTALL,
+)
+
+# Matches "## role id" turn headers in the turns section.
+_TURN_HEADER_RE = re.compile(r"^## (user|assistant|system|tool)\s+(\d+)", re.MULTILINE)
+
+
+def _parse_export_sections(text: str) -> dict[str, str]:
+    """Return {section_name: raw_content} for every section in an export file."""
+    return {m.group(1): m.group(2) for m in _SECTION_RE.finditer(text)}
+
+
+def _parse_export_turns(turns_section: str) -> list[dict[str, Any]]:
+    """Parse the turns section back into [{role, content}] dicts.
+
+    Original store IDs are discarded; the store assigns new IDs on import.
+    Timestamps from the export are preserved in the content header comment
+    but store.append_turn() stamps a new ts at insertion time.
+    """
+    turns: list[dict[str, Any]] = []
+    # split() with 2 capture groups gives:
+    #   [preamble, role0, id0, body0, role1, id1, body1, ...]
+    blocks = _TURN_HEADER_RE.split(turns_section)
+    i = 1  # skip preamble at blocks[0]
+    while i + 2 < len(blocks):
+        role = blocks[i].strip()
+        # blocks[i+1] is the original row id — ignored on import
+        body = blocks[i + 2].strip()
+        # Strip leading _ts: ..._ line if present (metadata, not content)
+        body = re.sub(r"^_ts:[^\n]*_\n?", "", body).strip()
+        if not body:
+            body = "(no text content)"
+        turns.append({"role": role, "content": body})
+        i += 3
+    return turns
+
+
 # ---------------------------------------------------------------------------
-# Input widget — paste-safe subclass
+# Input widget — multi-line TextArea subclass
 # ---------------------------------------------------------------------------
 
 
-class _UserInput(Input):
-    """Input with paste behaviour tuned for the Mnemara panel.
+class _UserTextArea(TextArea):
+    """Multi-line plain-text prompt area for the Mnemara panel.
 
-    Textual's stock Input._on_paste inserts char-by-char after taking only
-    the first line.  We collapse multi-line pastes to one line (join with
-    spaces), truncate at _USERINPUT_PASTE_CAP, and do a single atomic value
-    assignment so there's one render instead of one per character.
+    Enter inserts a newline.  Ctrl+S submits.  Multi-line paste works
+    natively — no collapsing needed since TextArea handles newlines correctly.
+
+    Tab moves focus out of the input rather than inserting whitespace
+    (tab_behavior="focus"); use Shift+Tab to move backwards.
     """
 
-    def _on_paste(self, event: "_txt_events.Paste") -> None:  # type: ignore[name-defined]
-        event.prevent_default()
-        event.stop()
-        text = event.text or ""
-        if not text:
+    BINDINGS = [
+        Binding("ctrl+s",     "app.submit_prompt",  "Send",        show=True),
+        # Escape declared as a Binding for documentation, but the actual
+        # interception happens in _on_key below — TextArea swallows Escape
+        # at the key-event level before any Binding lookup runs.
+        Binding("escape",     "app.clear_input",    "Clear input", show=False, priority=True),
+        # Delegate page scroll to App so the chatlog scrolls even when input
+        # has focus.  Without these, TextArea's own scroll handling intercepts
+        # the keys and the chatlog never receives them.
+        Binding("pageup",   "app.scroll_log_up",   show=False),
+        Binding("pagedown", "app.scroll_log_down",  show=False),
+    ]
+
+    async def _on_key(self, event) -> None:  # type: ignore[override]
+        """Intercept submit and clear keys at the key-event level.
+
+        TextArea's internal key handler runs before the Binding system,
+        so bindings with app.* actions are unreliable — the widget may
+        consume the key first.  We catch Ctrl+S and Escape here instead
+        and forward them to App actions manually.
+        """
+        if event.key == "ctrl+s":
+            event.prevent_default()
+            event.stop()
+            await self.app.run_action("submit_prompt")
             return
-        lines = text.splitlines()
-        collapsed = " ".join(part for part in (s.strip() for s in lines) if part)
-        if len(collapsed) > _USERINPUT_PASTE_CAP:
-            collapsed = collapsed[:_USERINPUT_PASTE_CAP]
-        cur = self.cursor_position
-        old = self.value
-        self.value = old[:cur] + collapsed + old[cur:]
-        self.cursor_position = cur + len(collapsed)
+        if event.key == "escape":
+            event.prevent_default()
+            event.stop()
+            await self.app.run_action("clear_input")
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +407,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
             auto_scroll=True,
         )
         yield Static(self._status_text(), id="status")
-        yield _UserInput(
-            placeholder="message  (Enter to send, Ctrl+C to quit)",
+        yield Static(
+            "[dim]Enter for newline · Ctrl+S to send · Esc to clear · Ctrl+C to quit[/dim]",
+            id="keyhint",
+        )
+        yield _UserTextArea(
+            "",
+            language=None,
+            show_line_numbers=False,
+            tab_behavior="focus",
+            soft_wrap=True,
             id="userinput",
         )
         yield Footer()
@@ -353,18 +473,64 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._spinner_timer = None
 
         self._render_history()
+        self._warn_if_context_near_limit()
         self._focus_input_after_refresh()
 
     def _focus_input_after_refresh(self) -> None:
         def _do_focus() -> None:
             try:
-                self.query_one("#userinput", Input).focus()
+                self.query_one("#userinput", _UserTextArea).focus()
             except Exception:
                 pass
         try:
             self.call_after_refresh(_do_focus)
         except Exception:
             _do_focus()
+
+    # ---------------------------------------------------------------- startup checks
+
+    _CONTEXT_WARN_RATIO = 0.80        # trigger auto-evict when >= 80% of max_window_tokens
+    _CONTEXT_AUTO_EVICT_TARGET = 0.60  # trim to 60% on startup auto-evict
+
+    def _warn_if_context_near_limit(self) -> None:
+        """Auto-evict on startup if the rolling window is already near capacity.
+
+        When estimated tokens >= _CONTEXT_WARN_RATIO * max_window_tokens,
+        evict oldest turns down to _CONTEXT_AUTO_EVICT_TARGET and post a
+        single inline notice showing what was dropped.  Fires silently when
+        below the threshold.
+        """
+        try:
+            max_tok = self.cfg.max_window_tokens
+            if max_tok <= 0:
+                return
+            estimated, _ = self.store.total_tokens()
+            if estimated < max_tok * self._CONTEXT_WARN_RATIO:
+                return
+            pct_before = int(100 * estimated / max_tok)
+            target_tokens = int(max_tok * self._CONTEXT_AUTO_EVICT_TARGET)
+            rows_dropped = self.store.evict(
+                max_turns=self.cfg.max_window_turns,
+                max_tokens=target_tokens,
+            )
+            new_estimated, _ = self.store.total_tokens()
+            pct_after = int(100 * new_estimated / max_tok)
+            log(
+                "context_auto_evict_startup",
+                pct_before=pct_before,
+                pct_after=pct_after,
+                rows_dropped=rows_dropped,
+                max=max_tok,
+            )
+            msg = (
+                f"[bold yellow]⚠ rolling window was at {pct_before}%[/bold yellow] — "
+                f"auto-evicted [bold]{rows_dropped}[/bold] turn(s), "
+                f"now at {pct_after}% (~{new_estimated:,} / {max_tok:,} tokens)"
+            )
+            self._chat().write(msg)
+            self._refresh_status()
+        except Exception:
+            pass  # never crash startup over a warning
 
     # ---------------------------------------------------------------- chat log
 
@@ -375,6 +541,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
         log_widget = self._chat()
         rows = self.store.window()
         if not rows:
+            log_widget.write(
+                "[dim]Tip: Enter inserts a newline. Ctrl+S sends.[/dim]"
+            )
             log_widget.write("[dim](empty window — start chatting below)[/dim]")
             return
         for row in rows:
@@ -419,11 +588,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
             nturns = 0
         try:
             ev = self.store.get_eviction_stats()
-            rows_ev = ev["rows_evicted"]
-            blks_ev = ev["blocks_evicted"]
-            ev_str = f"{rows_ev}r"
-            if blks_ev:
-                ev_str += f" {blks_ev}b"
+            ev_str = f"{ev['rows_evicted']}r"
+            blocks = ev.get("blocks_evicted", 0)
+            if blocks > 0:
+                ev_str += f" {blocks}b"
         except Exception:
             ev_str = "0r"
         queue_str = " [yellow]⏸ queued[/yellow]" if self._queued_input is not None else ""
@@ -463,15 +631,29 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     # ---------------------------------------------------------------- events
 
-    async def on_input_submitted(self, event: "Input.Submitted") -> None:
-        if event.input.id != "userinput":
+    async def action_submit_prompt(self) -> None:
+        """Ctrl+S handler: pull text from the TextArea and dispatch."""
+        try:
+            ta = self.query_one("#userinput", _UserTextArea)
+        except Exception:
             return
-        text = (event.value or "").strip()
+        text = (ta.text or "").strip()
         if not text:
             return
-        inp = self.query_one("#userinput", Input)
-        inp.value = ""
+        ta.clear()
+        await self._handle_user_input(text)
 
+    def action_clear_input(self) -> None:
+        """Escape handler: discard whatever is in the input bar and refocus it."""
+        try:
+            ta = self.query_one("#userinput", _UserTextArea)
+        except Exception:
+            return
+        ta.clear()
+        ta.focus()
+
+    async def _handle_user_input(self, text: str) -> None:
+        """Process a submitted prompt: slash commands, queuing, or turn dispatch."""
         if text.startswith("/"):
             await self._handle_slash(text)
             self._refresh_status()
@@ -540,6 +722,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception as exc:
             log("tui_turn_error", error=str(exc))
             chat.write(f"[red]error:[/red] {exc}")
+            # Surface a recovery hint for context-length overflows.
+            exc_str = str(exc).lower()
+            if "too long" in exc_str or "context" in exc_str or "/evict" in exc_str:
+                chat.write(
+                    "[dim]hint:[/dim] run [bold]/evict N[/bold] to drop the oldest N turns,"
+                    " or [bold]/clear[/bold] to reset the window"
+                )
         finally:
             self._busy = False
             self._refresh_status()
@@ -584,24 +773,32 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self._slash_export(arg, chat)
             return
 
-        if cmd == "/stop":
-            await self._slash_stop(chat)
+        if cmd == "/import":
+            await self._slash_import(arg, chat)
             return
 
-        if cmd == "/evict":
-            self._slash_evict(arg, chat)
+        if cmd == "/stop":
+            await self._slash_stop(chat)
             return
 
         if cmd == "/clear":
             self._slash_clear(chat)
             return
 
-        if cmd == "/help":
+        if cmd == "/evict":
+            self._slash_evict(arg, chat)
+            return
+
+        if cmd in ("/help", "/?"):
             self._slash_help(chat)
             return
 
+        if line.strip() == "/compress reads":
+            self._slash_compress_reads(chat)
+            return
+
         chat.write(
-            f"[dim]unknown command: {cmd} — type /help for the full list[/dim]"
+            f"[dim]unknown command: {cmd} — try /help for a full list[/dim]"
         )
 
     def _slash_models(self, chat: "RichLog") -> None:
@@ -690,73 +887,92 @@ class MnemaraTUI(App):  # type: ignore[misc]
         else:
             chat.write("[dim]nothing in flight[/dim]")
 
-    def _slash_evict(self, arg: str, chat: "RichLog") -> None:
-        """/evict [tools|N] — context surgery.
-
-        /evict          → show current eviction stats
-        /evict tools    → strip tool_use blocks from all rows (free up bloat)
-        /evict N        → drop the oldest N rows from the rolling window
-        """
-        arg = arg.strip()
-        if not arg:
-            ev = self.store.get_eviction_stats()
-            chat.write(
-                f"[bold]eviction stats[/bold]\n"
-                f"  rows evicted   : {ev.get('rows_evicted', 0)}\n"
-                f"  blocks evicted : {ev.get('blocks_evicted', 0)}\n"
-                f"  bytes freed    : {ev.get('bytes_freed', 0)}"
-            )
-            return
-
-        if arg == "tools":
-            result = self.store.evict_tool_use_blocks(all_rows=True)
-            rows_hit = result.get("rows_modified", 0)
-            blocks_rm = result.get("blocks_evicted", 0)
-            chat.write(
-                f"[green]✓ tool_use blocks stripped[/green] — "
-                f"{blocks_rm} block(s) removed from {rows_hit} row(s)"
-            )
-            return
-
-        if arg.isdigit():
-            n = int(arg)
-            if n <= 0:
-                chat.write("[red]N must be > 0[/red]")
-                return
-            removed = self.store.evict_last(n)
-            chat.write(f"[green]✓ evicted[/green] {removed} oldest row(s)")
-            return
-
-        chat.write("[red]usage: /evict  |  /evict tools  |  /evict N[/red]")
-
     def _slash_clear(self, chat: "RichLog") -> None:
-        """/clear — wipe the entire rolling window."""
-        n = len(self.store.window())
-        if n == 0:
-            chat.write("[dim]rolling window is already empty[/dim]")
+        """/clear — erase all visible chat history (does not touch stored rows)."""
+        chat.clear()
+        chat.write("[dim]chat display cleared (conversation history is preserved in storage)[/dim]")
+        self._refresh_status()
+
+    def _slash_evict(self, arg: str, chat: "RichLog") -> None:
+        """/evict [tools|thinking|N|last N] — free context budget.
+
+        /evict tools    — strip tool_use blocks from all stored rows
+        /evict thinking — strip thinking blocks from all stored rows
+        /evict N        — drop the N oldest rows (budget reclaim, keeps recent context)
+        /evict last N   — drop the N most-recent rows (rollback a bad paste/turn)
+        /evict          — show eviction stats
+        """
+        arg = arg.strip().lower()
+        ev = self.store.get_eviction_stats()
+        if not arg:
+            chat.write(
+                f"[bold]eviction stats[/bold]  "
+                f"rows: {ev['rows_evicted']} | blocks: {ev.get('blocks_evicted', 0)} | "
+                f"bytes freed: {ev.get('bytes_freed', 0):,}"
+            )
             return
-        removed = self.store.evict_last(n)
-        chat.write(f"[green]✓ cleared[/green] {removed} row(s) — rolling window wiped")
+
+        try:
+            if arg == "tools":
+                result = self.store.evict_tool_use_blocks(all_rows=True)
+                freed = result.get("blocks_evicted", result.get("rows_modified", 0))
+                chat.write(f"[green]/evict tools:[/green] {freed} tool_use block(s) stripped")
+            elif arg == "thinking":
+                result = self.store.evict_thinking_blocks(all_rows=True)
+                freed = result.get("blocks_evicted", result.get("rows_modified", 0))
+                chat.write(f"[green]/evict thinking:[/green] {freed} thinking block(s) stripped")
+            elif arg.isdigit():
+                n = int(arg)
+                dropped = self.store.evict_oldest(n)
+                chat.write(f"[green]/evict {n}:[/green] {dropped} oldest row(s) evicted")
+            elif arg.startswith("last ") and arg[5:].strip().isdigit():
+                n = int(arg[5:].strip())
+                dropped = self.store.evict_last(n)
+                chat.write(f"[green]/evict last {n}:[/green] {dropped} most-recent row(s) evicted")
+            else:
+                chat.write("[dim]/evict [tools|thinking|N|last N] — see /help[/dim]")
+                return
+        except Exception as exc:
+            chat.write(f"[red]evict error: {exc}[/red]")
+        self._refresh_status()
+
+    def _slash_compress_reads(self, chat: "RichLog") -> None:
+        """/compress reads — stub earlier Read tool_results with diffs vs latest."""
+        try:
+            result = self.store.compress_repeated_reads(skip_pinned=True)
+            chat.write(
+                f"[green]compressed reads:[/green] {result['reads_compressed']} read(s) stubbed, "
+                f"{result['bytes_freed']:,} bytes freed"
+            )
+        except Exception as exc:
+            chat.write(f"[red]compress reads error: {exc}[/red]")
+        self._refresh_status()
 
     def _slash_help(self, chat: "RichLog") -> None:
-        """/help — print all available slash commands."""
-        chat.write(
-            "[bold]slash commands[/bold]\n"
-            "  /quit, /exit          — close the panel\n"
-            "  /stop                 — interrupt the current streaming turn\n"
-            "  /models               — list available Gemma models\n"
-            "  /swap MODEL           — switch model by index, alias, or name\n"
-            "  /tokens N             — set rolling-window token cap\n"
-            "  /export [N] [path]    — export chat turns to a markdown file\n"
-            "  /evict                — show eviction stats\n"
-            "  /evict tools          — strip tool_use blocks from all rows\n"
-            "  /evict N              — drop oldest N rows from rolling window\n"
-            "  /clear                — wipe the entire rolling window\n"
-            "  /help                 — show this message"
-        )
+        """/help — list available slash commands."""
+        lines = [
+            "[bold]slash commands[/bold]",
+            "  /help, /?               — show this list",
+            "  /clear                  — clear display (keeps history)",
+            "  /models                 — list available models",
+            "  /swap MODEL             — switch to MODEL (in-session only)",
+            "  /tokens N [--temp]      — set max context window",
+            "  /evict                  — show eviction stats",
+            "  /evict tools            — strip tool_use blocks",
+            "  /evict thinking         — strip thinking blocks",
+            "  /evict N                — drop N oldest rows (budget reclaim)",
+            "  /evict last N           — drop N most-recent rows (rollback)",
+            "  /compress reads         — stub repeated Read results with diffs",
+            "  /export [N] [path]      — export turns + config + role_doc to markdown",
+            "  /import <path>          — restore turns from a full export file",
+            "  /stop                   — cancel active streaming turn",
+            "  /quit, /exit            — exit",
+        ]
+        for line in lines:
+            chat.write(line)
 
     async def _slash_export(self, arg: str, chat: "RichLog") -> None:
-        """/export [N] [path] — write rolling-window text to markdown."""
+        """/export [N] [path] — write full round-trippable markdown export."""
         parts = arg.split()
         n: int | None = None
         out_path: Path | None = None
@@ -792,28 +1008,92 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 for c in self.instance
             )
             out_path = Path(tempfile.gettempdir()) / f"mnemara_{safe_instance}_{stamp}.md"
+
+        # Gather config JSON (safe — dataclasses.asdict handles nested dataclasses)
+        try:
+            cfg_json = json.dumps(dataclasses.asdict(self.cfg), indent=2)
+        except Exception:
+            cfg_json = ""
+
+        # Read role doc text if a path is configured
+        role_doc_text = ""
+        if self.cfg.role_doc_path:
+            try:
+                role_doc_text = Path(self.cfg.role_doc_path).read_text(encoding="utf-8")
+            except Exception:
+                pass
+
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(
-                _render_export_rows(rows, self.instance),
+                _render_full_export(rows, self.instance, cfg_json, role_doc_text),
                 encoding="utf-8",
             )
         except Exception as exc:
             chat.write(f"[red]export failed: {exc}[/red]")
             return
-        chat.write(f"[green]exported {len(rows)} turn(s):[/green] {out_path}")
+        sections_written = ["turns"]
+        if cfg_json:
+            sections_written.append("config")
+        if role_doc_text:
+            sections_written.append("role_doc")
+        chat.write(
+            f"[green]exported {len(rows)} turn(s):[/green] {out_path}  "
+            f"[dim](sections: {', '.join(sections_written)})[/dim]"
+        )
+
+    async def _slash_import(self, arg: str, chat: "RichLog") -> None:
+        """/import <path> — restore turns from an export file (turns section only)."""
+        arg = arg.strip()
+        if not arg:
+            chat.write("[red]usage: /import <path>[/red]")
+            return
+        path = Path(arg).expanduser()
+        if not path.exists():
+            chat.write(f"[red]file not found: {path}[/red]")
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            chat.write(f"[red]read failed: {exc}[/red]")
+            return
+
+        sections = _parse_export_sections(text)
+        if "turns" not in sections:
+            chat.write("[red]no turns section found — is this a full mnemara export?[/red]")
+            return
+
+        turns = _parse_export_turns(sections["turns"])
+        old_count = len(self.store.window())
+        self.store.clear()
+        for t in turns:
+            self.store.append_turn(role=t["role"], content=t["content"])
+
+        chat.write(
+            f"[green]imported {len(turns)} turn(s)[/green] "
+            f"(replaced {old_count} previous turn(s) — {path.name})"
+        )
+        self._refresh_status()
 
     # ---------------------------------------------------------------- actions
 
     def action_paste(self) -> None:
+        """Ctrl+V paste: read clipboard via pyperclip and insert at cursor.
+
+        TextArea handles multi-line content natively, so no collapsing is
+        needed.  The insert() call places text at the current cursor position,
+        replacing any active selection.
+        """
         try:
             import pyperclip
-            text = pyperclip.paste()
-            inp = self.query_one("#userinput", Input)
-            cur = inp.cursor_position
-            old = inp.value
-            inp.value = old[:cur] + text + old[cur:]
-            inp.cursor_position = cur + len(text)
+            raw = pyperclip.paste()
+        except Exception:
+            return
+        if not raw:
+            return
+        try:
+            ta = self.query_one("#userinput", _UserTextArea)
+            ta.insert(raw)
         except Exception:
             pass
 

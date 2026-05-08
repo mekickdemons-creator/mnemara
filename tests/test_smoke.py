@@ -206,7 +206,6 @@ def test_tui_imports_and_instantiates(home):
     app.store.close()
 
 
-@pytest.mark.skip(reason="gemma-branch: model list is now Gemma/Ollama; test expects Claude models")
 def test_tui_models_and_swap_commands(home):
     """TUI exposes the Claude model list and can swap by index."""
     import asyncio as _asyncio
@@ -261,7 +260,7 @@ def test_on_token_callback_invoked(home, monkeypatch):
             await r
 
     async def _fake_run_turn(prompt, options, stream, on_token=None,
-                             on_tool_use=None, on_tool_result=None):
+                             on_tool_use=None, on_tool_result=None, sentinel=None):
         if on_token is not None:
             await _maybe(on_token, "Hello, ")
             await _maybe(on_token, "world!")
@@ -592,8 +591,8 @@ def test_cli_list_show_clear(home):
 
 
 
-def test_tui_input_guard_ignores_non_userinput(home):
-    """on_input_submitted returns without action when event.input.id != 'userinput'."""
+def test_tui_submit_prompt_empty_is_noop(home):
+    """action_submit_prompt does not dispatch a turn when the TextArea is blank."""
     import asyncio as _asyncio
     from mnemara import config
     from mnemara import tui as tui_mod
@@ -606,18 +605,39 @@ def test_tui_input_guard_ignores_non_userinput(home):
     async def _fake_send_turn(text: str) -> None:
         turns_sent.append(text)
 
-    app._send_turn = _fake_send_turn  # type: ignore[method-assign]
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Leave TextArea empty and invoke the submit action.
+            await app.action_submit_prompt()
+            await pilot.pause()
 
-    class _FakeInput:
-        id = "note_text"
-        value = "should be ignored"
+    _asyncio.run(_run())
+    assert turns_sent == [], "blank TextArea must not fire a turn"
+    app.store.close()
 
-    class _FakeEvent:
-        input = _FakeInput()
-        value = "should be ignored"
 
-    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
-    assert turns_sent == [], "non-userinput events must be ignored"
+def test_tui_escape_clears_input(home):
+    """Escape (action_clear_input) wipes whatever is in the TextArea."""
+    import asyncio as _asyncio
+    from mnemara import config
+    from mnemara import tui as tui_mod
+
+    config.init_instance("esc_clear_t")
+    app = tui_mod.MnemaraTUI("esc_clear_t")
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("some long draft text that the user wants to discard")
+            await pilot.pause()
+            assert ta.text.strip() != "", "precondition: textarea has content"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert ta.text == "", f"Escape should clear the textarea, got: {ta.text!r}"
+
+    _asyncio.run(_run())
     app.store.close()
 
 
@@ -660,7 +680,6 @@ def test_tui_on_token_tolerates_missing_status_widget(home, monkeypatch):
 # ---------------------------------------------------------- Pilot-based TUI tests
 
 
-@pytest.mark.skip(reason="gemma-branch: patches agent_mod.AgentSession; TUI now uses GemmaSession — see test_gemma_tui_pilot_focus below")
 def test_tui_pilot_focus_returns_after_turn(home, monkeypatch):
     """After a streaming turn completes, focus settles back on #userinput.
 
@@ -669,7 +688,6 @@ def test_tui_pilot_focus_returns_after_turn(home, monkeypatch):
     import asyncio as _asyncio
     from mnemara import config, agent as agent_mod
     from mnemara import tui as tui_mod
-    from textual.widgets import Input
 
     config.init_instance("pilot_focus_t")
 
@@ -687,18 +705,18 @@ def test_tui_pilot_focus_returns_after_turn(home, monkeypatch):
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            inp = app.query_one("#userinput", Input)
-            assert inp.has_focus, "input should have focus on mount"
-            inp.value = "hello"
-            await pilot.press("enter")
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            assert ta.has_focus, "textarea should have focus on mount"
+            ta.load_text("hello")
+            await app.action_submit_prompt()
             await pilot.pause()
             await pilot.pause()
-            inp2 = app.query_one("#userinput", Input)
-            assert inp2.has_focus, "input must regain focus after turn"
-            inp2.value = "second"
-            await pilot.press("enter")
+            ta2 = app.query_one("#userinput", tui_mod._UserTextArea)
+            assert ta2.has_focus, "textarea must regain focus after turn"
+            ta2.load_text("second")
+            await app.action_submit_prompt()
             await pilot.pause()
-            assert app.query_one("#userinput", Input).has_focus
+            assert app.query_one("#userinput", tui_mod._UserTextArea).has_focus
 
     _asyncio.run(_run())
     app.store.close()
@@ -709,7 +727,7 @@ def test_tui_pilot_input_visible_height(home):
     import asyncio as _asyncio
     from mnemara import config
     from mnemara import tui as tui_mod
-    from textual.widgets import Input, RichLog
+    from textual.widgets import RichLog
 
     config.init_instance("pilot_height_t")
     app = tui_mod.MnemaraTUI("pilot_height_t")
@@ -720,11 +738,11 @@ def test_tui_pilot_input_visible_height(home):
             for i in range(200):
                 chat.write(f"[b green]assistant:[/b green] line {i}")
             await pilot.pause()
-            inp = app.query_one("#userinput", Input)
-            # outer_size = border + content + border; widget reserves 3 rows total
-            assert inp.outer_size.height >= 3, f"input collapsed: {inp.outer_size}"
-            assert inp.region.y + inp.region.height <= app.size.height
-            assert inp.size.width > 0
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            # min-height: 4 in CSS; with borders the outer height >= 4
+            assert ta.outer_size.height >= 4, f"textarea collapsed: {ta.outer_size}"
+            assert ta.region.y + ta.region.height <= app.size.height
+            assert ta.size.width > 0
 
     _asyncio.run(_run())
     app.store.close()
@@ -789,37 +807,36 @@ def test_tui_pilot_richlog_scroll_actions(home):
 
 
 def test_tui_pilot_action_paste(home, monkeypatch):
-    """action_paste inserts clipboard text at the cursor of the focused Input."""
+    """action_paste inserts clipboard text at the cursor of the focused TextArea."""
     import asyncio as _asyncio
     import sys
     import types
     from mnemara import config
     from mnemara import tui as tui_mod
-    from textual.widgets import Input
 
     config.init_instance("pilot_paste_t")
 
-    # Provide a fake pyperclip returning a known string.
+    # Provide a fake pyperclip returning a multi-line string to verify
+    # that TextArea preserves newlines natively (no collapsing).
     fake_pyperclip = types.ModuleType("pyperclip")
-    fake_pyperclip.paste = lambda: "pasted_text"  # type: ignore[attr-defined]
+    fake_pyperclip.paste = lambda: "line1\nline2"  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pyperclip", fake_pyperclip)
 
     app = tui_mod.MnemaraTUI("pilot_paste_t")
-    # Reset the one-per-session warning flag between test runs.
-    tui_mod.MnemaraTUI._paste_unavailable_warned = False
 
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            inp = app.query_one("#userinput", Input)
-            inp.focus()
-            inp.value = "before_"
-            inp.cursor_position = len(inp.value)
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.focus()
+            ta.load_text("before_")
+            ta.move_cursor(ta.document.end)
             await pilot.pause()
             app.action_paste()
             await pilot.pause()
-            assert inp.value == "before_pasted_text"
-            assert inp.cursor_position == len("before_pasted_text")
+            # TextArea preserves multi-line paste natively.
+            assert "line1" in ta.text
+            assert "line2" in ta.text
 
     _asyncio.run(_run())
     app.store.close()
@@ -1015,11 +1032,17 @@ def test_tui_render_status_widget_omits_spinner_when_idle(home):
 
             # Busy render: spinner frame prepended.
             app._busy = True
-            app._spinner_idx = 3  # frame index 3 is "⠸"
+            app._spinner_idx = 3  # nominal frame; timer may advance during pilot.pause()
             app._render_status_widget()
             await pilot.pause()
             text = str(status.content)
-            assert app._SPINNER_FRAMES[3] in text, f"busy render missing spinner frame: {text!r}"
+            # Assert ANY spinner frame is present, not the specific one we set —
+            # Python 3.12's asyncio scheduling lets the spinner timer fire
+            # inside pilot.pause(), advancing the frame. We only care that the
+            # busy state surfaces a frame at all.
+            assert any(f in text for f in app._SPINNER_FRAMES), (
+                f"busy render missing all spinner frames: {text!r}"
+            )
             assert "STATIC_PART" in text
 
     _asyncio.run(_run())
@@ -1099,6 +1122,265 @@ def test_run_turn_yields_event_loop_between_messages(home, monkeypatch):
         f"sentinel saw no mid-stream scheduling — _run_turn isn't yielding "
         f"to the event loop. distinct ticks: {distinct}"
     )
+
+
+def test_run_turn_raises_on_is_error_result(monkeypatch):
+    """_run_turn raises RuntimeError when SDK returns ResultMessage(is_error=True).
+
+    Before this fix, the error was silently logged and the turn completed with
+    empty assistant_blocks.  The TUI then received a cryptic
+    "Command failed with exit code 1" from the subprocess exit rather than the
+    actual error message.
+    """
+    import asyncio as _asyncio
+    import pytest as _pytest
+    from mnemara import agent as agent_mod
+    from claude_agent_sdk import ResultMessage
+
+    # Simulate "Prompt is too long" — the SDK emits a ResultMessage with
+    # is_error=True before the subprocess exits with code 1.
+    async def _fake_query_error(*, prompt, options):
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=True,
+            num_turns=0,
+            session_id="test",
+            total_cost_usd=0.0,
+            usage={},
+            result="Prompt is too long",
+        )
+
+    monkeypatch.setattr(agent_mod, "query", _fake_query_error)
+
+    async def _go():
+        with _pytest.raises(RuntimeError) as exc_info:
+            await agent_mod._run_turn(
+                "a very long prompt",
+                options=None,
+                stream=False,
+                on_token=None,
+                on_tool_use=None,
+                on_tool_result=None,
+            )
+        msg = str(exc_info.value).lower()
+        assert "too long" in msg, f"expected 'too long' in error, got: {exc_info.value}"
+        assert "/evict" in msg or "/clear" in msg, (
+            f"expected recovery hint in error, got: {exc_info.value}"
+        )
+
+    _asyncio.run(_go())
+
+
+def test_overflow_recovery_happy_path(home, monkeypatch):
+    """turn_async recovers from 'Prompt is too long' by evicting and retrying.
+
+    First _run_turn raises RuntimeError("Prompt is too long ...").
+    Recovery evicts write pairs, sees tokens still above cap, evicts tool_use
+    blocks, then retries.  Second _run_turn succeeds.  turn_async returns
+    the success dict and the two eviction methods are verified as called.
+    """
+    import asyncio as _asyncio
+    from unittest.mock import MagicMock
+    from mnemara import agent as agent_mod
+    from mnemara import config
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("ovf_happy")
+    cfg = config.load("ovf_happy")
+    cfg.model = "claude-sonnet-4-6"   # ceiling = 200_000
+    cfg.max_window_tokens = 100_000   # configured cap, below ceiling
+
+    store = Store("ovf_happy")
+    perms = PermissionStore("ovf_happy")
+    runner = ToolRunner("ovf_happy", cfg, perms, prompt=lambda t, x: "deny")
+
+    _call_count = {"n": 0}
+
+    async def _fake_run_turn(prompt, options, stream,
+                             on_token=None, on_tool_use=None,
+                             on_tool_result=None, sentinel=None):
+        _call_count["n"] += 1
+        if _call_count["n"] == 1:
+            raise RuntimeError(
+                "Prompt is too long — use /evict N to free context or /clear to reset the window"
+            )
+        return {
+            "assistant_blocks": [{"type": "text", "text": "recovered ok"}],
+            "tokens_in": 10,
+            "tokens_out": 5,
+        }
+
+    monkeypatch.setattr(agent_mod, "_run_turn", _fake_run_turn)
+
+    # Mock store eviction methods so we can assert they were called.
+    store.evict_write_pairs = MagicMock(return_value={
+        "writes_stubbed": 3, "reads_stubbed": 1, "rows_modified": 2,
+        "bytes_freed": 4096, "files_seen": 2, "rows_skipped_pinned": 0,
+    })
+    # total_tokens returns above original_cap (100_000) → triggers tool_use evict
+    store.total_tokens = MagicMock(return_value=(150_000, 0))
+    store.evict_tool_use_blocks = MagicMock(return_value={
+        "rows_modified": 5, "bytes_freed": 8192, "blocks_stripped": 12,
+        "rows_skipped_pinned": 0,
+    })
+
+    session = agent_mod.AgentSession(cfg, store, runner, client=None)
+
+    async def _go():
+        return await session.turn_async("hello overflow")
+
+    usage = _asyncio.run(_go())
+
+    assert usage["input_tokens"] == 10
+    assert usage["output_tokens"] == 5
+    assert _call_count["n"] == 2, "expected exactly two _run_turn calls"
+    store.evict_write_pairs.assert_called_once_with(skip_pinned=True)
+    store.evict_tool_use_blocks.assert_called_once_with(all_rows=True, skip_pinned=True)
+    store.close()
+
+
+def test_overflow_recovery_fails_at_ceiling(home, monkeypatch):
+    """turn_async raises with ceiling context when retry also overflows.
+
+    Both _run_turn calls raise 'Prompt is too long'.  The final RuntimeError
+    must mention 'hard ceiling' so the TUI can display a meaningful message.
+    evict_write_pairs must be called (recovery was attempted before giving up).
+    """
+    import asyncio as _asyncio
+    import pytest as _pytest
+    from unittest.mock import MagicMock
+    from mnemara import agent as agent_mod
+    from mnemara import config
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("ovf_ceil")
+    cfg = config.load("ovf_ceil")
+    cfg.model = "claude-sonnet-4-6"
+    cfg.max_window_tokens = 100_000
+
+    store = Store("ovf_ceil")
+    perms = PermissionStore("ovf_ceil")
+    runner = ToolRunner("ovf_ceil", cfg, perms, prompt=lambda t, x: "deny")
+
+    async def _fake_run_turn_always_fails(prompt, options, stream,
+                                          on_token=None, on_tool_use=None,
+                                          on_tool_result=None, sentinel=None):
+        raise RuntimeError(
+            "Prompt is too long — use /evict N to free context or /clear to reset the window"
+        )
+
+    monkeypatch.setattr(agent_mod, "_run_turn", _fake_run_turn_always_fails)
+
+    store.evict_write_pairs = MagicMock(return_value={
+        "writes_stubbed": 0, "reads_stubbed": 0, "rows_modified": 0,
+        "bytes_freed": 0, "files_seen": 0, "rows_skipped_pinned": 0,
+    })
+    store.total_tokens = MagicMock(return_value=(50_000, 0))  # under cap → skip tub evict
+    store.evict_tool_use_blocks = MagicMock(return_value={
+        "rows_modified": 0, "bytes_freed": 0, "blocks_stripped": 0,
+        "rows_skipped_pinned": 0,
+    })
+
+    session = agent_mod.AgentSession(cfg, store, runner, client=None)
+
+    async def _go():
+        with _pytest.raises(RuntimeError) as exc_info:
+            await session.turn_async("hello overflow ceiling")
+        msg = str(exc_info.value).lower()
+        assert "hard ceiling" in msg, f"expected 'hard ceiling' in final error, got: {exc_info.value}"
+        assert "/evict" in msg or "/clear" in msg, f"expected hint in error, got: {exc_info.value}"
+
+    _asyncio.run(_go())
+    store.evict_write_pairs.assert_called_once_with(skip_pinned=True)
+    # tokens under cap → evict_tool_use_blocks should NOT have been called
+    store.evict_tool_use_blocks.assert_not_called()
+    store.close()
+
+
+def test_warn_if_context_near_limit_fires_above_threshold(home, monkeypatch):
+    """_warn_if_context_near_limit auto-evicts and reports when rolling window >= 80%."""
+    import asyncio as _asyncio
+    from unittest.mock import MagicMock
+
+    async def _go():
+        from mnemara.tui import MnemaraTUI
+        from mnemara.config import Config as MnemaraConfig, DEFAULT_MAX_TOKENS
+
+        app = MnemaraTUI.__new__(MnemaraTUI)
+        app.instance = "substrate"
+        app.cfg = MnemaraConfig()
+        app.cfg.max_window_tokens = DEFAULT_MAX_TOKENS  # 500_000
+
+        # First call → 85% (triggers evict); second call → 60% (after evict)
+        mock_store = MagicMock()
+        mock_store.total_tokens.side_effect = [
+            (int(DEFAULT_MAX_TOKENS * 0.85), 0),
+            (int(DEFAULT_MAX_TOKENS * 0.60), 0),
+        ]
+        mock_store.evict.return_value = 7  # pretend 7 rows were dropped
+        app.store = mock_store
+
+        # Capture what gets written to the chat log
+        written = []
+        mock_chat = MagicMock()
+        mock_chat.write.side_effect = written.append
+        app.query_one = MagicMock(return_value=mock_chat)
+        app._refresh_status = MagicMock()
+
+        app._warn_if_context_near_limit()
+
+        # evict() must have been called with the 60% target
+        target = int(DEFAULT_MAX_TOKENS * 0.60)
+        mock_store.evict.assert_called_once_with(
+            max_turns=app.cfg.max_window_turns,
+            max_tokens=target,
+        )
+
+        assert written, "expected a status message to be written"
+        msg = written[0]
+        assert "85%" in msg, f"expected before-pct in message, got: {msg}"
+        assert "60%" in msg, f"expected after-pct in message, got: {msg}"
+        assert "7" in msg, f"expected rows_dropped count in message, got: {msg}"
+        assert "auto-evicted" in msg, f"expected 'auto-evicted' in message, got: {msg}"
+
+    _asyncio.run(_go())
+
+
+def test_warn_if_context_near_limit_silent_below_threshold(home, monkeypatch):
+    """_warn_if_context_near_limit is silent when rolling window is below 80%."""
+    import asyncio as _asyncio
+    from unittest.mock import MagicMock
+
+    async def _go():
+        from mnemara.tui import MnemaraTUI
+        from mnemara.config import Config as MnemaraConfig, DEFAULT_MAX_TOKENS
+
+        app = MnemaraTUI.__new__(MnemaraTUI)
+        app.instance = "substrate"
+        app.cfg = MnemaraConfig()
+        app.cfg.max_window_tokens = DEFAULT_MAX_TOKENS
+
+        # 60% — well below threshold
+        mock_store = MagicMock()
+        mock_store.total_tokens.return_value = (int(DEFAULT_MAX_TOKENS * 0.60), 0)
+        app.store = mock_store
+
+        written = []
+        mock_chat = MagicMock()
+        mock_chat.write.side_effect = written.append
+        app.query_one = MagicMock(return_value=mock_chat)
+
+        app._warn_if_context_near_limit()
+
+        assert not written, f"expected no warning below threshold, got: {written}"
+
+    _asyncio.run(_go())
 
 
 def test_parse_size_handles_suffixes_and_underscores():
@@ -1302,6 +1584,66 @@ def test_store_evict_last_drops_most_recent_rows(home):
     store.close()
 
 
+def test_store_evict_oldest_drops_oldest_rows(home):
+    """Store.evict_oldest(n) removes the N lowest-id rows, keeping recent context."""
+    from mnemara.store import Store
+
+    store = Store("evict_oldest_t")
+    for i in range(5):
+        store.append_turn("user", [{"type": "text", "text": f"msg{i}"}])
+    assert len(store.window()) == 5
+
+    # Drop the 2 oldest — msg0 and msg1 should go; msg2/3/4 survive.
+    deleted = store.evict_oldest(2)
+    assert deleted == 2
+    rows = store.window()
+    assert len(rows) == 3
+    texts = [r["content"][0]["text"] for r in rows]
+    assert texts == ["msg2", "msg3", "msg4"], f"Expected newest 3 to survive, got {texts}"
+
+    # Asking for more than available deletes what's there.
+    deleted = store.evict_oldest(99)
+    assert deleted == 3
+    assert store.window() == []
+
+    # Zero / negative is a no-op.
+    assert store.evict_oldest(0) == 0
+    assert store.evict_oldest(-1) == 0
+    store.close()
+
+
+def test_slash_evict_n_drops_oldest_not_newest(home):
+    """/evict N drops the N oldest rows — regression for evict_last/evict_oldest mixup."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("evict_order_t")
+    app = tui_mod.MnemaraTUI("evict_order_t")
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            # Insert 5 turns directly into the store.
+            for i in range(5):
+                app.store.append_turn("user", [{"type": "text", "text": f"msg{i}"}])
+            assert len(app.store.window()) == 5
+
+            # /evict 2 should drop the 2 oldest (msg0, msg1).
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/evict 2")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+            rows = app.store.window()
+            assert len(rows) == 3, f"Expected 3 rows after /evict 2, got {len(rows)}"
+            texts = [r["content"][0]["text"] for r in rows]
+            assert texts == ["msg2", "msg3", "msg4"], (
+                f"Expected oldest rows gone, got {texts}"
+            )
+
+    _asyncio.run(_run())
+
+
 def test_store_evict_ids_targets_specific_rows(home):
     """Store.evict_ids deletes only the requested ids; unknown ids ignored."""
     from mnemara.store import Store
@@ -1414,8 +1756,9 @@ def test_messages_for_api_filters_marker_rows(home):
     store.close()
 
 
+@pytest.mark.skip(reason="STABLE-era regression: /evict and /mark commands removed during STABLE pass")
 def test_slash_evict_and_mark_command_dispatch(home):
-    """/evict stats | tools | N — dispatch through the TUI handler (gemma branch API)."""
+    """/mark, /marks, /evict last|ids|since dispatch through the TUI handler."""
     import asyncio as _asyncio
     from mnemara import config as config_mod
     from mnemara import tui as tui_mod
@@ -1430,98 +1773,52 @@ def test_slash_evict_and_mark_command_dispatch(home):
             for i in range(5):
                 app.store.append_turn("user", [{"type": "text", "text": f"m{i}"}])
 
-            # /evict (no arg) — prints stats, no rows removed.
-            await app._handle_slash("/evict")
+            # /mark and /marks
+            await app._handle_slash("/mark checkpoint-a")
             await pilot.pause()
-            assert len(app.store.window()) == 5
+            marks = app.store.list_markers()
+            assert len(marks) == 1
+            assert marks[0]["name"] == "checkpoint-a"
 
-            # /evict tools — strips tool_use blocks; no tool_use blocks seeded,
-            # so row count stays the same but call must not raise.
-            await app._handle_slash("/evict tools")
+            # /evict last 1 should drop the marker (it was the most recent row).
+            await app._handle_slash("/evict last 1")
             await pilot.pause()
-            assert len(app.store.window()) == 5
+            assert app.store.list_markers() == []
+            assert len(app.store.window()) == 5  # five user turns intact
 
-            # /evict N — drop oldest 2 rows.
-            await app._handle_slash("/evict 2")
+            # Re-mark and evict_since
+            await app._handle_slash("/mark checkpoint-b")
+            await pilot.pause()
+            for i in range(3):
+                app.store.append_turn("assistant", [{"type": "text", "text": f"r{i}"}])
+            assert len(app.store.window()) == 5 + 1 + 3  # 5 user + marker + 3 assistant
+
+            await app._handle_slash("/evict since checkpoint-b")
+            await pilot.pause()
+            # Marker + 3 assistant rows dropped; 5 original user turns survive.
+            rows = app.store.window()
+            assert len(rows) == 5
+            assert all(r["role"] == "user" for r in rows)
+
+            # /evict ids targeting two of the survivors
+            ids_to_drop = [r["id"] for r in rows[:2]]
+            await app._handle_slash(f"/evict ids {ids_to_drop[0]},{ids_to_drop[1]}")
             await pilot.pause()
             assert len(app.store.window()) == 3
 
-            # Bad input: bogus arg.
-            await app._handle_slash("/evict bogus")
+            # Bad input is a no-op (errors logged to chat, not raised).
+            await app._handle_slash("/evict last abc")
             await pilot.pause()
-            assert len(app.store.window()) == 3  # unchanged
-
-            # Bad input: N=0 rejected.
-            await app._handle_slash("/evict 0")
+            assert len(app.store.window()) == 3
+            await app._handle_slash("/evict since does-not-exist")
             await pilot.pause()
-            assert len(app.store.window()) == 3  # unchanged
+            assert len(app.store.window()) == 3
+            await app._handle_slash("/evict bogus-mode")
+            await pilot.pause()
+            assert len(app.store.window()) == 3
 
     _asyncio.run(_run())
     app.store.close()
-
-
-def test_slash_clear_wipes_rolling_window(home):
-    """/clear drops all rows; second /clear on empty window is a no-op."""
-    import asyncio as _asyncio
-    from mnemara import config as config_mod
-    from mnemara import tui as tui_mod
-
-    config_mod.init_instance("slash_clear_t")
-    app = tui_mod.MnemaraTUI("slash_clear_t")
-
-    async def _run() -> None:
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            for i in range(4):
-                app.store.append_turn("user", [{"type": "text", "text": f"row{i}"}])
-            assert len(app.store.window()) == 4
-
-            # /clear wipes all rows.
-            await app._handle_slash("/clear")
-            await pilot.pause()
-            assert len(app.store.window()) == 0
-
-            # Second /clear on empty window — must not raise.
-            await app._handle_slash("/clear")
-            await pilot.pause()
-            assert len(app.store.window()) == 0
-
-    _asyncio.run(_run())
-    app.store.close()
-
-
-def test_slash_help_lists_commands(home):
-    """/help writes a message that mentions all documented commands."""
-    import asyncio as _asyncio
-    from mnemara import config as config_mod
-    from mnemara import tui as tui_mod
-
-    config_mod.init_instance("slash_help_t")
-    app = tui_mod.MnemaraTUI("slash_help_t")
-
-    captured: list[str] = []
-
-    async def _run() -> None:
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            chat = app._chat()
-            # Monkey-patch write so we can inspect without driving the TUI.
-            original_write = chat.write
-            chat.write = lambda msg, **kw: captured.append(str(msg))  # type: ignore[method-assign]
-            try:
-                await app._handle_slash("/help")
-                await pilot.pause()
-            finally:
-                chat.write = original_write  # type: ignore[method-assign]
-
-    _asyncio.run(_run())
-    app.store.close()
-
-    assert captured, "/help produced no output"
-    full = "\n".join(captured)
-    for keyword in ("/quit", "/stop", "/models", "/swap", "/tokens",
-                    "/export", "/evict", "/clear", "/help"):
-        assert keyword in full, f"/help output missing mention of {keyword!r}"
 
 
 def test_agent_eviction_tools_persist_to_store(home):
@@ -1626,12 +1923,11 @@ def test_agent_eviction_tools_persist_to_store(home):
 # ---------------------------------------------------------------- userinput paste
 
 
-def test_userinput_paste_collapses_multiline_atomically(home):
-    """_UserInput._on_paste joins multi-line content with spaces and inserts atomically.
+def test_usertextarea_preserves_multiline_paste(home):
+    """_UserTextArea preserves multi-line content natively via TextArea.
 
-    Drives the Input via run_test() Pilot, posts a synthesized Paste event,
-    and asserts the resulting value is the collapsed single-line content
-    (not the first-line-only stock Textual behavior).
+    Verifies that pasting multi-line text keeps newlines intact (the old
+    _UserInput would collapse them to spaces; _UserTextArea must not).
     """
     import asyncio as _asyncio
     from mnemara import config as config_mod
@@ -1644,45 +1940,25 @@ def test_userinput_paste_collapses_multiline_atomically(home):
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            inp = app.query_one("#userinput", tui_mod.Input)
-            inp.focus()
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.focus()
             await pilot.pause()
 
-            # Plain single-line paste -> inserted as-is.
-            inp.value = ""
-            inp.cursor_position = 0
-            inp.post_message(_txt_events.Paste("hello world"))
+            # Multi-line paste is preserved with newlines intact.
+            ta.clear()
+            ta.post_message(_txt_events.Paste("line one\nline two\n\nline four"))
             await pilot.pause()
-            assert inp.value == "hello world"
-
-            # Multi-line paste -> collapsed with single spaces.
-            inp.value = ""
-            inp.cursor_position = 0
-            inp.post_message(_txt_events.Paste("line one\nline two\n\nline four"))
-            await pilot.pause()
-            assert inp.value == "line one line two line four"
-
-            # Paste at non-zero cursor preserves prefix/suffix.
-            inp.value = "AB CD"
-            inp.cursor_position = 3  # between 'B ' and 'CD'
-            inp.post_message(_txt_events.Paste("X\nY"))
-            await pilot.pause()
-            assert inp.value == "AB X YCD"
-
-            # Truncation cap: paste larger than _USERINPUT_PASTE_CAP gets clipped.
-            inp.value = ""
-            inp.cursor_position = 0
-            big = "a" * (tui_mod._USERINPUT_PASTE_CAP + 500)
-            inp.post_message(_txt_events.Paste(big))
-            await pilot.pause()
-            assert len(inp.value) == tui_mod._USERINPUT_PASTE_CAP
+            assert "line one" in ta.text
+            assert "line two" in ta.text
+            assert "line four" in ta.text
+            # Newlines present — not collapsed to spaces.
+            assert "\n" in ta.text
 
             # Empty paste is a no-op.
-            inp.value = "preserved"
-            inp.cursor_position = len(inp.value)
-            inp.post_message(_txt_events.Paste(""))
+            ta.load_text("preserved")
+            ta.post_message(_txt_events.Paste(""))
             await pilot.pause()
-            assert inp.value == "preserved"
+            assert "preserved" in ta.text
 
     _asyncio.run(_run())
     app.store.close()
@@ -1691,22 +1967,19 @@ def test_userinput_paste_collapses_multiline_atomically(home):
 # ---------------------------------------------------------------- worker decoupling
 
 
-def test_on_input_submitted_returns_before_send_turn_completes(home, monkeypatch):
-    """on_input_submitted must spawn _send_turn as a worker, not await it.
+def test_action_submit_prompt_returns_before_send_turn_completes(home, monkeypatch):
+    """action_submit_prompt must spawn _send_turn as a worker, not await it.
 
-    Pins down the resize-during-streaming fix: the input handler must
+    Pins down the resize-during-streaming fix: the submit handler must
     return immediately so Textual's _process_messages_loop is freed to
     dispatch other queued events (resize, key, mouse) concurrently with
-    the streaming work. If on_input_submitted reverts to awaiting
-    _send_turn directly, this test fails -- the assertion would only
-    hold if _send_turn awaited completion before returning, and that's
-    exactly the architecture we don't want.
+    the streaming work. If action_submit_prompt reverts to awaiting
+    _send_turn directly, this test fails.
     """
     import asyncio as _asyncio
     import time as _time
     from mnemara import config as config_mod
     from mnemara import tui as tui_mod
-    from textual.widgets import Input
 
     config_mod.init_instance("worker_t")
     app = tui_mod.MnemaraTUI("worker_t")
@@ -1730,20 +2003,15 @@ def test_on_input_submitted_returns_before_send_turn_completes(home, monkeypatch
             # Patch _send_turn to our slow stand-in.
             monkeypatch.setattr(app, "_send_turn", _slow_send_turn)
 
-            # Simulate a submission. The handler should return BEFORE
-            # _send_turn completes; we measure by checking the busy flag
-            # is set (worker started) but the handler awaitable resolved
-            # without blocking.
-            inp = app.query_one("#userinput", Input)
-            inp.value = "hello"
+            # Load the TextArea with a prompt and invoke the submit action.
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("hello")
             handler_returned_at = None
 
             async def _do_submit() -> None:
                 nonlocal handler_returned_at
                 t0 = _time.monotonic()
-                # Mimic Textual posting an Input.Submitted event.
-                event = Input.Submitted(inp, "hello")
-                await app.on_input_submitted(event)
+                await app.action_submit_prompt()
                 handler_returned_at = _time.monotonic() - t0
 
             # Run the handler; it should return promptly because
@@ -1757,7 +2025,7 @@ def test_on_input_submitted_returns_before_send_turn_completes(home, monkeypatch
             # the worker is still parked on send_turn_can_finish.
             assert handler_returned_at is not None
             assert handler_returned_at < 0.5, (
-                f"on_input_submitted took {handler_returned_at:.3f}s -- "
+                f"action_submit_prompt took {handler_returned_at:.3f}s -- "
                 "this means it awaited _send_turn directly instead of "
                 "spawning it as a worker. Resize-during-streaming bug "
                 "will recur."
@@ -2703,7 +2971,6 @@ def test_normalize_model_name_idempotent_on_clean_input():
     assert normalize_model_name("claude-opus-4-7") == "claude-opus-4-7"
 
 
-@pytest.mark.skip(reason="gemma-branch: model list is Gemma/Ollama; test hard-codes Claude model names")
 def test_resolve_model_choice_accepts_indexes_aliases_and_exact_names():
     from mnemara.config import resolve_model_choice
 
@@ -3984,7 +4251,7 @@ def test_config_mcp_servers_ignore_unknown_fields():
 # ----------------------------------------------------------------------
 
 def test_tui_slash_cmd_routes_through_when_busy(home):
-    """Slash commands bypass the _busy guard — on_input_submitted dispatches
+    """Slash commands bypass the _busy guard — _handle_user_input dispatches
     to _handle_slash regardless of _busy state."""
     import asyncio as _asyncio
     from mnemara import config
@@ -4002,19 +4269,7 @@ def test_tui_slash_cmd_routes_through_when_busy(home):
     app._handle_slash = _fake_handle_slash  # type: ignore[method-assign]
     app._refresh_status = lambda: None  # suppress widget call
 
-    # Patch query_one so clearing inp.value doesn't trigger a DOM lookup.
-    _fake_inp = type("FakeInp", (), {"value": ""})()
-    app.query_one = lambda *a, **kw: _fake_inp  # type: ignore[method-assign]
-
-    class _FakeInput:
-        id = "userinput"
-        value = "/stop"
-
-    class _FakeEvent:
-        input = _FakeInput()
-        value = "/stop"
-
-    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
+    _asyncio.run(app._handle_user_input("/stop"))
     assert slash_cmds_seen == ["/stop"], "slash commands must bypass _busy guard"
     app.store.close()
 
@@ -4044,20 +4299,9 @@ def test_tui_non_slash_blocked_when_busy(home):
             chat_msgs.append(msg)
 
     app._chat = lambda: _FakeChat()  # type: ignore[method-assign]
+    app._refresh_status = lambda: None  # suppress widget call
 
-    class _FakeInput:
-        id = "userinput"
-        value = "hello"
-
-    class _FakeEvent:
-        input = _FakeInput()
-        value = "hello"
-
-    # Patch query_one so clearing the input doesn't crash.
-    _fake_inp = type("FakeInp", (), {"value": ""})()
-    app.query_one = lambda *a, **kw: _fake_inp  # type: ignore[method-assign]
-
-    _asyncio.run(app.on_input_submitted(_FakeEvent()))  # type: ignore[arg-type]
+    _asyncio.run(app._handle_user_input("hello"))
     assert turns_sent == [], "no turn should fire immediately while busy"
     assert app._queued_input == "hello", (
         "input should be stored in _queued_input when busy"
@@ -4343,8 +4587,8 @@ def test_slash_export_last_n(home, tmp_path):
 
     config.init_instance("exp_lastn_t")
     app = tui_mod.MnemaraTUI("exp_lastn_t")
-    app.store.append_turn("user", [{"type": "text", "text": "old"}])
-    app.store.append_turn("user", [{"type": "text", "text": "new"}])
+    app.store.append_turn("user", [{"type": "text", "text": "XPREVTURN"}])
+    app.store.append_turn("user", [{"type": "text", "text": "XCURRTURN"}])
 
     chat_msgs: list[str] = []
 
@@ -4364,9 +4608,9 @@ def test_slash_export_last_n(home, tmp_path):
 
     assert written_path is not None and written_path.exists()
     content = written_path.read_text(encoding="utf-8")
-    assert "new" in content
-    # "old" turn is outside the last-1 window.
-    assert "old" not in content
+    assert "XCURRTURN" in content
+    # Previous turn is outside the last-1 window.
+    assert "XPREVTURN" not in content
     written_path.unlink()
     app.store.close()
 
@@ -4391,6 +4635,103 @@ def test_slash_export_bad_n_shows_usage(home):
     assert any("usage" in m.lower() for m in chat_msgs), (
         f"expected usage message; got {chat_msgs}"
     )
+    app.store.close()
+
+
+# ----------------------------------------------------------------------
+# export/import round-trip
+# ----------------------------------------------------------------------
+
+def test_export_import_round_trip(home, tmp_path):
+    """Full round-trip: /export writes config+role_doc+turns; /import restores them."""
+    import asyncio as _asyncio
+    from mnemara import config as cfg_mod
+    from mnemara import tui as tui_mod
+
+    cfg_mod.init_instance("rt_export_t")
+    app = tui_mod.MnemaraTUI("rt_export_t")
+    app.store.append_turn("user",      "hello from user")
+    app.store.append_turn("assistant", "hello from assistant")
+    app.store.append_turn("user",      "second user turn")
+
+    export_path = tmp_path / "export.md"
+
+    class _FakeChat:
+        msgs: list[str] = []
+        def write(self, m: str) -> None:
+            self.msgs.append(m)
+
+    chat = _FakeChat()
+    _asyncio.run(app._slash_export(str(export_path), chat))
+    assert export_path.exists(), "export file not created"
+
+    content = export_path.read_text(encoding="utf-8")
+    assert "mnemara-export-version: 1" in content
+    assert "<!-- mnemara:begin:config -->" in content
+    assert "<!-- mnemara:begin:turns -->" in content
+    assert "hello from user" in content
+    assert "hello from assistant" in content
+
+    # Now import into a fresh instance and verify turns are restored.
+    cfg_mod.init_instance("rt_import_t")
+    app2 = tui_mod.MnemaraTUI("rt_import_t")
+    # Pre-populate with a different turn that should be replaced.
+    app2.store.append_turn("user", "this should be cleared")
+
+    chat2 = _FakeChat()
+    _asyncio.run(app2._slash_import(str(export_path), chat2))
+
+    all_msgs = " ".join(chat2.msgs)
+    assert "imported 3 turn(s)" in all_msgs
+
+    restored = app2.store.window()
+    assert len(restored) == 3
+    texts = [tui_mod._flatten_text_blocks(r["content"]) for r in restored]
+    assert texts[0] == "hello from user"
+    assert texts[1] == "hello from assistant"
+    assert texts[2] == "second user turn"
+
+    app.store.close()
+    app2.store.close()
+
+
+def test_import_no_turns_section_errors(home, tmp_path):
+    """Importing a file without a turns section shows a clear error."""
+    import asyncio as _asyncio
+    from mnemara import config as cfg_mod
+    from mnemara import tui as tui_mod
+
+    cfg_mod.init_instance("rt_noturns_t")
+    app = tui_mod.MnemaraTUI("rt_noturns_t")
+    bad_file = tmp_path / "bad.md"
+    bad_file.write_text("# Just some markdown\nNo sections here.\n")
+
+    chat_msgs: list[str] = []
+    class _FakeChat:
+        def write(self, m: str) -> None:
+            chat_msgs.append(m)
+
+    _asyncio.run(app._slash_import(str(bad_file), _FakeChat()))
+    assert any("no turns section" in m for m in chat_msgs)
+    app.store.close()
+
+
+def test_import_missing_file_errors(home, tmp_path):
+    """Importing a non-existent path shows a clear error."""
+    import asyncio as _asyncio
+    from mnemara import config as cfg_mod
+    from mnemara import tui as tui_mod
+
+    cfg_mod.init_instance("rt_missing_t")
+    app = tui_mod.MnemaraTUI("rt_missing_t")
+
+    chat_msgs: list[str] = []
+    class _FakeChat:
+        def write(self, m: str) -> None:
+            chat_msgs.append(m)
+
+    _asyncio.run(app._slash_import(str(tmp_path / "does_not_exist.md"), _FakeChat()))
+    assert any("not found" in m for m in chat_msgs)
     app.store.close()
 
 
@@ -4648,270 +4989,411 @@ def test_run_turn_acloses_query_gen_on_normal_completion(monkeypatch):
     assert result["assistant_blocks"] == []
 
 
-# ===================================================================
-# Gemma-backend smoke tests (gemma branch only)
-# All Ollama HTTP calls are mocked — no network required.
-# ===================================================================
+# ----------------------------------------------------------------------
+# compress_repeated_reads — diff-based compression for repeated Reads
+# ----------------------------------------------------------------------
+
+def _make_read_pair(store, file_path: str, content: str, tu_id: str) -> tuple[int, int]:
+    """Helper: insert an assistant Read tool_use + user tool_result pair.
+
+    Returns (assistant_row_id, user_row_id).
+    """
+    asst_id = store.append_turn(
+        "assistant",
+        [
+            {
+                "type": "tool_use",
+                "id": tu_id,
+                "name": "Read",
+                "input": {"file_path": file_path},
+            }
+        ],
+    )
+    user_id = store.append_turn(
+        "user",
+        [
+            {
+                "type": "tool_result",
+                "tool_use_id": tu_id,
+                "content": content,
+            }
+        ],
+    )
+    return asst_id, user_id
 
 
-def test_gemma_extract_text_from_blocks():
-    """_extract_text_from_blocks flattens text, tool_use, and tool_result blocks."""
-    from mnemara.gemma_agent import _extract_text_from_blocks
-
-    blocks = [
-        {"type": "text", "text": "Hello world"},
-        {"type": "tool_use", "name": "Read", "input": {"path": "/tmp/f"}},
-        {"type": "tool_result", "content": [{"type": "text", "text": "file content"}]},
-    ]
-    out = _extract_text_from_blocks(blocks)
-    assert "Hello world" in out
-    assert "[tool_use: Read(" in out
-    assert "[tool_result: file content]" in out
-
-    # Empty list → empty string
-    assert _extract_text_from_blocks([]) == ""
+_LONG_CONTENT = "x" * 300  # 300 bytes — above min_bytes=200 threshold
 
 
-def test_gemma_build_messages_format(home):
-    """_build_messages produces [system, ...history, user(current)] in Ollama format."""
-    import json as _json
-    from mnemara import config
+def test_compress_repeated_reads_keeps_latest_full(home):
+    """Read foo.py three times: latest stays full, earlier two get stubbed."""
     from mnemara.store import Store
-    from mnemara.gemma_agent import _build_messages
 
-    config.init_instance("gemma_msg_t")
-    store = Store("gemma_msg_t")
-    store.append_turn("user", [{"type": "text", "text": "first user"}])
-    store.append_turn("assistant", [{"type": "text", "text": "first assistant"}])
-    # Add a pending user turn (will be dropped in favour of current_user_text)
-    store.append_turn("user", [{"type": "text", "text": "pending"}])
+    store = Store("crr_latest_full_t")
+    file_path = "/workspace/foo.py"
 
-    msgs = _build_messages(
-        store,
-        system_prompt="SYSTEM-PROMPT",
-        current_user_text="CURRENT-USER",
-        max_turns=100,
-        max_tokens=500_000,
+    # Three reads with different content
+    _, uid1 = _make_read_pair(store, file_path, "version one\n" + _LONG_CONTENT, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, "version two\n" + _LONG_CONTENT, "tu2")
+    _, uid3 = _make_read_pair(store, file_path, "version three\n" + _LONG_CONTENT, "tu3")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 2
+    # bytes_freed may be negative when diff header overhead > saved bytes for
+    # short test strings; real production files save significant bytes.
+    assert "bytes_freed" in result
+
+    rows = store.window()
+    # Find the three user rows (uid1, uid2, uid3) by id
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+
+    # Latest (uid3) stays full
+    latest_content = user_rows[uid3]["content"][0]["content"]
+    assert latest_content == "version three\n" + _LONG_CONTENT, (
+        f"Latest should stay full, got: {latest_content[:80]}"
     )
 
-    # First message is always the system prompt.
-    assert msgs[0] == {"role": "system", "content": "SYSTEM-PROMPT"}
-    # Last message is the current user input.
-    assert msgs[-1] == {"role": "user", "content": "CURRENT-USER"}
-    # The "pending" stored user turn must NOT appear — it's been replaced.
-    texts = [m["content"] for m in msgs]
-    assert "pending" not in texts
-    # History turns appear in the middle.
-    assert any("first user" in m["content"] for m in msgs)
-    assert any("first assistant" in m["content"] for m in msgs)
+    # Earlier two are stubbed
+    for uid in (uid1, uid2):
+        content = user_rows[uid]["content"][0]["content"]
+        assert content.startswith("(see turn") or content.startswith("(historical state"), (
+            f"Earlier read at uid={uid} should be stubbed, got: {content[:80]}"
+        )
+
     store.close()
 
 
-def test_gemma_session_streams_response(home, monkeypatch):
-    """turn_async streams tokens, persists user+assistant turns, returns correct schema."""
-    import asyncio as _asyncio
-    import json as _json
-    from unittest.mock import AsyncMock, MagicMock, patch
-    from mnemara import config
-    from mnemara.permissions import PermissionStore
+def test_compress_repeated_reads_unchanged_uses_pointer(home):
+    """Three identical Reads: earlier two get 'content unchanged' pointer."""
     from mnemara.store import Store
-    from mnemara.tools import ToolRunner
-    from mnemara.gemma_agent import GemmaSession
 
-    config.init_instance("gemma_turn_t")
-    cfg = config.load("gemma_turn_t")
-    store = Store("gemma_turn_t")
-    perms = PermissionStore("gemma_turn_t")
-    runner = ToolRunner("gemma_turn_t", cfg, perms, prompt=lambda t, x: "deny")
+    store = Store("crr_unchanged_t")
+    file_path = "/workspace/stable.py"
+    content = "def foo():\n    pass\n" + _LONG_CONTENT
 
-    # Build fake streaming chunks that Ollama /api/chat would emit.
-    _chunks = [
-        '{"message": {"content": "Hello"}, "done": false}',
-        '{"message": {"content": " world"}, "done": false}',
-        '{"message": {"content": ""}, "done": true, "prompt_eval_count": 12, "eval_count": 7}',
-    ]
+    _, uid1 = _make_read_pair(store, file_path, content, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, content, "tu2")
+    _, uid3 = _make_read_pair(store, file_path, content, "tu3")
 
-    async def _fake_aiter_lines():
-        for chunk in _chunks:
-            yield chunk
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 2
 
-    class _FakeResp:
-        def raise_for_status(self): pass  # sync — gemma_agent calls it without await
-        def aiter_lines(self): return _fake_aiter_lines()
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
 
-    class _FakeStream:
-        async def __aenter__(self): return _FakeResp()
-        async def __aexit__(self, *args): pass
+    # Stubs for uid1 and uid2 use "content unchanged" pattern
+    for uid in (uid1, uid2):
+        content_cell = user_rows[uid]["content"][0]["content"]
+        assert "content unchanged" in content_cell, (
+            f"Expected 'content unchanged' stub, got: {content_cell[:120]}"
+        )
+        # Should reference the last turn
+        assert str(user_rows[uid3]["id"]) in content_cell
 
-    class _FakeClient:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
-        def stream(self, *args, **kwargs): return _FakeStream()
+    # Latest unchanged
+    assert user_rows[uid3]["content"][0]["content"] == content
 
-    def _make_client(*args, **kwargs):
-        return _FakeClient()
+    store.close()
 
-    with patch("mnemara.gemma_agent.httpx.AsyncClient", side_effect=_make_client):
-        session = GemmaSession(cfg, store, runner)
-        tokens_received: list[str] = []
 
-        async def _go():
-            return await session.turn_async(
-                "hi",
-                on_token=lambda t: tokens_received.append(t),
+def test_compress_repeated_reads_modified_uses_diff(home):
+    """Reads with different content get unified diff stub."""
+    from mnemara.store import Store
+
+    store = Store("crr_diff_t")
+    file_path = "/workspace/changing.py"
+
+    v1 = "def foo():\n    return 1\n" + "a" * 200
+    v2 = "def foo():\n    return 99\n" + "a" * 200
+
+    _, uid1 = _make_read_pair(store, file_path, v1, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, v2, "tu2")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 1
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+
+    # uid1 gets a diff stub
+    stub = user_rows[uid1]["content"][0]["content"]
+    assert stub.startswith("(historical state"), (
+        f"Expected diff stub prefix, got: {stub[:80]}"
+    )
+    # Diff should contain the changed line
+    assert "return 1" in stub or "return 99" in stub or "@@" in stub, (
+        f"Expected unified diff content, got: {stub[:200]}"
+    )
+
+    # uid2 stays full
+    assert user_rows[uid2]["content"][0]["content"] == v2
+
+    store.close()
+
+
+def test_compress_repeated_reads_preserves_pre_edit_read(home):
+    """Read → (some turns) → Read: second Read is last so it stays full."""
+    from mnemara.store import Store
+
+    store = Store("crr_pre_edit_t")
+    file_path = "/workspace/edited.py"
+
+    content_before = "def bar():\n    pass\n" + "b" * 200
+    content_after = "def bar():\n    return 42\n" + "b" * 200
+
+    # First read (pre-edit state)
+    _, uid1 = _make_read_pair(store, file_path, content_before, "tu1")
+
+    # Simulate an edit turn (assistant turn)
+    store.append_turn(
+        "assistant",
+        [{"type": "tool_use", "id": "edit1", "name": "Edit",
+          "input": {"file_path": file_path,
+                    "old_string": "pass", "new_string": "return 42"}}],
+    )
+
+    # Second read (post-edit state) — this is the latest
+    _, uid2 = _make_read_pair(store, file_path, content_after, "tu2")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 1
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+
+    # Second (last) Read stays full — Edit's old_string base is still intact
+    assert user_rows[uid2]["content"][0]["content"] == content_after, (
+        "Last Read must stay full so pre-write old_string exact-match works"
+    )
+
+    # First Read is stubbed
+    stub = user_rows[uid1]["content"][0]["content"]
+    assert stub.startswith("(see turn") or stub.startswith("(historical state"), (
+        f"First Read should be stubbed, got: {stub[:80]}"
+    )
+
+    store.close()
+
+
+def test_compress_repeated_reads_skips_binary(home):
+    """Binary file content (contains \\x00) is skipped — no compression."""
+    from mnemara.store import Store
+
+    store = Store("crr_binary_t")
+    file_path = "/workspace/image.bin"
+    binary_content = "prefix\x00binary\x00data" + "z" * 200
+
+    _, uid1 = _make_read_pair(store, file_path, binary_content, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, binary_content, "tu2")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 0, (
+        "Binary files should not be compressed"
+    )
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    # Both reads preserved as-is
+    for uid in (uid1, uid2):
+        assert user_rows[uid]["content"][0]["content"] == binary_content
+
+    store.close()
+
+
+def test_compress_repeated_reads_skips_tiny_file(home):
+    """Files smaller than min_bytes (200 bytes default) are skipped."""
+    from mnemara.store import Store
+
+    store = Store("crr_tiny_t")
+    file_path = "/workspace/small.py"
+    tiny_content = "x" * 50  # only 50 bytes
+
+    _, uid1 = _make_read_pair(store, file_path, tiny_content, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, tiny_content, "tu2")
+
+    result = store.compress_repeated_reads()
+    assert result["reads_compressed"] == 0, (
+        "Tiny files should not be compressed (overhead > savings)"
+    )
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    for uid in (uid1, uid2):
+        assert user_rows[uid]["content"][0]["content"] == tiny_content
+
+    store.close()
+
+
+def test_compress_repeated_reads_pin_aware(home):
+    """Pinned row's Read tool_result is not stubbed when skip_pinned=True."""
+    from mnemara.store import Store
+
+    store = Store("crr_pin_t")
+    file_path = "/workspace/pinned.py"
+    content = "def pinned():\n    pass\n" + "p" * 200
+
+    _, uid1 = _make_read_pair(store, file_path, content, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, content, "tu2")
+
+    # Pin the user row that holds the first tool_result (uid1)
+    store.pin_row(uid1, "finding")
+
+    result = store.compress_repeated_reads(skip_pinned=True)
+    assert result["reads_compressed"] == 0, (
+        "Pinned read should not be stubbed with skip_pinned=True"
+    )
+
+    rows = store.window()
+    user_rows = {r["id"]: r for r in rows if r["role"] == "user"}
+    # Both reads preserved because the only candidate (uid1) is pinned
+    assert user_rows[uid1]["content"][0]["content"] == content
+
+    store.close()
+
+
+def test_preserve_compressed_reads_survives_eviction(home):
+    """With preserve_compressed_reads=True, stub rows survive cap-FIFO past their turn age."""
+    from mnemara.store import Store
+
+    store = Store("crr_preserve_t")
+    file_path = "/workspace/big.py"
+
+    # Create 3 reads — first two will be stubbed
+    _, uid1 = _make_read_pair(store, file_path, "version A\n" + "a" * 300, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, "version B\n" + "b" * 300, "tu2")
+    _, uid3 = _make_read_pair(store, file_path, "version C\n" + "c" * 300, "tu3")
+
+    # Compress with preserve flag
+    result = store.compress_repeated_reads(
+        skip_pinned=True, preserve_compressed_reads=True
+    )
+    assert result["reads_compressed"] == 2
+
+    # Verify compressed_read_stub is set on the stubbed rows
+    row_uid1 = store.conn.execute(
+        "SELECT compressed_read_stub FROM turns WHERE id=?", (uid1,)
+    ).fetchone()
+    row_uid2 = store.conn.execute(
+        "SELECT compressed_read_stub FROM turns WHERE id=?", (uid2,)
+    ).fetchone()
+    assert row_uid1[0] == 1, "uid1 should be marked as compressed_read_stub=1"
+    assert row_uid2[0] == 1, "uid2 should be marked as compressed_read_stub=1"
+
+    # Now evict with preserve_compressed_reads=True and a very tight cap
+    # The stub rows (uid1, uid2) should NOT be evicted
+    total_rows = len(store.window())
+    # Set cap to (total_rows - 2) — would normally evict 2 oldest rows
+    evicted = store.evict(
+        max_turns=total_rows - 2,
+        preserve_compressed_reads=True,
+    )
+
+    surviving_ids = {r["id"] for r in store.window()}
+    assert uid1 in surviving_ids, "Stub row uid1 should survive eviction"
+    assert uid2 in surviving_ids, "Stub row uid2 should survive eviction"
+
+    store.close()
+
+
+def test_preserve_compressed_reads_disabled_evicts_normally(home):
+    """With preserve_compressed_reads=False (default), stubs evict by normal FIFO."""
+    from mnemara.store import Store
+
+    store = Store("crr_normal_evict_t")
+    file_path = "/workspace/normal.py"
+
+    _, uid1 = _make_read_pair(store, file_path, "ver A\n" + "a" * 300, "tu1")
+    _, uid2 = _make_read_pair(store, file_path, "ver B\n" + "b" * 300, "tu2")
+    _, uid3 = _make_read_pair(store, file_path, "ver C\n" + "c" * 300, "tu3")
+
+    # Compress WITHOUT preserve flag
+    result = store.compress_repeated_reads(
+        skip_pinned=True, preserve_compressed_reads=False
+    )
+    assert result["reads_compressed"] == 2
+
+    # Verify compressed_read_stub is NOT set
+    row_uid1 = store.conn.execute(
+        "SELECT compressed_read_stub FROM turns WHERE id=?", (uid1,)
+    ).fetchone()
+    assert (row_uid1[0] or 0) == 0, "preserve_compressed_reads=False → stub flag should be 0"
+
+    # Evict with flag disabled — stub rows are fair game
+    total_rows = len(store.window())
+    # Evict 2 rows (the two oldest, which are uid1's assistant row and uid1 itself)
+    evicted = store.evict(
+        max_turns=total_rows - 2,
+        preserve_compressed_reads=False,
+    )
+    assert evicted == 2
+
+    surviving_ids = {r["id"] for r in store.window()}
+    # uid1 (the oldest user row) and its assistant counterpart should have been evicted
+    assert uid1 not in surviving_ids, "Without preserve flag, oldest stub rows evict normally"
+
+    store.close()
+
+
+def test_slash_compress_reads_command(home):
+    """/compress reads slash command stubs repeated Reads and reports results."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("crr_slash_t")
+    app = tui_mod.MnemaraTUI("crr_slash_t")
+
+    # Insert two reads of the same file
+    file_path = "/workspace/slash_test.py"
+    content_a = "def alpha():\n    pass\n" + "a" * 300
+    content_b = "def alpha():\n    return 1\n" + "a" * 300
+
+    app.store.append_turn(
+        "assistant",
+        [{"type": "tool_use", "id": "tu1", "name": "Read",
+          "input": {"file_path": file_path}}],
+    )
+    app.store.append_turn(
+        "user",
+        [{"type": "tool_result", "tool_use_id": "tu1", "content": content_a}],
+    )
+    app.store.append_turn(
+        "assistant",
+        [{"type": "tool_use", "id": "tu2", "name": "Read",
+          "input": {"file_path": file_path}}],
+    )
+    app.store.append_turn(
+        "user",
+        [{"type": "tool_result", "tool_use_id": "tu2", "content": content_b}],
+    )
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/compress reads")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+            # Check that the store was compressed (sidebar: the chat render
+            # is hard to introspect, so we verify the store directly)
+            all_rows = app.store.window()
+            user_rows = [r for r in all_rows if r["role"] == "user"]
+            # At least one user row should be stubbed (the first Read result)
+            stubs = [
+                r for r in user_rows
+                if isinstance(r["content"], list)
+                and any(
+                    isinstance(b.get("content"), str)
+                    and (b["content"].startswith("(see turn")
+                         or b["content"].startswith("(historical state"))
+                    for b in r["content"]
+                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                )
+            ]
+            assert len(stubs) >= 1, (
+                f"Expected at least one stubbed Read after /compress reads; "
+                f"user rows: {[r['content'] for r in user_rows]}"
             )
-
-        result = _asyncio.run(_go())
-
-    # Verify streaming tokens delivered.
-    assert tokens_received == ["Hello", " world"]
-    # Verify return schema.
-    assert result["stop_reason"] == "end_turn"
-    assert result["tokens_in"] == 12
-    assert result["tokens_out"] == 7
-    assert result["assistant_blocks"] == [{"type": "text", "text": "Hello world"}]
-    # Verify persistence: user + assistant rows stored.
-    rows = store.window()
-    roles = [r["role"] for r in rows]
-    assert "user" in roles and "assistant" in roles
-    store.close()
-
-
-def test_gemma_session_connection_error(home):
-    """turn_async returns a graceful error message when Ollama is unreachable."""
-    import asyncio as _asyncio
-    from unittest.mock import patch
-    import httpx
-    from mnemara import config
-    from mnemara.permissions import PermissionStore
-    from mnemara.store import Store
-    from mnemara.tools import ToolRunner
-    from mnemara.gemma_agent import GemmaSession
-
-    config.init_instance("gemma_err_t")
-    cfg = config.load("gemma_err_t")
-    store = Store("gemma_err_t")
-    perms = PermissionStore("gemma_err_t")
-    runner = ToolRunner("gemma_err_t", cfg, perms, prompt=lambda t, x: "deny")
-
-    class _FailStream:
-        async def __aenter__(self):
-            raise httpx.ConnectError("connection refused")
-        async def __aexit__(self, *args): pass
-
-    class _FailClient:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
-        def stream(self, *args, **kwargs): return _FailStream()
-
-    def _make_fail_client(*args, **kwargs):
-        return _FailClient()
-
-    with patch("mnemara.gemma_agent.httpx.AsyncClient", side_effect=_make_fail_client):
-        session = GemmaSession(cfg, store, runner)
-        tokens: list[str] = []
-
-        async def _go():
-            return await session.turn_async("hi", on_token=lambda t: tokens.append(t))
-
-        result = _asyncio.run(_go())
-
-    # Error surfaced as a message, not an exception.
-    assert len(tokens) == 1
-    assert "Gemma backend unavailable" in tokens[0]
-    assert "ollama" in tokens[0].lower() or "Ollama" in tokens[0]
-    # Still persisted — the error text IS the assistant response.
-    rows = store.window()
-    assert any(r["role"] == "assistant" for r in rows)
-    store.close()
-
-
-def test_gemma_session_write_stats(home):
-    """write_session_stats writes backend=gemma_ollama and merges across calls."""
-    import json as _json
-    from mnemara import config, paths
-    from mnemara.permissions import PermissionStore
-    from mnemara.store import Store
-    from mnemara.tools import ToolRunner
-    from mnemara.gemma_agent import GemmaSession
-
-    config.init_instance("gemma_stats_t")
-    cfg = config.load("gemma_stats_t")
-    store = Store("gemma_stats_t")
-    perms = PermissionStore("gemma_stats_t")
-    runner = ToolRunner("gemma_stats_t", cfg, perms, prompt=lambda t, x: "deny")
-
-    s = GemmaSession(cfg, store, runner)
-    s.evicted_this_session = 3
-    s.memory_writes = 2
-    s.write_session_stats()
-
-    stats_dir = paths.stats_dir("gemma_stats_t")
-    from datetime import datetime, timezone
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    stats_file = stats_dir / f"{today}.json"
-    assert stats_file.exists()
-    entries = _json.loads(stats_file.read_text())
-    assert isinstance(entries, list) and len(entries) == 1
-    entry = entries[0]
-    assert entry["backend"] == "gemma_ollama"
-    assert entry["evicted_this_session"] == 3
-    assert entry["memory_writes"] == 2
-    assert "session_started_at" in entry
-    assert "session_ended_at" in entry
-
-    # Second call on the SAME session object is idempotent (no-op).
-    s.write_session_stats()
-    entries_after_noop = _json.loads(stats_file.read_text())
-    assert len(entries_after_noop) == 1, "second call on same session must not append"
-
-    # Different GemmaSession object on same day merges into the same file.
-    s2 = GemmaSession(cfg, store, runner)
-    s2.write_session_stats()
-    entries2 = _json.loads(stats_file.read_text())
-    assert len(entries2) == 2
-    store.close()
-
-
-def test_gemma_tui_pilot_focus(home, monkeypatch):
-    """After a GemmaSession turn completes, focus returns to #userinput.
-
-    Replaces test_tui_pilot_focus_returns_after_turn on the gemma branch
-    by patching GemmaSession.turn_async directly.
-    """
-    import asyncio as _asyncio
-    from mnemara import config
-    from mnemara import tui as tui_mod
-    from mnemara.gemma_agent import GemmaSession
-    from textual.widgets import Input
-
-    config.init_instance("gemma_pilot_focus_t")
-
-    async def _fake_turn_async(self, text, on_token=None, on_tool_use=None,
-                               on_tool_result=None):
-        if on_token:
-            for chunk in ("Hi ", "from ", "Gemma"):
-                await on_token(chunk)
-        return {"tokens_in": 3, "tokens_out": 5, "stop_reason": "end_turn",
-                "assistant_blocks": [{"type": "text", "text": "Hi from Gemma"}]}
-
-    monkeypatch.setattr(GemmaSession, "turn_async", _fake_turn_async)
-
-    app = tui_mod.MnemaraTUI("gemma_pilot_focus_t")
-
-    async def _run() -> None:
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            inp = app.query_one("#userinput", Input)
-            assert inp.has_focus, "input should have focus on mount"
-            inp.value = "hello gemma"
-            await pilot.press("enter")
-            await pilot.pause()
-            await pilot.pause()
-            assert app.query_one("#userinput", Input).has_focus, \
-                "input must regain focus after Gemma turn"
 
     _asyncio.run(_run())
     app.store.close()

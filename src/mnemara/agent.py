@@ -45,6 +45,7 @@ from .logging_util import log, warn
 from . import store as store_mod
 from .store import Store
 from .tools import ToolRunner
+from .runtime_sentinel import RuntimeSentinel
 
 try:
     from claude_agent_sdk import (
@@ -63,9 +64,16 @@ try:
         query,
         tool,
     )
+    # HookEventMessage was added in SDK 0.1.74; import defensively so the
+    # module loads on older SDKs too (the sentinel feature just won't fire).
+    try:
+        from claude_agent_sdk import HookEventMessage
+    except ImportError:  # pragma: no cover
+        HookEventMessage = None  # type: ignore[assignment,misc]
     _SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _SDK_AVAILABLE = False
+    HookEventMessage = None  # type: ignore[assignment]
 
 console = Console()
 
@@ -101,6 +109,31 @@ _UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
 _LIST_PINNED_TOOL = "mcp__mnemara_memory__list_pinned"
 
 
+# Hard context ceilings per model family — the API's absolute token limit.
+# Used by _recover_from_overflow to gauge how aggressively to evict before
+# retrying; unlike max_window_tokens these are not user-configurable.
+_MODEL_CONTEXT_CEILING: dict[str, int] = {
+    "opus": 1_000_000,
+    "sonnet": 200_000,
+    "haiku": 200_000,
+}
+_DEFAULT_CONTEXT_CEILING = 200_000
+
+
+def _model_context_ceiling(model: str) -> int:
+    """Return the hard context token ceiling for a given model identifier.
+
+    Matches by substring — "claude-sonnet-4-6" → 200_000,
+    "claude-opus-4-7" → 1_000_000.  Returns _DEFAULT_CONTEXT_CEILING for
+    unknown models (safe underestimate, won't over-evict).
+    """
+    m = (model or "").lower()
+    for family, ceiling in _MODEL_CONTEXT_CEILING.items():
+        if family in m:
+            return ceiling
+    return _DEFAULT_CONTEXT_CEILING
+
+
 class AgentSession:
     def __init__(self, cfg: Config, store: Store, runner: ToolRunner, client: Any = None):
         if not _SDK_AVAILABLE:
@@ -113,6 +146,11 @@ class AgentSession:
         # `client` retained in the signature for backward compatibility with
         # repl.py callers; the SDK manages its own transport, so we ignore it.
         self.client = client
+        # Per-session RuntimeSentinel (v0.3.4) — created only when
+        # cfg.runtime_sentinel is True; None otherwise.
+        self._sentinel: Optional[RuntimeSentinel] = (
+            RuntimeSentinel() if getattr(cfg, "runtime_sentinel", False) else None
+        )
         # Session-scoped counters (self-instrumentation, v0.2.0).
         self.session_started_at = datetime.now(timezone.utc).isoformat()
         self.session_ended_at: Optional[str] = None
@@ -179,14 +217,26 @@ class AgentSession:
 
         options = self._build_options(system_prompt)
 
-        result = await _run_turn(
-            prompt,
-            options,
-            self.cfg.stream,
-            on_token=on_token,
-            on_tool_use=on_tool_use,
-            on_tool_result=on_tool_result,
-        )
+        try:
+            result = await _run_turn(
+                prompt,
+                options,
+                self.cfg.stream,
+                on_token=on_token,
+                on_tool_use=on_tool_use,
+                on_tool_result=on_tool_result,
+                sentinel=self._sentinel,
+            )
+        except RuntimeError as _overflow_exc:
+            if "Prompt is too long" not in str(_overflow_exc):
+                raise
+            result = await self._recover_from_overflow(
+                user_text=user_text,
+                options=options,
+                on_token=on_token,
+                on_tool_use=on_tool_use,
+                on_tool_result=on_tool_result,
+            )
 
         assistant_blocks = result["assistant_blocks"]
         total_in = result["tokens_in"]
@@ -224,6 +274,26 @@ class AgentSession:
                 # Eviction failures must never crash a turn; audit-trail
                 # eviction is opportunistic.
                 log("auto_evict_pairs_error", error=str(exc))
+        # Compress repeated Read results after every turn when the flag is on.
+        # Outside the auto_evict_after_write guard so it fires on read-heavy
+        # turns too, not just write turns. compress_repeated_reads is
+        # idempotent — already-stubbed rows are skipped in O(1).
+        if getattr(self.cfg, "compress_repeated_reads", False):
+            try:
+                cr_result = self.store.compress_repeated_reads(
+                    skip_pinned=True,
+                    preserve_compressed_reads=getattr(
+                        self.cfg, "preserve_compressed_reads", False
+                    ),
+                )
+                if cr_result.get("reads_compressed", 0) > 0:
+                    log(
+                        "auto_compress_reads",
+                        reads_compressed=cr_result["reads_compressed"],
+                        bytes_freed=cr_result["bytes_freed"],
+                    )
+            except Exception as exc:
+                log("auto_compress_reads_error", error=str(exc))
         # Pass row_cap_slack so the row cap can "breathe" with the byte
         # budget after heavy block surgery. The slack is configured per
         # panel via cfg.row_cap_slack_when_token_headroom (default 0 =
@@ -234,6 +304,7 @@ class AgentSession:
             self.cfg.max_window_turns,
             self.cfg.max_window_tokens,
             row_cap_slack=getattr(self.cfg, "row_cap_slack_when_token_headroom", 0),
+            preserve_compressed_reads=getattr(self.cfg, "preserve_compressed_reads", False),
         )
         if evicted:
             log("eviction", deleted=evicted)
@@ -249,6 +320,81 @@ class AgentSession:
                 self.tools_called[name] = self.tools_called.get(name, 0) + 1
 
         return {"input_tokens": total_in, "output_tokens": total_out, "evicted": evicted}
+
+    async def _recover_from_overflow(
+        self,
+        *,
+        user_text: str,
+        options: "ClaudeAgentOptions",
+        on_token: "OnToken | None",
+        on_tool_use: "OnToolUse | None",
+        on_tool_result: "OnToolResult | None",
+    ) -> dict[str, Any]:
+        """Self-healing recovery when the API rejects the prompt as too long.
+
+        Sequence:
+          1. Log overflow_recovery_lift with model name and hard ceiling.
+          2. evict_write_pairs(skip_pinned=True) — highest bytes freed per
+             call, audit trail (file_path) preserved.
+          3. If stored tokens are still above the *configured* cap, also run
+             evict_tool_use_blocks(all_rows=True, skip_pinned=True).
+          4. Rebuild the prompt from the trimmed store and retry once.
+          5. If the retry still overflows, log overflow_recovery_failed and
+             raise RuntimeError with the ceiling context for display.
+        """
+        model = getattr(self.cfg, "model", "") or ""
+        ceiling = _model_context_ceiling(model)
+        original_cap = self.cfg.max_window_tokens
+        log("overflow_recovery_lift",
+            model=model,
+            original_cap=original_cap,
+            ceiling=ceiling)
+
+        # Step 1: stub Edit/Write body content — max bytes freed, min info lost.
+        pair_result = self.store.evict_write_pairs(skip_pinned=True)
+        log("overflow_recovery_evict_write_pairs",
+            bytes_freed=pair_result.get("bytes_freed", 0),
+            writes_stubbed=pair_result.get("writes_stubbed", 0),
+            reads_stubbed=pair_result.get("reads_stubbed", 0))
+
+        # Step 2: if still over the configured cap, strip full tool_use blocks.
+        current_tokens, _ = self.store.total_tokens()
+        if current_tokens > original_cap:
+            tub_result = self.store.evict_tool_use_blocks(
+                all_rows=True, skip_pinned=True
+            )
+            log("overflow_recovery_evict",
+                rows_modified=tub_result.get("rows_modified", 0),
+                bytes_freed=tub_result.get("bytes_freed", 0),
+                blocks_stripped=tub_result.get("blocks_stripped", 0))
+
+        # Step 3: rebuild the prompt from the now-trimmed store and retry once.
+        prompt_retry = _build_prompt(self.store, user_text)
+        log("overflow_recovery_retry", model=model, ceiling=ceiling)
+
+        try:
+            return await _run_turn(
+                prompt_retry,
+                options,
+                self.cfg.stream,
+                on_token=on_token,
+                on_tool_use=on_tool_use,
+                on_tool_result=on_tool_result,
+                sentinel=self._sentinel,
+            )
+        except RuntimeError as retry_exc:
+            if "Prompt is too long" in str(retry_exc):
+                tokens_now, _ = self.store.total_tokens()
+                log("overflow_recovery_failed",
+                    model=model,
+                    ceiling=ceiling,
+                    tokens_after_evict=tokens_now)
+                raise RuntimeError(
+                    f"Prompt is too long even after aggressive eviction "
+                    f"({model} hard ceiling: {ceiling:,} tokens) — "
+                    "use /evict N to free context or /clear to reset the window"
+                ) from None
+            raise
 
     def write_session_stats(self) -> Optional[Path]:
         """Dump session counters to ~/.mnemara/<instance>/stats/YYYY-MM-DD.json.
@@ -1470,6 +1616,16 @@ class AgentSession:
                 interrupt=False,
             )
 
+        # Wire include_hook_events when the runtime sentinel is enabled so
+        # that HookEventMessage entries arrive in the query() stream. This
+        # requires SDK >= 0.1.74; the field is guarded at the type level by
+        # the conditional import above and is only passed when the sentinel
+        # is active.
+        sentinel_active = self._sentinel is not None and HookEventMessage is not None
+        extra_opts: dict[str, Any] = {}
+        if sentinel_active:
+            extra_opts["include_hook_events"] = True
+
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=cfg.model,
@@ -1480,6 +1636,7 @@ class AgentSession:
             include_partial_messages=cfg.stream,
             setting_sources=[],
             stderr=lambda line: log("sdk_stderr", line=line),
+            **extra_opts,
         )
 
 
@@ -1554,6 +1711,7 @@ async def _run_turn(
     on_token: OnToken | None = None,
     on_tool_use: OnToolUse | None = None,
     on_tool_result: OnToolResult | None = None,
+    sentinel: "RuntimeSentinel | None" = None,
 ) -> dict[str, Any]:
     assistant_blocks: list[dict] = []
     tokens_in = 0
@@ -1562,6 +1720,8 @@ async def _run_turn(
     # When any callback is wired the caller (TUI) owns presentation —
     # suppress the default console rendering to avoid double-output.
     callback_mode = any(c is not None for c in (on_token, on_tool_use, on_tool_result))
+    # Whether we've already halted this turn due to sentinel firing.
+    _sentinel_halted = False
 
     async def _maybe_await(result):
         if asyncio.iscoroutine(result):
@@ -1659,9 +1819,46 @@ async def _run_turn(
                 ) + int(usage.get("cache_creation_input_tokens", 0) or 0)
                 tokens_out = int(usage.get("output_tokens", 0) or 0)
                 if message.is_error:
-                    log("agent_error", subtype=message.subtype, result=str(message.result)[:200])
+                    result_str = str(message.result)
+                    log("agent_error", subtype=message.subtype, result=result_str[:200])
                     warn(f"agent_error subtype={message.subtype}")
-            # SystemMessage: init / context info — ignore.
+                    # Raise immediately so the TUI sees a descriptive error rather
+                    # than the cryptic "Command failed with exit code 1" that the
+                    # SDK emits when the subprocess exits after returning this
+                    # ResultMessage.  The finally block below still runs to close
+                    # the generator cleanly.
+                    if any(kw in result_str.lower() for kw in ("too long", "context_length", "tokens")):
+                        raise RuntimeError(
+                            f"{result_str} — use /evict N to free context or /clear to reset the window"
+                        )
+                    raise RuntimeError(f"agent error: {result_str}")
+            elif HookEventMessage is not None and isinstance(message, HookEventMessage):
+                # SDK >= 0.1.74 emits hook lifecycle events into the stream
+                # when include_hook_events=True. Feed PreToolUse events to the
+                # sentinel so it can detect polling patterns.
+                if sentinel is not None and not _sentinel_halted:
+                    sentinel.observe(message)
+                    halt_reason = sentinel.should_halt()
+                    if halt_reason:
+                        _sentinel_halted = True
+                        notice = (
+                            f"[SENTINEL HALT] {halt_reason}. "
+                            "Stopping further tool dispatch for this turn. "
+                            "Please check in with the user before continuing."
+                        )
+                        log("sentinel_halt", reason=halt_reason)
+                        # Inject a synthetic text block so the notice lands
+                        # in the persisted assistant turn.
+                        assistant_blocks.append({"type": "text", "text": notice})
+                        if on_token is not None:
+                            await _maybe_await(on_token(notice))
+                        elif stream and not callback_mode:
+                            console.print(f"\n[bold red]{notice}[/bold red]")
+                            printed_any = True
+                        # Break out of the message stream to stop consuming
+                        # further tool dispatches for this turn.
+                        break
+            # SystemMessage (non-hook): init / context info — ignore.
     finally:
         # Explicitly close the generator so SubprocessCLITransport.close()
         # runs while the event loop is still live.  The inner try/except

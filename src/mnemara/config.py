@@ -8,19 +8,20 @@ from typing import Any
 
 from . import paths
 
-DEFAULT_MODEL = "gemma4:26b"
+DEFAULT_MODEL = "claude-opus-4-7"
 AVAILABLE_MODELS = [
-    "gemma4:26b",
-    "gemma4:12b",
-    "gemma3:27b",
-    "gemma3:12b",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
 ]
 MODEL_ALIASES = {
-    "latest": "gemma4:26b",
-    "frontier": "gemma4:26b",
+    "latest": "claude-opus-4-7",
+    "frontier": "claude-opus-4-7",
     "default": DEFAULT_MODEL,
-    "large": "gemma4:26b",
-    "small": "gemma4:12b",
+    "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+    "mini": "claude-haiku-4-5",
 }
 DEFAULT_MAX_TURNS = 100
 DEFAULT_MAX_TOKENS = 500_000  # matches observed productive ceiling — natural compaction sets in around 600K, 500K leaves 100K safety buffer
@@ -29,23 +30,24 @@ DEFAULT_MAX_TOKENS = 500_000  # matches observed productive ceiling — natural 
 def normalize_model_name(raw: str) -> str:
     """Validate and normalize a model name string. Returns the cleaned name.
 
-    Accepts model identifiers from multiple ecosystems: an alphabetic first
-    character followed by letters, digits, dots, hyphens, or colons. Colon
-    is permitted because Ollama uses it as a tag separator
-    (e.g. 'gemma4:26b', 'qwen2.5-coder:14b'). Strips outer whitespace but
-    rejects any internal whitespace.
+    Accepts Anthropic-style model identifiers: an alphabetic first character
+    followed by letters, digits, dots, or hyphens. Strips outer whitespace
+    but rejects any internal whitespace (the bug producer reported
+    2026-04-30 was `/swap claude sonnet 4 5` with spaces silently stored as
+    a literal model="claude sonnet 4 5" string, which the SDK then rejected
+    on the next turn with an opaque error from deep in the transport).
 
-    Permissive about the model FAMILY by design — Anthropic, Ollama, and
-    other providers all add new families regularly and a hardcoded
-    allowlist would drift. Format validation catches the common typo
-    classes (whitespace, control chars, accidental quotes) and lets the
-    backend itself reject genuinely-unknown model names with a clear
-    error.
+    Permissive about the model FAMILY by design — Anthropic adds new
+    families regularly ('claude-3-...', 'claude-3-5-...', 'claude-sonnet-4-5',
+    'claude-opus-4-7', etc.) and a hardcoded allowlist would drift. Format
+    validation catches the common typo classes (whitespace, control chars,
+    accidental quotes) and lets the API itself reject genuinely-unknown
+    model names on first use with a clear error.
 
     Raises ValueError on:
       - empty / whitespace-only input
       - internal whitespace
-      - characters outside [a-zA-Z0-9.\\-:]
+      - characters outside [a-zA-Z0-9.-]
       - first character not alphabetic
     """
     if raw is None:
@@ -64,12 +66,12 @@ def normalize_model_name(raw: str) -> str:
         raise ValueError(
             f"model name must start with a letter, got: {raw!r}"
         )
-    # Letters / digits / dots / hyphens / colons (Ollama tag separator).
+    # Letters / digits / dots / hyphens only.
     for ch in s:
-        if not (ch.isalnum() or ch in ".-:"):
+        if not (ch.isalnum() or ch in ".-"):
             raise ValueError(
                 f"model name contains invalid character {ch!r} in {raw!r} "
-                "(allowed: letters, digits, '.', '-', ':')"
+                "(allowed: letters, digits, '.', '-')"
             )
     return s
 
@@ -164,6 +166,26 @@ class Config:
     # Default 0 = feature off (backward-compat). A reasonable starting
     # value is 30 (30% slack on a 100-turn cap). Set in config.json.
     row_cap_slack_when_token_headroom: int = 0
+    # v0.3.4 — runtime-enforced sentinel via SDK hook events
+    # When True, AgentSession wires include_hook_events=True into
+    # ClaudeAgentOptions and feeds PreToolUse hook events to a per-session
+    # RuntimeSentinel.  If the sentinel detects a polling pattern (same tool,
+    # same args, 3+ times in the last 5 PreToolUse events) it injects a
+    # synthetic system notice and stops further tool dispatch for that turn.
+    # Belt-and-suspenders with the role-doc sentinel (sentinel.md); both can
+    # run simultaneously. Off by default; opt-in per instance.
+    runtime_sentinel: bool = False
+    # v0.6.0 — diff-based compression for repeated Reads
+    # compress_repeated_reads: when True, /compress reads and the auto-evict
+    # hook call store.compress_repeated_reads() to stub older copies of the
+    # same file with a unified diff against the latest Read, freeing context
+    # budget while preserving the LAST Read at full fidelity (so Claude's
+    # pre-write old_string exact-match still works).
+    # preserve_compressed_reads: when True, rows with compressed_read_stub=1
+    # are excluded from cap-FIFO eviction (same soft-protect semantics as
+    # pin_label). Lets stub rows outlive their turn-count age.
+    compress_repeated_reads: bool = False
+    preserve_compressed_reads: bool = False
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7
@@ -244,6 +266,9 @@ class Config:
             row_cap_slack_when_token_headroom=int(
                 d.get("row_cap_slack_when_token_headroom", 0)
             ),
+            runtime_sentinel=bool(d.get("runtime_sentinel", False)),
+            compress_repeated_reads=bool(d.get("compress_repeated_reads", False)),
+            preserve_compressed_reads=bool(d.get("preserve_compressed_reads", False)),
             graph_enabled=bool(d.get("graph_enabled", True)),
             replay_default_days=int(d.get("replay_default_days", 7)),
             replay_default_threshold=int(d.get("replay_default_threshold", 3)),
@@ -263,15 +288,8 @@ def load(instance: str) -> Config:
     path = paths.config_path(instance)
     if not path.exists():
         raise FileNotFoundError(f"No config at {path} — run `mnemara init --instance {instance}`")
-    try:
-        with path.open() as f:
-            return Config.from_dict(json.load(f))
-    except (json.JSONDecodeError, ValueError):
-        # config.json exists but is empty or corrupt (e.g. from a failed init).
-        # Re-write a fresh default config and return it.
-        cfg = Config.default()
-        save(instance, cfg)
-        return cfg
+    with path.open() as f:
+        return Config.from_dict(json.load(f))
 
 
 def save(instance: str, cfg: Config) -> None:

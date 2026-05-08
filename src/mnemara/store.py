@@ -1,6 +1,8 @@
 """SQLite-backed rolling-window store."""
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -68,6 +70,12 @@ class Store:
             # query as `pin_label IS NOT NULL` for "all pinned" or filter by
             # the specific category.
             ("pin_label", "TEXT"),
+            # 2026-05-07 v0.6.0: compressed_read_stub marks rows whose
+            # tool_result content was replaced by a diff-based stub by
+            # compress_repeated_reads(). When preserve_compressed_reads is
+            # True, these rows are excluded from cap-FIFO eviction (same soft-
+            # protect semantics as pin_label). 0 = normal, 1 = stub row.
+            ("compressed_read_stub", "INTEGER DEFAULT 0"),
         ]:
             if col not in cols:
                 try:
@@ -159,6 +167,7 @@ class Store:
         max_tokens: int | None = None,
         *,
         row_cap_slack: int = 0,
+        preserve_compressed_reads: bool = False,
     ) -> int:
         """Evict oldest turns until both caps are satisfied. Returns number deleted.
 
@@ -217,13 +226,20 @@ class Store:
         # Strategy: delete unpinned rows oldest-first until either the cap is
         # satisfied or no unpinned rows remain; then, if the cap still isn't
         # met, delete pinned rows oldest-first (last resort).
+        # When preserve_compressed_reads=True, rows with compressed_read_stub=1
+        # are also protected (same soft-protect semantics as pin_label).
+        _stub_guard = (
+            "AND (compressed_read_stub IS NULL OR compressed_read_stub = 0)"
+            if preserve_compressed_reads
+            else ""
+        )
         cur = self.conn.execute("SELECT COUNT(*) FROM turns")
         n = cur.fetchone()[0]
         if n > effective_max_turns:
             to_delete = n - effective_max_turns
-            # Phase A: try unpinned rows first.
+            # Phase A: try unpinned (and non-stub) rows first.
             cur = self.conn.execute(
-                "SELECT id FROM turns WHERE pin_label IS NULL ORDER BY id ASC LIMIT ?",
+                f"SELECT id FROM turns WHERE pin_label IS NULL {_stub_guard} ORDER BY id ASC LIMIT ?",
                 (to_delete,),
             )
             unpinned_ids = [r[0] for r in cur.fetchall()]
@@ -262,9 +278,9 @@ class Store:
                 total = int(cur.fetchone()[0])
                 if total <= max_tokens:
                     break
-                # Try oldest unpinned row first.
+                # Try oldest unpinned (and non-stub) row first.
                 cur = self.conn.execute(
-                    "SELECT id FROM turns WHERE pin_label IS NULL ORDER BY id ASC LIMIT 1"
+                    f"SELECT id FROM turns WHERE pin_label IS NULL {_stub_guard} ORDER BY id ASC LIMIT 1"
                 )
                 row = cur.fetchone()
                 if row:
@@ -427,6 +443,40 @@ class Store:
         else:
             cur = self.conn.execute(
                 "SELECT id FROM turns ORDER BY id DESC LIMIT ?", (int(n),)
+            )
+        ids = [r[0] for r in cur.fetchall()]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(
+            f"DELETE FROM turns WHERE id IN ({placeholders})", ids
+        )
+        self.conn.commit()
+        n = len(ids)
+        if n:
+            self._bump_eviction_stats(rows=n)
+        return n
+
+    def evict_oldest(self, n: int, *, skip_pinned: bool = True) -> int:
+        """Delete the N oldest (lowest-id) rows. Returns count actually deleted.
+
+        This is the budget-reclaim primitive: stale history is removed while
+        keeping the most-recent context intact — the opposite of evict_last.
+
+        skip_pinned: if True (default) pinned rows are skipped when counting
+            and selecting. Pass skip_pinned=False to include pinned rows.
+        """
+        if n <= 0:
+            return 0
+        if skip_pinned:
+            cur = self.conn.execute(
+                "SELECT id FROM turns WHERE pin_label IS NULL "
+                "ORDER BY id ASC LIMIT ?",
+                (int(n),),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT id FROM turns ORDER BY id ASC LIMIT ?", (int(n),)
             )
         ids = [r[0] for r in cur.fetchall()]
         if not ids:
@@ -1198,6 +1248,271 @@ class Store:
             new_blocks.append(new_b)
             n_stubbed += 1
         return new_blocks, n_stubbed
+
+    def compress_repeated_reads(
+        self,
+        skip_pinned: bool = True,
+        min_bytes: int = 200,
+        preserve_compressed_reads: bool = False,
+    ) -> dict:
+        """Compress historical Read tool_results for files read multiple times.
+
+        For each file that has been Read 2+ times in the rolling window,
+        keep the LAST Read at full fidelity and replace earlier Reads with:
+          - an "unchanged" pointer if the content hash matches the last Read
+          - a unified diff against the last Read otherwise
+
+        This frees context budget without breaking Claude's pre-write
+        old_string exact-match (which references the most-recent Read).
+
+        Args:
+          skip_pinned: if True (default), rows with pin_label IS NOT NULL
+            are skipped over and their Read tool_results are preserved.
+          min_bytes: minimum content length to compress. Reads shorter than
+            this are kept full (compression overhead exceeds savings).
+          preserve_compressed_reads: if True, mark modified rows with
+            compressed_read_stub=1 so evict() will skip them when called
+            with preserve_compressed_reads=True.
+
+        Returns:
+          {"reads_compressed": N, "bytes_freed": M}
+        """
+        # Walk all stored turns chronologically; collect Read tool_use blocks
+        # paired with their immediately following tool_result blocks.
+        # The content column stores a JSON list of blocks (tool_use, tool_result,
+        # text, thinking, etc.). We need to find tool_use blocks with name
+        # containing "Read" and extract the file_path from their input, then
+        # find the tool_result block that carries the file content.
+        #
+        # NOTE: tool_result blocks live in *user* turns (they come back from
+        # the SDK in UserMessage entries). The assistant turn carries tool_use
+        # blocks. So we need to scan BOTH roles to build the map:
+        #   - assistant turn: tool_use {name: "Read", input: {file_path: ...}}
+        #   - user turn (next): tool_result {tool_use_id: ..., content: [...]}
+        #
+        # We build a {tool_use_id -> file_path} map from assistant turns,
+        # then look up tool_results by tool_use_id in user turns.
+
+        all_rows = list(self.conn.execute(
+            "SELECT id, content, pin_label FROM turns ORDER BY id ASC"
+        ))
+
+        # Map tool_use_id -> file_path for Read calls
+        read_tool_use_map: dict[str, str] = {}
+
+        # For each file_path, accumulate (turn_id, tool_use_id, content_hash,
+        # full_content, block_index_in_content) in chronological order.
+        # block_index_in_content is the index of the tool_result block within
+        # the content list of that turn.
+        file_reads: dict[str, list[dict]] = {}
+
+        for row_id, content_str, pin_label in all_rows:
+            try:
+                blocks = json.loads(content_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(blocks, list):
+                continue
+
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+
+                if btype == "tool_use":
+                    # Check if this is a Read tool call
+                    name = block.get("name", "")
+                    if "Read" in name:
+                        inp = block.get("input")
+                        if isinstance(inp, dict):
+                            fp = inp.get("file_path") or inp.get("path")
+                            if fp and isinstance(fp, str):
+                                tid = block.get("id")
+                                if tid:
+                                    read_tool_use_map[tid] = fp
+
+                elif btype == "tool_result":
+                    # Match against a Read tool_use_id
+                    tool_use_id = block.get("tool_use_id")
+                    if not tool_use_id or tool_use_id not in read_tool_use_map:
+                        continue
+                    file_path = read_tool_use_map[tool_use_id]
+                    # Extract text content from the tool_result
+                    block_content = block.get("content")
+                    if isinstance(block_content, str):
+                        text = block_content
+                    elif isinstance(block_content, list):
+                        # List of content blocks — extract text
+                        parts = []
+                        for cb in block_content:
+                            if isinstance(cb, dict) and cb.get("type") == "text":
+                                parts.append(cb.get("text", ""))
+                        text = "\n".join(p for p in parts if p)
+                    else:
+                        continue
+                    # Compute hash
+                    try:
+                        content_hash = hashlib.md5(text.encode()).hexdigest()
+                    except Exception:
+                        continue
+                    entry = {
+                        "turn_id": row_id,
+                        "tool_use_id": tool_use_id,
+                        "content_hash": content_hash,
+                        "full_content": text,
+                        "pin_label": pin_label,
+                    }
+                    if file_path not in file_reads:
+                        file_reads[file_path] = []
+                    file_reads[file_path].append(entry)
+
+        reads_compressed = 0
+        bytes_freed = 0
+
+        for file_path, reads in file_reads.items():
+            if len(reads) < 2:
+                continue
+
+            # Determine the effective "last" Read: skip entries whose content
+            # looks like a file-deleted error (starts with "Error" or similar).
+            # The last full-content entry is our canonical reference.
+            last_entry = None
+            for entry in reversed(reads):
+                c = entry["full_content"]
+                # Skip already-stubbed entries as the reference
+                if c.startswith("(see turn") or c.startswith("(historical state"):
+                    continue
+                last_entry = entry
+                break
+
+            if last_entry is None:
+                # All entries are already stubbed — skip
+                continue
+
+            last_turn_id = last_entry["turn_id"]
+            last_hash = last_entry["content_hash"]
+            last_content = last_entry["full_content"]
+
+            # Process all entries except the last full one
+            for entry in reads:
+                if entry is last_entry:
+                    continue
+
+                turn_id = entry["turn_id"]
+                content = entry["full_content"]
+                tool_use_id = entry["tool_use_id"]
+                entry_pin = entry["pin_label"]
+
+                # Pin check
+                if skip_pinned and entry_pin is not None:
+                    continue
+
+                # Already stubbed — idempotent skip
+                if content.startswith("(see turn") or content.startswith("(historical state"):
+                    continue
+
+                # Binary check: skip if \x00 bytes present
+                if "\x00" in content:
+                    continue
+
+                # Size check
+                if len(content) < min_bytes:
+                    continue
+
+                # Build the replacement stub
+                if entry["content_hash"] == last_hash:
+                    stub = f"(see turn {last_turn_id} — content unchanged at this point)"
+                else:
+                    diff_lines = list(difflib.unified_diff(
+                        content.splitlines(keepends=True),
+                        last_content.splitlines(keepends=True),
+                        fromfile=f"turn {turn_id}",
+                        tofile=f"turn {last_turn_id}",
+                        lineterm="",
+                    ))
+                    stub = (
+                        f"(historical state at turn {turn_id}; "
+                        f"diff vs latest read at turn {last_turn_id}:)\n"
+                        + "".join(diff_lines)
+                    )
+
+                # Find the turn row and update it
+                row_data = self.conn.execute(
+                    "SELECT content FROM turns WHERE id = ?", (turn_id,)
+                ).fetchone()
+                if not row_data:
+                    continue
+
+                try:
+                    row_blocks = json.loads(row_data[0])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(row_blocks, list):
+                    continue
+
+                orig_str = row_data[0]
+                modified = False
+                new_blocks = []
+                for blk in row_blocks:
+                    if (
+                        isinstance(blk, dict)
+                        and blk.get("type") == "tool_result"
+                        and blk.get("tool_use_id") == tool_use_id
+                    ):
+                        # Replace the content with the stub
+                        new_blk = dict(blk)
+                        old_content = blk.get("content")
+                        if isinstance(old_content, str):
+                            new_blk["content"] = stub
+                        elif isinstance(old_content, list):
+                            # Replace text blocks with stub, preserve structure
+                            new_content_blocks = []
+                            replaced = False
+                            for cb in old_content:
+                                if (
+                                    isinstance(cb, dict)
+                                    and cb.get("type") == "text"
+                                    and not replaced
+                                ):
+                                    new_content_blocks.append({"type": "text", "text": stub})
+                                    replaced = True
+                                elif isinstance(cb, dict) and cb.get("type") == "text":
+                                    # Skip extra text blocks (replaced by stub)
+                                    pass
+                                else:
+                                    new_content_blocks.append(cb)
+                            if not replaced:
+                                new_content_blocks.append({"type": "text", "text": stub})
+                            new_blk["content"] = new_content_blocks
+                        else:
+                            new_blk["content"] = stub
+                        new_blocks.append(new_blk)
+                        modified = True
+                    else:
+                        new_blocks.append(blk)
+
+                if not modified:
+                    continue
+
+                new_str = json.dumps(new_blocks)
+                delta = len(orig_str) - len(new_str)
+                self.conn.execute(
+                    "UPDATE turns SET content=? WHERE id=?",
+                    (new_str, turn_id),
+                )
+                if preserve_compressed_reads:
+                    self.conn.execute(
+                        "UPDATE turns SET compressed_read_stub=1 WHERE id=?",
+                        (turn_id,),
+                    )
+                reads_compressed += 1
+                bytes_freed += delta
+
+        if reads_compressed:
+            self.conn.commit()
+            self._bump_eviction_stats(blocks=reads_compressed, bytes_=bytes_freed)
+
+        return {"reads_compressed": reads_compressed, "bytes_freed": bytes_freed}
 
     def total_tokens(self) -> tuple[int, int]:
         """Return (estimated_stored_tokens, sum_output_tokens).

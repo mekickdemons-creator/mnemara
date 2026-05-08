@@ -1,23 +1,55 @@
 # Mnemara
 
-[![PyPI](https://img.shields.io/pypi/v/mnemara.svg)](https://pypi.org/project/mnemara/)
-[![Python](https://img.shields.io/pypi/pyversions/mnemara.svg)](https://pypi.org/project/mnemara/)
+[![PyPI](https://img.shields.io/pypi/v/gemma-mnemara.svg)](https://pypi.org/project/gemma-mnemara/)
+[![Python](https://img.shields.io/pypi/pyversions/gemma-mnemara.svg)](https://pypi.org/project/gemma-mnemara/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A controlled rolling-context conversation runtime for Claude. Built on the
-**[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)**:
-Mnemara wraps the SDK with a transparent, file-based context layer so you can
-see and shape exactly what the model sees on every turn.
+> **Note:** There is also a Rust project called [`mnemara`](https://github.com/deliberium/mnemara) by `deliberium` — a memory engine for embedded/service systems. Different project, parallel naming (both inspired by Mnemosyne). If you arrived looking for that one, head over there.
 
-What you get:
+**Local-first agent runtime. No API key. No cloud. Ollama under the hood.**
 
-- A **role doc** re-read on every API call and pinned as the system prompt.
+Mnemara (Gemma edition) is a conversation runtime where the **role doc is
+re-read on every turn** and pinned as the system prompt. It drives Gemma
+(or any Ollama-compatible model) directly — no Anthropic account, no usage
+bill, no data leaving your machine.
+
+The flagship example is [`examples/roles/gemma-sentinel.md`](examples/roles/gemma-sentinel.md).
+Drop it in, and the agent watches its own execution for the four failure
+modes that turn agent sessions into runaway loops:
+
+- **No progress** — N+ turns on the same sub-goal with no state change.
+- **Polling** — same tool, same args, 3+ times in a row.
+- **Drift** — about to do something the user didn't ask for.
+- **Sycophancy** — about to reverse a conclusion under tone-only pushback.
+
+When any one fires, the agent **halts and asks**, instead of burning
+another N turns. The role doc is plain Markdown — edit it to match the
+failure modes you actually see.
+
+Try it in 30 seconds (requires [Ollama](https://ollama.com/)):
+
+```bash
+pip install gemma-mnemara
+ollama pull gemma4:26b
+mnemara init --instance scratch
+mnemara role --instance scratch --set examples/roles/gemma-sentinel.md
+mnemara run --instance scratch
+```
+
+---
+
+Powered by **[Ollama](https://ollama.com/)** — runs fully offline.
+Mnemara wraps Ollama's `/api/chat` with a transparent, file-based context
+layer so you can see and shape exactly what the model sees on every turn.
+
+What's in the box:
+
+- A **role doc** re-read on every API call and pinned as the system prompt
+  (the bit that makes Sentinel work).
 - A configurable **rolling window** of recent turns (FIFO, by row count or
   token budget).
-- Native tool use — Bash, Read, Edit, Write — plus an in-process `WriteMemory`
-  tool registered as an SDK MCP server.
-- Optional **MCP wire-through**: declare stdio MCP servers in config and the
-  Claude Agent SDK exposes them to the model.
+- **MCP tool use**: configure stdio MCP servers in `config.json` and Gemma
+  can call them — no API key required for the tools either.
 - A **Textual TUI** (`mnemara run`) and a bare prompt-toolkit REPL fallback.
 - Per-instance, file-only state under `~/.mnemara/<instance>/` — no daemon,
   no service, no hidden state.
@@ -25,13 +57,10 @@ What you get:
   `mnemara replay` consolidation primitive that drafts wiki pages and
   role-amendment proposals from clustered memory atoms.
 
-If you want a chat loop where you control the system prompt, control the
-window, and can read every byte of state on disk, that's what this is.
-
 ## Install
 
 ```bash
-pip install mnemara
+pip install gemma-mnemara
 ```
 
 Or from source if you want to hack on it:
@@ -39,6 +68,7 @@ Or from source if you want to hack on it:
 ```bash
 git clone https://github.com/mekickdemons-creator/mnemara.git
 cd mnemara
+git checkout gemma
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -46,23 +76,22 @@ pip install -e .
 
 ### Platform support
 
-Tested on Linux and macOS. Windows works through **WSL** — the
-Claude Agent SDK's tool calls use `bash`, which is not available on
-native Windows shells (cmd / PowerShell). If you're on Windows, run
-Mnemara inside a WSL distro and treat that as your "Linux" environment.
+Tested on Linux and macOS. Windows works through **WSL** — Mnemara's tool
+calls use `bash`, which is not available on native Windows shells
+(cmd / PowerShell). If you're on Windows, run Mnemara inside a WSL distro.
 
-### Auth
+### Prerequisites: Ollama
 
-Mnemara runs on the Claude Agent SDK, which talks to the Anthropic API. The
-easiest way is to set your API key:
+Mnemara (Gemma edition) drives Ollama directly. No API key required.
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+# Install Ollama: https://ollama.com/
+ollama pull gemma4:26b   # or gemma3:27b, gemma2:27b, etc.
+ollama serve             # if not already running as a service
 ```
 
-Get a key at <https://console.anthropic.com/>. The SDK also supports the local
-`claude` CLI's subscription auth as a fallback if you have Claude Code
-installed and logged in — but the documented path is the API key.
+Set `"model": "gemma4:26b"` (or any Ollama tag) in your instance's
+`config.json`. The default is `gemma4:26b`.
 
 ## Quick start
 
@@ -73,12 +102,12 @@ installed and logged in — but the documented path is the API key.
 ```bash
 mnemara init --instance scratch
 # (prompts for role doc path; you can leave it blank and set it later)
-mnemara role --instance scratch --set examples/roles/sentinel.md
+mnemara role --instance scratch --set examples/roles/gemma-sentinel.md
 mnemara run --instance scratch
 ```
 
 The `--set` argument points at a **role doc** — a Markdown file that becomes
-the agent's system prompt. The repo ships with `examples/roles/sentinel.md`
+the agent's system prompt. The repo ships with `examples/roles/gemma-sentinel.md`
 as a starting point; see [Role docs](#role-docs) below for what to put in
 your own.
 
@@ -90,7 +119,7 @@ useful for scripting or non-TTY contexts.
 
 ```
 +------------------------------------------------------------+
-| mnemara: scratch        model=claude-opus-4-7  role=...    |   header
+| mnemara: scratch        model=gemma4:26b  role=...         |   header
 +------------------------------------------------------------+
 |                                                            |
 |  you: how do I check the lease timeout?                    |
@@ -99,7 +128,7 @@ useful for scripting or non-TTY contexts.
 |    result: ...                                             |
 |                                                            |   chat log
 +------------------------------------------------------------+
-| turns: 12/100 | tokens: 14K/200K | model: claude-opus-4-7  |   status
+| turns: 12/100 | tokens: 14K/200K | model: gemma4:26b       |   status
 +------------------------------------------------------------+
 | > _                                                        |   input
 +------------------------------------------------------------+
@@ -115,8 +144,8 @@ Keybindings:
 | `/help` | Slash-command list (same as the REPL) |
 
 The TUI accepts `/models`, `/swap`, `/tokens`, `/quit`, and `/exit`.
-`/models` lists the available Claude model shortcuts; `/swap 1` or
-`/swap claude-sonnet-4-6` switches the active model.
+`/models` lists the available Ollama model tags; `/swap gemma4:12b` or
+`/swap gemma3:27b` switches the active model.
 
 ## Role docs
 
@@ -162,16 +191,28 @@ the user remembers to remind the agent.
 
 ### Example: Sentinel
 
-[`examples/roles/sentinel.md`](examples/roles/sentinel.md) is a
-self-monitoring role doc. Drop it in as your instance's role and the
-agent will watch its own execution for the failure modes above
-(timeout / no progress, polling, semantic drift, sycophantic reversal)
-and **halt to ask the user** rather than spending another N turns on a
-runaway loop.
+[`examples/roles/gemma-sentinel.md`](examples/roles/gemma-sentinel.md) is a
+self-monitoring role doc tuned for the Gemma backend. Drop it in as your
+instance's role and the agent will watch its own execution for the failure
+modes above (timeout / no progress, polling, semantic drift, sycophantic
+reversal) and **halt to ask the user** rather than spending another N turns on
+a runaway loop.
 
 ```bash
-mnemara role --instance my-agent --set examples/roles/sentinel.md
+mnemara role --instance my-agent --set examples/roles/gemma-sentinel.md
 ```
+
+Or download it directly from GitHub without cloning the repo:
+
+```bash
+mnemara role --instance my-agent --set-from-url \
+  https://raw.githubusercontent.com/mekickdemons-creator/mnemara/gemma/examples/roles/gemma-sentinel.md
+```
+
+`--set-from-url` fetches the doc once (https only, 1 MB cap, UTF-8) and
+saves it into `~/.mnemara/<instance>/role.md`. Mnemara never re-fetches
+the URL at runtime — the saved local copy is what gets re-read each
+turn. Edit the local copy to customize.
 
 Use it as-is for monitoring-flavored work, or treat it as a template:
 copy the file, edit the trigger conditions to match the failure modes
@@ -183,13 +224,13 @@ just text in a Markdown file that the agent reads on every turn.
 
 ### More example role docs
 
-The repo ships three role docs under [`examples/roles/`](examples/roles/):
+The repo ships Gemma-tuned role docs under [`examples/roles/`](examples/roles/):
 
 | File | Use it when |
 |---|---|
-| [`sentinel.md`](examples/roles/sentinel.md) | You want the agent to self-monitor for loops, drift, sycophancy and halt to ask the user. |
-| [`coder.md`](examples/roles/coder.md) | You want a careful, grounded coding collaborator that reads before it writes and edits narrowly. |
-| [`researcher.md`](examples/roles/researcher.md) | You want a citation-grounded research assistant that distinguishes observation from inference and refuses to fabricate. |
+| [`gemma-sentinel.md`](examples/roles/gemma-sentinel.md) | You want the agent to self-monitor for loops, drift, sycophancy and halt to ask the user. |
+| [`gemma-coder.md`](examples/roles/gemma-coder.md) | You want a careful, grounded coding collaborator that reads before it writes and edits narrowly. |
+| [`gemma-planner.md`](examples/roles/gemma-planner.md) | You want a structured planning assistant that reasons step-by-step and flags uncertainty. |
 
 These are starting points. Copy any of them, edit the rules to match
 your work, and point your instance at the copy.
@@ -256,7 +297,7 @@ Everything for an instance lives under `~/.mnemara/<instance>/`:
 | Field | Meaning |
 |---|---|
 | `role_doc_path` | Absolute path to the role doc. Re-read on every API call. Pinned as the system prompt. |
-| `model` | Claude model id (e.g. `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`). |
+| `model` | Ollama model tag (e.g. `gemma4:26b`, `gemma3:27b`, `gemma2:27b`). Default `gemma4:26b`. |
 | `max_window_turns` | Rolling-window size (FIFO). Default 20. Counts both user and assistant turns. |
 | `max_window_tokens` | Token-budget cap. The window is FIFO-trimmed once total tokens exceed this. |
 | `allowed_tools` | List of `{tool, mode, allowed_patterns}` policies. `mode` ∈ `allow`/`ask`/`deny`. |
@@ -274,7 +315,8 @@ mnemara list                              # list instances
 mnemara show --instance <name> [-n N]     # print the rolling window (read-only)
 mnemara clear --instance <name>           # wipe the rolling window
 mnemara delete --instance <name> --force  # nuke ~/.mnemara/<name>/
-mnemara role --instance <name> --set PATH # set role_doc_path
+mnemara role --instance <name> --set PATH                # set role_doc_path (local file)
+mnemara role --instance <name> --set-from-url URL        # download once into instance dir
 mnemara note --instance <name> TEXT...    # append a memory note from the shell
 mnemara replay --instance <name> [--days N] [--threshold N] [--apply]  # consolidation pass
 ```
@@ -285,8 +327,8 @@ mnemara replay --instance <name> [--days N] [--threshold N] [--apply]  # consoli
 /role <path>     swap role doc (also persists to config)
 /show            print the rolling window
 /clear           wipe the window (with confirm)
-/models          list available Claude model shortcuts
-/swap <model|n>  switch model for this and future sessions
+/models          list available Ollama model tags
+/swap <model>    switch model for this and future sessions
 /note <text>     append to today's memory file
 /proposals       list pending role-amendment proposals
 /quit, /exit     save state and exit
@@ -386,36 +428,35 @@ There is also an opt-in **auto-evict-after-write** config flag
 edit/write tool call. Off by default; opt in per instance if you've
 decided that's the policy you want.
 
-## Gemma / Ollama backend
-
-The `gemma` branch ships an alternative backend (`GemmaSession`) that
-replaces the Claude Agent SDK with a direct Ollama `/api/chat` call.
-No API key, no Anthropic account — Ollama must be running locally.
-
-```bash
-ollama pull gemma4:26b   # or gemma3:27b
-ollama serve             # if not already running
-mnemara run --instance my-gemma-instance
-```
-
-Set `"model": "gemma4:26b"` (or any Ollama tag) in `config.json`.
-
-### MCP tool use from the Gemma backend
+## MCP tool use
 
 When `mcp_servers` are configured, GemmaSession starts each server as a
 stdio subprocess on the first turn, negotiates the MCP handshake, and
-passes the available tools to Ollama via the `tools` request field.  When
+passes the available tools to Ollama via the `tools` request field. When
 Gemma calls a tool the request is dispatched to the appropriate MCP server
-(the same permission gates as the Claude backend apply).  Results are
-appended as `role: "tool"` messages and the model is re-invoked until it
-produces a plain text response (capped at 10 tool-call iterations).
+(the same permission gates apply). Results are appended as `role: "tool"`
+messages and the model is re-invoked until it produces a plain text response
+(capped at 10 tool-call iterations).
 
 Tool names are namespaced `<server>__<tool>` so multiple servers coexist
-without collision.  Grant blanket permission in `allowed_tools`:
+without collision. Grant blanket permission in `allowed_tools`:
 
 ```json
 "allowed_tools": [
   {"tool": "fetch__fetch", "mode": "allow", "allowed_patterns": []}
+]
+```
+
+Add servers in `config.json`:
+
+```json
+"mcp_servers": [
+  {
+    "name": "myserver",
+    "command": "/usr/local/bin/my-mcp-server",
+    "args": [],
+    "env": {}
+  }
 ]
 ```
 
@@ -433,29 +474,10 @@ without collision.  Grant blanket permission in `allowed_tools`:
 ```
 
 `uvx` downloads and caches `mcp-server-fetch` on first use; no separate
-install step.  The model can then call `fetch__fetch` with `{"url": "..."}`.
+install step. The model can then call `fetch__fetch` with `{"url": "..."}`.
 
 MCP servers that fail to start are logged to `debug.log` and silently
 skipped — the session continues without their tools.
-
-## MCP wire-through (Claude backend)
-
-Add an entry to `mcp_servers` in `config.json`:
-
-```json
-"mcp_servers": [
-  {
-    "name": "myserver",
-    "command": "/usr/local/bin/my-mcp-server",
-    "args": [],
-    "env": {}
-  }
-]
-```
-
-Mnemara records these servers in its runtime metadata and allow-lists their
-`mcp__<name>__*` tool namespace. The Claude Agent SDK handles the actual
-stdio transport.
 
 ## Graph backend (Kuzu) + sleep/replay primitive
 
@@ -544,14 +566,13 @@ If Ollama is unreachable or LanceDB import fails, RAG tools return
 
 ## Architecture note
 
-Mnemara is a thin runtime around the Claude Agent SDK. The SDK runs the
-model and its native tools (Bash/Read/Edit/Write); Mnemara owns:
+Mnemara (Gemma edition) drives Ollama directly via `/api/chat`. No external
+SDK dependency. Mnemara owns:
 
 - The persistent turn store (`turns.sqlite`).
-- The role doc, re-read every call as `system_prompt`.
-- The rolling-window transcript serialized into each turn's prompt
-  (the SDK is stateless per `query()`).
-- The permission policy (mediated via the SDK's `can_use_tool` callback).
+- The role doc, re-read every call as the system prompt.
+- The rolling-window transcript serialized into each turn's prompt.
+- The permission policy (checked before each MCP tool dispatch).
 - The memory/wiki/RAG/graph backends and the `replay` consolidation pass.
 
 ### Scope: single-instance runtime
@@ -572,7 +593,7 @@ not omission: a generic multi-agent harness has too many opinions
 (scheduling? message-passing? leader election? failure recovery?) to be
 useful as one-size-fits-all. Build your own thin wrapper around the
 [programmatic-use surface](#programmatic-use) — Mnemara is small enough
-that "spawn N `AgentSession`s and route messages between them" is real
+that "spawn N `GemmaSession`s and route messages between them" is real
 code you can write in an afternoon for the specific shape of orchestration
 your project needs.
 
@@ -585,13 +606,15 @@ minimal embed: initializes an instance, configures a role doc, drives
 a turn, and inspects the rolling window — about 60 lines.
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... python examples/programmatic_use.py
+python examples/programmatic_use.py
 ```
 
 ## Troubleshooting
 
-- **Auth errors** — confirm `ANTHROPIC_API_KEY` is set, or that `claude`
-  CLI is installed and `claude login` has been run as a fallback.
+- **Ollama not running** — confirm `ollama serve` is active and the model
+  is pulled (`ollama list`). Mnemara connects to `http://localhost:11434`.
+- **Wrong model tag** — set `"model": "gemma4:26b"` (or the tag you pulled)
+  in `~/.mnemara/<instance>/config.json`.
 - **Role doc not loading** — Mnemara warns to stderr and uses an empty system
   prompt; the REPL stays alive. Check `debug.log` for the path that failed.
 - **MCP server crashes** — check `debug.log` and the server's own stderr.

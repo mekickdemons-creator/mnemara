@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gemma-mnemara"
-version = "0.1.0"
+version = "0.7.0"
 description = "Controlled rolling-context conversation runtime for Gemma via Ollama — transparent turns store, role doc system prompt, offline-first."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,9 +14,8 @@ authors = [
     {name = "Dave Moore"},
 ]
 keywords = [
-    "claude",
-    "anthropic",
-    "claude-agent-sdk",
+    "gemma",
+    "ollama",
     "llm",
     "agent",
     "mcp",
@@ -24,6 +23,7 @@ keywords = [
     "repl",
     "tui",
     "context-window",
+    "local-first",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
