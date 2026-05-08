@@ -357,6 +357,78 @@ async def test_process_noop_when_busy(tmp_path: Path) -> None:
     tui._handle_user_input.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_process_turn_by_turn_consumes_one_row(tmp_path: Path) -> None:
+    """peer_poll_batch=False: _process_peer_messages fires ONE turn per call."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_tui(tmp_path, "/unused.db")
+    tui.cfg = config_mod.Config.from_dict({
+        "peer_poll_batch": False,
+        "peer_poll_enabled": True,
+        "architect_db_path": "/unused.db",
+        "model": "claude-sonnet-4-6",
+    })
+    tui._peer_pending_rows = [
+        {"row_id": 20, "sender_role": "theseus", "task_id": "first",
+         "payload": {"n": 1}, "submitted_at": "2026-05-08"},
+        {"row_id": 21, "sender_role": "theseus", "task_id": "second",
+         "payload": {"n": 2}, "submitted_at": "2026-05-08"},
+        {"row_id": 22, "sender_role": "theseus", "task_id": "third",
+         "payload": {"n": 3}, "submitted_at": "2026-05-08"},
+    ]
+
+    await MnemaraTUI._process_peer_messages(tui)
+
+    # Exactly one LLM call fired.
+    tui._handle_user_input.assert_awaited_once()
+    # Only the first row consumed; two remain.
+    assert len(tui._peer_pending_rows) == 2
+    assert tui._peer_pending_rows[0]["row_id"] == 21
+    # The message targets only the first row.
+    msg = tui._handle_user_input.call_args[0][0]
+    assert "row_id=20" in msg
+    assert "row_id=21" not in msg
+    assert "row_id=22" not in msg
+
+
+@pytest.mark.asyncio
+async def test_process_turn_by_turn_drains_sequentially(tmp_path: Path) -> None:
+    """peer_poll_batch=False: three calls drain three rows one at a time."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_tui(tmp_path, "/unused.db")
+    tui.cfg = config_mod.Config.from_dict({
+        "peer_poll_batch": False,
+        "peer_poll_enabled": True,
+        "architect_db_path": "/unused.db",
+        "model": "claude-sonnet-4-6",
+    })
+    tui._peer_pending_rows = [
+        {"row_id": 30, "sender_role": "theseus", "task_id": "a",
+         "payload": {}, "submitted_at": "2026-05-08"},
+        {"row_id": 31, "sender_role": "theseus", "task_id": "b",
+         "payload": {}, "submitted_at": "2026-05-08"},
+        {"row_id": 32, "sender_role": "theseus", "task_id": "c",
+         "payload": {}, "submitted_at": "2026-05-08"},
+    ]
+
+    # Simulate three idle windows (e.g. _send_turn finally block fires 3x).
+    await MnemaraTUI._process_peer_messages(tui)
+    assert len(tui._peer_pending_rows) == 2
+
+    await MnemaraTUI._process_peer_messages(tui)
+    assert len(tui._peer_pending_rows) == 1
+
+    await MnemaraTUI._process_peer_messages(tui)
+    assert tui._peer_pending_rows == []
+
+    # Three turns fired, one per call.
+    assert tui._handle_user_input.await_count == 3
+
+
 # ---------------------------------------------------------------------------
 # Status bar ⚡ badge test
 # ---------------------------------------------------------------------------
