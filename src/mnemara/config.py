@@ -196,6 +196,10 @@ class Config:
     # STALE relative to the current on-disk hash.
     read_skeleton_enabled: bool = False
     file_stat_manifest_enabled: bool = False
+    # display — cosmetic label shown in the TUI chat log instead of "assistant"
+    # Set to e.g. "Substrate-engineer" or "Majordomo" to make panel identity
+    # visible at a glance. Empty string = keep default "assistant".
+    display_name: str = ""
     # v0.3 — graph backend + sleep/replay
     graph_enabled: bool = True
     replay_default_days: int = 7

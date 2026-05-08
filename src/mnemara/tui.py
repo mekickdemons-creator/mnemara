@@ -555,13 +555,14 @@ class MnemaraTUI(App):  # type: ignore[misc]
             text = _flatten_text_blocks(content)
             log_widget.write(f"[b cyan]you:[/b cyan] {text}")
         elif role == "assistant":
+            label = self.cfg.display_name or "assistant"
             if isinstance(content, list):
                 for b in content:
                     if not isinstance(b, dict):
                         continue
                     t = b.get("type")
                     if t == "text" and b.get("text"):
-                        log_widget.write(f"[b green]assistant:[/b green] {b['text']}")
+                        log_widget.write(f"[b green]{label}:[/b green] {b['text']}")
                     elif t == "tool_use":
                         name = b.get("name", "?")
                         inp = b.get("input") or {}
@@ -572,7 +573,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
                         c = b.get("content")
                         log_widget.write(f"[dim]  result: {str(c)[:200]}[/dim]")
             else:
-                log_widget.write(f"[b green]assistant:[/b green] {content}")
+                log_widget.write(f"[b green]{label}:[/b green] {content}")
 
     # ---------------------------------------------------------------- status / spinner
 
@@ -706,7 +707,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 on_tool_result=on_tool_result,
             )
             if self._stream_buffer:
-                chat.write(f"[b green]assistant:[/b green] {self._stream_buffer}")
+                label = self.cfg.display_name or "assistant"
+                chat.write(f"[b green]{label}:[/b green] {self._stream_buffer}")
         except asyncio.CancelledError:
             try:
                 self.store.append_turn(
@@ -716,7 +718,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             except Exception:
                 pass
             if self._stream_buffer:
-                chat.write(f"[b green]assistant:[/b green] [dim]{self._stream_buffer}[/dim]")
+                label = self.cfg.display_name or "assistant"
+                chat.write(f"[b green]{label}:[/b green] [dim]{self._stream_buffer}[/dim]")
             chat.write("[dim]⏹ turn interrupted[/dim]")
             raise
         except Exception as exc:
