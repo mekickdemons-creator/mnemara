@@ -261,5 +261,62 @@ def note_cmd(instance: str, text: tuple[str, ...]) -> None:
     console.print(f"[green]appended to[/green] {p}")
 
 
+@main.command("migrate")
+@click.option("--all", "all_instances", is_flag=True, default=False,
+              help="Migrate every instance under ~/.mnemara/.")
+@click.option("--instance", "instance_name", default=None,
+              help="Migrate a single named instance.")
+def migrate_cmd(all_instances: bool, instance_name: str | None) -> None:
+    """Run schema migrations on one or all instances.
+
+    Each Store() construction runs _migrate_schema() idempotently — this
+    command forces that pass on panels that haven't been started since a
+    schema-version bump (e.g. the v0.6.0 compressed_read_stub column).
+
+    Examples:
+        mnemara migrate --all
+        mnemara migrate --instance majordomo
+    """
+    if not all_instances and not instance_name:
+        console.print("[red]provide --all or --instance <name>[/red]")
+        sys.exit(1)
+    if all_instances and instance_name:
+        console.print("[red]--all and --instance are mutually exclusive[/red]")
+        sys.exit(1)
+
+    targets: list[str]
+    if instance_name:
+        if not paths.config_path(instance_name).exists():
+            console.print(f"[red]No instance:[/red] {instance_name}")
+            sys.exit(1)
+        targets = [instance_name]
+    else:
+        targets = paths.list_instances()
+        if not targets:
+            console.print("[dim](no instances found)[/dim]")
+            return
+
+    ok: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for name in targets:
+        try:
+            store = Store(name)
+            store.close()
+            ok.append(name)
+        except Exception as exc:  # noqa: BLE001
+            failed.append((name, str(exc)))
+
+    for name in ok:
+        console.print(f"[green]migrated[/green] {name}")
+    for name, err in failed:
+        console.print(f"[red]failed[/red] {name}: {err}")
+
+    console.print(
+        f"\n[dim]{len(ok)} migrated, {len(failed)} failed[/dim]"
+    )
+    if failed:
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()

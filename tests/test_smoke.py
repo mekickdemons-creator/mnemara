@@ -583,6 +583,86 @@ def test_cli_list_show_clear(home):
     assert r.exit_code == 0
 
 
+def test_migrate_all_brings_panels_to_current_schema(home, tmp_path):
+    """Instances that pre-date a schema column get it after `mnemara migrate --all`."""
+    import sqlite3
+    from click.testing import CliRunner
+    from mnemara.cli import main
+    from mnemara import config as config_mod, paths
+
+    # Create two instances via init (which runs _migrate_schema, giving them current schema)
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--instance", "mig_a", "--role", ""])
+    runner.invoke(main, ["init", "--instance", "mig_b", "--role", ""])
+
+    # Simulate a pre-v0.6 database by dropping the compressed_read_stub column
+    # (SQLite doesn't support DROP COLUMN before 3.35; recreate the table instead)
+    for name in ("mig_a", "mig_b"):
+        db = paths.db_path(name)
+        conn = sqlite3.connect(str(db))
+        # Check if the column exists first
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
+        if "compressed_read_stub" in cols:
+            # Recreate the table without the column
+            conn.executescript("""
+                BEGIN;
+                CREATE TABLE turns_old AS SELECT id, ts, role, content, tokens_in,
+                    tokens_out, pin_label FROM turns;
+                DROP TABLE turns;
+                CREATE TABLE turns (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tokens_in INTEGER DEFAULT 0,
+                    tokens_out INTEGER DEFAULT 0,
+                    pin_label TEXT
+                );
+                INSERT INTO turns SELECT * FROM turns_old;
+                DROP TABLE turns_old;
+                COMMIT;
+            """)
+        conn.close()
+
+    # Verify the column is now missing in both
+    for name in ("mig_a", "mig_b"):
+        db = paths.db_path(name)
+        conn = sqlite3.connect(str(db))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
+        conn.close()
+        assert "compressed_read_stub" not in cols, f"{name} still has column before migrate"
+
+    # Run migrate --all
+    result = runner.invoke(main, ["migrate", "--all"])
+    assert result.exit_code == 0, result.output
+    assert "migrated" in result.output
+
+    # Column should now be present in both
+    for name in ("mig_a", "mig_b"):
+        db = paths.db_path(name)
+        conn = sqlite3.connect(str(db))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
+        conn.close()
+        assert "compressed_read_stub" in cols, f"{name} missing column after migrate"
+
+
+def test_migrate_idempotent_on_current_schema(home):
+    """Running migrate twice on a current-schema instance produces no errors."""
+    from click.testing import CliRunner
+    from mnemara.cli import main
+
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--instance", "mig_idem", "--role", ""])
+
+    # First migrate
+    r1 = runner.invoke(main, ["migrate", "--instance", "mig_idem"])
+    assert r1.exit_code == 0, r1.output
+    assert "migrated" in r1.output
+
+    # Second migrate — must also succeed (no error on existing column)
+    r2 = runner.invoke(main, ["migrate", "--instance", "mig_idem"])
+    assert r2.exit_code == 0, r2.output
+    assert "migrated" in r2.output
 
 
 
