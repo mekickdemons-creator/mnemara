@@ -249,6 +249,7 @@ class Config:
                 ToolPolicy(tool="PinRow", mode="allow"),
                 ToolPolicy(tool="UnpinRow", mode="allow"),
                 ToolPolicy(tool="ListPinned", mode="allow"),
+                ToolPolicy(tool="ListWindow", mode="allow"),
             ]
         )
 

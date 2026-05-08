@@ -110,6 +110,7 @@ _PIN_ROW_TOOL = "mcp__mnemara_memory__pin_row"
 _UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
 _LIST_PINNED_TOOL = "mcp__mnemara_memory__list_pinned"
 _READ_SKELETON_TOOL = "mcp__mnemara_memory__read_skeleton"
+_LIST_WINDOW_TOOL = "mcp__mnemara_memory__list_window"
 
 
 # Hard context ceilings per model family — the API's absolute token limit.
@@ -581,10 +582,12 @@ class AgentSession:
             "inspect_context",
             "Report Mnemara's view of the current session: turn count, token "
             "totals, eviction count, role doc info, configured MCP servers, "
-            "and tool permission summary. Returns a JSON dict.",
-            {},
+            "and tool permission summary. Pass include_rows=true to also "
+            "include the 50 most-recent rolling-window rows with summaries "
+            "(same format as list_window). Returns a JSON dict.",
+            {"include_rows": bool},
         )
-        async def _inspect_context_tool(_args: dict[str, Any]) -> dict[str, Any]:
+        async def _inspect_context_tool(args: dict[str, Any]) -> dict[str, Any]:
             cfg = session.cfg
             tin, tout = session.store.total_tokens()
             n_turns = len(session.store.window())
@@ -615,6 +618,11 @@ class AgentSession:
                     {"tool": t.tool, "mode": t.mode} for t in cfg.allowed_tools
                 ],
             }
+            # include_rows: append rolling-window rows when requested
+            include_rows = args.get("include_rows", False)
+            if include_rows:
+                window_data = session.store.list_window(limit=50, offset=0, role="")
+                info["rows"] = window_data.get("rows", [])
             return {
                 "content": [
                     {"type": "text", "text": json.dumps(info, indent=2)}
@@ -1597,6 +1605,34 @@ class AgentSession:
             result = tools_mod._read_skeleton(args)
             return {"content": [{"type": "text", "text": result}]}
 
+        @tool(
+            "list_window",
+            "List rolling-window rows with lightweight summaries. Returns "
+            "{ok, rows, total} where each row has {row_id, timestamp, role, "
+            "summary}. summary is the first 80 chars of text content; for "
+            "assistant rows with structured blocks, the first text block's "
+            "text is extracted (tool_use blocks show as '[tool_use <name>]'). "
+            "Use limit (max 200, default 50) and offset for pagination. "
+            "Filter to a specific speaker with role='user' or role='assistant'. "
+            "Rows are returned most-recent first (highest row_id first). "
+            "Use row_ids from this list with pin_row to pin specific turns.",
+            {"limit": int, "offset": int, "role": str},
+        )
+        async def _list_window_tool(args: dict[str, Any]) -> dict[str, Any]:
+            try:
+                limit = int(args.get("limit") or 50)
+            except (TypeError, ValueError):
+                limit = 50
+            try:
+                offset = int(args.get("offset") or 0)
+            except (TypeError, ValueError):
+                offset = 0
+            role = (args.get("role") or "").strip()
+            result = session.store.list_window(limit=limit, offset=offset, role=role)
+            return {
+                "content": [{"type": "text", "text": json.dumps(result)}]
+            }
+
         registered = [
             _write_memory_tool,
             _inspect_context_tool,
@@ -1625,6 +1661,7 @@ class AgentSession:
             _unpin_row_tool,
             _list_pinned_tool,
             _evict_older_than_tool,
+            _list_window_tool,
         ]
         if getattr(self.cfg, "read_skeleton_enabled", False):
             registered.append(_read_skeleton_tool)
@@ -1675,6 +1712,7 @@ class AgentSession:
             _PIN_ROW_TOOL,
             _UNPIN_ROW_TOOL,
             _LIST_PINNED_TOOL,
+            _LIST_WINDOW_TOOL,
         ]
         if getattr(self.cfg, "read_skeleton_enabled", False):
             allowed_tools.append(_READ_SKELETON_TOOL)
@@ -2066,6 +2104,8 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "UnpinRow", ""
     if tool_name == _LIST_PINNED_TOOL or tool_name.endswith("__list_pinned"):
         return "ListPinned", ""
+    if tool_name == _LIST_WINDOW_TOOL or tool_name.endswith("__list_window"):
+        return "ListWindow", ""
     if tool_name == _READ_SKELETON_TOOL or tool_name.endswith("__read_skeleton"):
         return "Read", str(tool_input.get("file_path") or "")
     return None, ""

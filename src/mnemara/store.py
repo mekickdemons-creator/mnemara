@@ -1567,6 +1567,67 @@ class Store:
 
         return result
 
+    def list_window(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        role: str = "",
+    ) -> dict:
+        """Return rolling-window rows with lightweight summaries.
+
+        Args:
+          limit:  max rows to return (capped at 200).
+          offset: skip this many rows (for pagination).
+          role:   if non-empty, filter to 'user' or 'assistant' only.
+
+        Returns:
+          {
+            "ok": True,
+            "rows": [{"row_id": int, "timestamp": str, "role": str, "summary": str}, ...],
+            "total": int,  # total matching rows (before limit/offset)
+          }
+
+        Sort: most recent first (highest row_id first).
+        Summary: first 80 chars of flattened text content.
+        For assistant rows with structured block content, extracts the first
+        text block's text, or returns "[tool_use <name>]" for tool_use blocks.
+        """
+        limit = min(int(limit), 200)
+        offset = max(int(offset), 0)
+
+        if role:
+            count_cur = self.conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE role=?", (role,)
+            )
+        else:
+            count_cur = self.conn.execute("SELECT COUNT(*) FROM turns")
+        total = int(count_cur.fetchone()[0])
+
+        if role:
+            rows_cur = self.conn.execute(
+                "SELECT id, ts, role, content FROM turns "
+                "WHERE role=? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (role, limit, offset),
+            )
+        else:
+            rows_cur = self.conn.execute(
+                "SELECT id, ts, role, content FROM turns "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+
+        rows = []
+        for row_id, ts, row_role, content_str in rows_cur.fetchall():
+            summary = _window_summary(row_role, content_str)
+            rows.append({
+                "row_id": row_id,
+                "timestamp": ts,
+                "role": row_role,
+                "summary": summary,
+            })
+
+        return {"ok": True, "rows": rows, "total": total}
+
     def total_tokens(self) -> tuple[int, int]:
         """Return (estimated_stored_tokens, sum_output_tokens).
 
@@ -1580,6 +1641,32 @@ class Store:
         )
         a, b = cur.fetchone()
         return int(a), int(b)
+
+
+def _window_summary(role: str, content_str: str) -> str:
+    """Build an 80-char summary from a raw content string.
+
+    For assistant rows with JSON-encoded block lists, extracts the first
+    text block's text, or returns "[tool_use <name>]" for tool_use blocks.
+    Falls back to the first 80 chars of the raw string on any failure.
+    """
+    if role == "assistant":
+        try:
+            blocks = json.loads(content_str)
+            if isinstance(blocks, list) and blocks:
+                for b in blocks:
+                    if not isinstance(b, dict):
+                        continue
+                    btype = b.get("type")
+                    if btype == "text":
+                        return (b.get("text") or "")[:80]
+                    if btype == "tool_use":
+                        name = b.get("name") or "?"
+                        return f"[tool_use {name}]"
+                # No matching block found; fall through to raw
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return content_str[:80]
 
 
 def _maybe_json(s: str):
