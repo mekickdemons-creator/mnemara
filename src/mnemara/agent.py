@@ -561,12 +561,26 @@ class AgentSession:
                         payload_dict = parsed
                 except (ValueError, TypeError):
                     payload_dict = None
-            tools_mod.write_memory(
-                session.runner.instance,
-                args.get("text", "") or "",
-                args.get("category", "note") or "note",
-                payload=payload_dict,
-                cfg=session.cfg,
+            instance = session.runner.instance
+            text = args.get("text", "") or ""
+            category = args.get("category", "note") or "note"
+            cfg = session.cfg
+            # Run the synchronous write_memory (which may do blocking I/O: file
+            # append + optional RAG HTTP embed call + graph edge computation) in
+            # a thread so the event loop stays free.  Without this, rapid-fire
+            # write_memory calls block the asyncio loop while the embedding HTTP
+            # request runs, starving _read_messages and preventing it from
+            # draining the CLI subprocess's stdout pipe.  When the pipe buffer
+            # fills (~64 KB on Linux), the CLI blocks trying to write more
+            # output and the bidirectional control stream deadlocks, producing
+            # "stream closed" errors at the transport layer.
+            await asyncio.to_thread(
+                tools_mod.write_memory,
+                instance,
+                text,
+                category,
+                payload_dict,
+                cfg,
             )
             session.memory_writes += 1
             cat = args.get("category", "") or ""

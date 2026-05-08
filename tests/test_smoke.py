@@ -427,6 +427,81 @@ def test_structured_write_memory_payload(home):
     assert "] legacy" in text2
 
 
+def test_write_memory_20_rapid_calls_all_succeed(home, monkeypatch):
+    """Regression test for write_memory stream-closed errors (v0.10.1).
+
+    Calls write_memory 20 times in rapid succession via the _registered_tools
+    MCP handler — the same code path used in production panels.  All 20 calls
+    must return ok=True and all 20 entries must appear in the memory file.
+
+    Root cause being guarded: tools_mod.write_memory is synchronous and may
+    do blocking I/O (file append + optional RAG HTTP embed + graph edges).
+    When called directly from the async _write_memory_tool handler without
+    offloading to a thread, rapid back-to-back calls block the event loop,
+    starve _read_messages, and fill the CLI subprocess's stdout pipe — causing
+    the bidirectional control stream to deadlock and produce "stream closed"
+    errors at 30-50% failure rate.  The fix is asyncio.to_thread() in the
+    handler so blocking I/O runs off-loop.
+    """
+    import asyncio as _asyncio
+    from mnemara import agent as agent_mod, config, paths
+    from mnemara.permissions import PermissionStore
+    from mnemara.store import Store
+    from mnemara.tools import ToolRunner
+
+    config.init_instance("wm_rapid_t")
+    cfg = config.load("wm_rapid_t")
+    store = Store("wm_rapid_t")
+    perms = PermissionStore("wm_rapid_t")
+    runner = ToolRunner("wm_rapid_t", cfg, perms, prompt=lambda t, x: "deny")
+
+    async def _fake_query(*, prompt, options, transport=None):
+        async for _ in prompt:
+            break
+        if False:
+            yield None
+
+    monkeypatch.setattr(agent_mod, "query", _fake_query)
+
+    session = agent_mod.AgentSession(cfg, store, runner)
+    session.turn("init")
+
+    handler = session._registered_tools.get("write_memory")
+    assert handler is not None, "write_memory must be in _registered_tools"
+
+    N = 20
+    markers = [f"RAPID_ENTRY_{i:02d}" for i in range(N)]
+
+    async def _run() -> list[bool]:
+        results = []
+        for i, marker in enumerate(markers):
+            result = await handler({"text": marker, "category": "rapid_test"})
+            content = result.get("content", [])
+            text = content[0]["text"] if content else ""
+            is_ok = not result.get("is_error", False) and "error" not in text.lower()
+            results.append(is_ok)
+        return results
+
+    call_results = _asyncio.run(_run())
+
+    # All 20 calls must return success
+    failures = [markers[i] for i, ok in enumerate(call_results) if not ok]
+    assert not failures, f"{len(failures)}/20 calls returned error: {failures}"
+    assert all(call_results), f"call results: {call_results}"
+
+    # All 20 entries must be present in the memory file
+    mem_dir = paths.memory_dir("wm_rapid_t")
+    mem_files = list(mem_dir.glob("*.md"))
+    assert mem_files, "no memory file created"
+    combined = "\n".join(f.read_text() for f in mem_files)
+    missing = [m for m in markers if m not in combined]
+    assert not missing, (
+        f"{len(missing)}/20 entries missing from memory file: {missing!r}"
+    )
+
+    store.close()
+
+
 def test_session_stats_dump_merges(home):
     import json as _json
     from datetime import datetime, timezone
