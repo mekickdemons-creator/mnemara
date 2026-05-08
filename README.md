@@ -137,18 +137,10 @@ useful for scripting or non-TTY contexts.
 +------------------------------------------------------------+
 ```
 
-Keybindings:
-
-| Key | Action |
-|---|---|
-| Enter | Send the message |
-| Ctrl+L | Clear the on-screen chat log (does NOT touch turns.sqlite) |
-| Ctrl+C | Quit |
-| `/help` | Slash-command list (same as the REPL) |
-
-The TUI accepts `/models`, `/swap`, `/tokens`, `/quit`, and `/exit`.
-`/models` lists the available Claude model shortcuts; `/swap 1` or
-`/swap claude-sonnet-4-6` switches the active model.
+The input area is multi-line. See [Slash commands](#slash-commands-repl-and-tui)
+below for the full keybinding table and the slash-command surface
+(`/models`, `/swap`, `/tokens`, `/evict`, `/export`, `/import`, `/compress reads`,
+`/skeleton`, `/name`, etc.).
 
 ## Role docs
 
@@ -297,6 +289,8 @@ Everything for an instance lives under `~/.mnemara/<instance>/`:
 
 `~/.mnemara/<instance>/config.json`:
 
+### Core
+
 | Field | Meaning |
 |---|---|
 | `role_doc_path` | Absolute path to the role doc. Re-read on every API call. Pinned as the system prompt. |
@@ -308,6 +302,35 @@ Everything for an instance lives under `~/.mnemara/<instance>/`:
 | `stream` | If true, render the model's text deltas as they arrive. |
 | `bash_timeout_seconds` | Bash command timeout. Default 60. |
 | `file_tool_home_only` | If true, Read/Write/Edit refuse paths outside `$HOME`. Default true. |
+| `display_name` | Cosmetic label shown in the TUI chat log instead of `assistant`. Empty = default. Set via `/name <label>`. |
+
+### Context discipline (opt-in compression / eviction)
+
+All default to `False` (or `0`). Turn on per instance.
+
+| Field | Meaning |
+|---|---|
+| `auto_evict_after_write` | After any turn containing Edit/Write/MultiEdit/NotebookEdit blocks, stub the bulky body content of those tool_use specs *and* prior Read specs for the same file. Audit shell preserved. |
+| `compress_repeated_reads` | After every turn, walk the window for repeated Reads of the same file — keep the latest at full fidelity, stub earlier ones as a unified diff or "unchanged" pointer. v0.6.0 / v0.8.0. |
+| `preserve_compressed_reads` | When set, rows flagged as compression stubs are excluded from cap-FIFO eviction (same soft-protect as pinned rows). |
+| `read_skeleton_enabled` | Registers the `read_skeleton` tool so the agent can request Python signatures + docstrings only (~90% smaller than a full Read). v0.7.0. |
+| `file_stat_manifest_enabled` | Auto-injects a markdown table at the bottom of system_prompt listing every file Read this session: size, mtime, fresh/STALE/gone vs current disk hash, est tokens. v0.7.0. |
+| `runtime_sentinel` | Wires SDK hook events so a per-session `RuntimeSentinel` watches PreToolUse events. If the same `(tool, args)` fires 3+ times in 5 events, injects a synthetic `[SENTINEL HALT]` and stops the turn. Belt-and-suspenders with `sentinel.md`. |
+| `row_cap_slack_when_token_headroom` | If > 0, lets `n_turns` exceed `max_window_turns` by up to this many rows when token usage is well under cap. Lets the row cap "breathe" with the byte budget. Default 0. |
+
+### Memory backends
+
+| Field | Meaning |
+|---|---|
+| `rag_enabled` | LanceDB RAG index over `memory/` + `wiki/`. Default `True`. |
+| `rag_embed_url` | Ollama embeddings endpoint. Default `http://localhost:11434/api/embeddings`. |
+| `rag_embed_model` | Embedding model. Default `nomic-embed-text`. |
+| `rag_auto_index_memory` | Re-index memory atoms on each write. Default `True`. |
+| `rag_auto_index_wiki` | Re-index wiki pages on each write. Default `True`. |
+| `graph_enabled` | Kuzu property graph for `memory_atoms`/`wiki_pages`/`entities`. Default `True`. Off-switch if Kuzu is unavailable. |
+| `replay_default_days` | Default lookback for `mnemara replay`. Default 7. |
+| `replay_default_threshold` | Minimum cluster size to count as a pattern. Default 3. |
+| `replay_policy_path` | Override path for the replay policy doc. Empty = `<instance>/wiki/replay_policy.md`. |
 
 ## CLI commands
 
@@ -322,21 +345,44 @@ mnemara role --instance <name> --set PATH                # set role_doc_path (lo
 mnemara role --instance <name> --set-from-url URL        # download once into instance dir
 mnemara note --instance <name> TEXT...    # append a memory note from the shell
 mnemara replay --instance <name> [--days N] [--threshold N] [--apply]  # consolidation pass
+mnemara migrate --all                     # run schema migration on every instance (idempotent)
+mnemara migrate --instance <name>         # run schema migration on one instance
 ```
 
 ## Slash commands (REPL and TUI)
 
 ```
-/role <path>     swap role doc (also persists to config)
-/show            print the rolling window
-/clear           wipe the window (with confirm)
-/models          list available Claude model shortcuts
-/swap <model|n>  switch model for this and future sessions
-/note <text>     append to today's memory file
-/proposals       list pending role-amendment proposals
-/quit, /exit     save state and exit
-/help            show this list
+/role <path>         swap role doc (also persists to config)
+/show                print the rolling window
+/clear               wipe the window (with confirm)
+/models              list available Claude model shortcuts
+/swap <model|n>      switch model for this and future sessions
+/tokens <N>          set max_window_tokens live (accepts 500k, 1m, 200000)
+/note <text>         append to today's memory file
+/proposals           list pending role-amendment proposals
+/evict <N>           drop the N oldest rows from the rolling window
+/stop                cancel the in-flight turn
+/export <path>       round-trip the session (turns + config + role_doc) to markdown
+/import <path>       restore a session from a /export markdown file
+/compress reads      manually run compress_repeated_reads on the window
+/skeleton <path>     manually extract Python signatures from a file (debug)
+/name <label>        set display_name; clear with /name (no arg)
+/quit, /exit         save state and exit
+/help                show this list
 ```
+
+### TUI keybindings
+
+The TUI input area is multi-line — `Enter` inserts a newline.
+
+| Key | Action |
+|---|---|
+| Ctrl+S | Send the message |
+| Enter | Newline in the input |
+| Escape | Clear the input |
+| Ctrl+L | Clear the on-screen chat log (does NOT touch turns.sqlite) |
+| PageUp / PageDown | Scroll chat |
+| Ctrl+C | Quit |
 
 ## Permissions model
 
