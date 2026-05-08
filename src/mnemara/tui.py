@@ -25,7 +25,8 @@ try:
     from textual import events as _txt_events
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.widgets import Footer, Header, Input, RichLog, Static, TextArea
+    from textual.widgets import Button, Footer, Header, Input, RichLog, Static, TextArea
+    from textual.containers import Horizontal
     _TEXTUAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _TEXTUAL_AVAILABLE = False
@@ -137,6 +138,45 @@ Screen {
 
 #userinput > .text-area--selection {
     background: #2a3f5f;
+}
+
+#btn-row {
+    height: 3;
+    background: #11151e;
+    align: right middle;
+}
+
+#btn-send {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 14;
+}
+
+#btn-send:hover {
+    background: #2a4f7a;
+    color: #8fb6e6;
+}
+
+#btn-send:focus {
+    border: tall #6f9ad9;
+}
+
+#btn-quit {
+    background: #2a1f1f;
+    color: #8a6a6a;
+    border: tall #5a3a3a;
+    min-width: 14;
+    margin-left: 1;
+}
+
+#btn-quit:hover {
+    background: #3a2a2a;
+    color: #c08080;
+}
+
+#btn-quit:focus {
+    border: tall #a05050;
 }
 """
 
@@ -408,7 +448,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         )
         yield Static(self._status_text(), id="status")
         yield Static(
-            "[dim]Enter for newline · Ctrl+S to send · Esc to clear · Ctrl+C to quit[/dim]",
+            "[dim]Enter for newline · Esc to clear[/dim]",
             id="keyhint",
         )
         yield _UserTextArea(
@@ -419,6 +459,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
             soft_wrap=True,
             id="userinput",
         )
+        with Horizontal(id="btn-row"):
+            yield Button("Send  ⌃S", id="btn-send")
+            yield Button("Quit  ⌃C", id="btn-quit")
         yield Footer()
 
     # ---------------------------------------------------------------- mount
@@ -652,6 +695,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
             return
         ta.clear()
         ta.focus()
+
+    async def on_button_pressed(self, event: "Button.Pressed") -> None:
+        """Handle Send and Quit button clicks."""
+        if event.button.id == "btn-send":
+            await self.action_submit_prompt()
+        elif event.button.id == "btn-quit":
+            await self.action_quit()
 
     async def _handle_user_input(self, text: str) -> None:
         """Process a submitted prompt: slash commands, queuing, or turn dispatch."""
