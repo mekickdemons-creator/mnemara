@@ -14,6 +14,11 @@ realize what it lets you do: write rules the agent has to obey on every
 single API call — not just the first one — and the agent enforces them on
 itself.
 
+> **Empirical check (2026-05-08):** in a 101-turn coding session run on
+> Mnemara itself, the panel made zero out-of-lane writes and zero protocol
+> violations against its role doc. The rule that fires on turn 1 still
+> fires on turn 101.
+
 The flagship example is [`examples/roles/sentinel.md`](examples/roles/sentinel.md).
 Drop it in, and the agent watches its own execution for the four failure
 modes that turn agent sessions into expensive accidents:
