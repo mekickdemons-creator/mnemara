@@ -26,7 +26,7 @@ try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.screen import ModalScreen
-    from textual.widgets import Button, Footer, Header, Input, RichLog, Static, TextArea
+    from textual.widgets import Button, Footer, Header, Input, ListItem, ListView, RichLog, Static, TextArea
     from textual.containers import Horizontal, Vertical
     _TEXTUAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -287,6 +287,126 @@ RoleDocEditorModal {
 
 #btn-role:focus {
     border: tall #6f9ad9;
+}
+
+/* ---- Context viewer modal ---- */
+ContextViewerModal {
+    align: center middle;
+}
+
+#ctx-dialog {
+    width: 95%;
+    height: 95%;
+    border: round #6f9ad9;
+    background: #1d2330;
+    padding: 1 2;
+}
+
+#ctx-header {
+    height: 1;
+    color: #8fb6e6;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#ctx-filter-row {
+    height: 3;
+    background: #1d2330;
+    margin-bottom: 1;
+}
+
+#ctx-filter-input {
+    width: 1fr;
+    border: tall #4d6fa3;
+    background: #11151e;
+    color: #ffffff;
+}
+
+#ctx-panels {
+    height: 1fr;
+}
+
+#ctx-list-panel {
+    width: 2fr;
+    border: round #4d6fa3;
+    margin-right: 1;
+}
+
+#ctx-list {
+    height: 1fr;
+    background: #11151e;
+}
+
+#ctx-detail-panel {
+    width: 3fr;
+    border: round #4d6fa3;
+}
+
+#ctx-detail-ta {
+    height: 1fr;
+    background: #11151e;
+    color: #d0d8e8;
+    padding: 0 1;
+}
+
+#ctx-action-row {
+    height: 3;
+    background: #1d2330;
+    align: left middle;
+    margin-top: 1;
+}
+
+#btn-ctx-evict {
+    background: #2a1f1f;
+    color: #c08080;
+    border: tall #5a3a3a;
+    min-width: 10;
+}
+
+#btn-ctx-pin {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 10;
+    margin-left: 1;
+}
+
+#btn-ctx-unpin {
+    background: #1a2a1a;
+    color: #6fad6f;
+    border: tall #3a6f3a;
+    min-width: 10;
+    margin-left: 1;
+}
+
+#btn-ctx-close {
+    background: #2a2a2a;
+    color: #888888;
+    border: tall #444444;
+    min-width: 14;
+    margin-left: 1;
+}
+
+#btn-ctx-evict:hover { background: #3a2a2a; }
+#btn-ctx-pin:hover   { background: #2a4f7a; }
+#btn-ctx-unpin:hover { background: #2a3a2a; }
+#btn-ctx-close:hover { background: #333333; }
+
+#btn-context {
+    background: #1a2a1a;
+    color: #6fad6f;
+    border: tall #3a6f3a;
+    min-width: 14;
+    margin-left: 1;
+}
+
+#btn-context:hover {
+    background: #2a3a2a;
+    color: #8fc88f;
+}
+
+#btn-context:focus {
+    border: tall #6fad6f;
 }
 """
 
@@ -565,6 +685,220 @@ class RoleDocEditorModal(ModalScreen):  # type: ignore[misc]
         self.dismiss({"saved": False, "cancelled": True, "dirty": dirty})
 
 
+class ContextViewerModal(ModalScreen):  # type: ignore[misc]
+    """Full-screen modal overlay for viewing and managing the rolling-window context.
+
+    Pushed onto the screen stack by MnemaraTUI when the user runs /context or
+    clicks the [💬 Context] button.
+
+    Left panel: scrollable list of turns (most recent first) with row_id, role,
+    timestamp, and summary. Pin marker (📌) shown for pinned rows.
+
+    Right panel: read-only TextArea showing the full content of the selected turn.
+
+    Actions: Evict (removes from window), Pin / Unpin, Close.
+    Filter: live text filter + role filter buttons (All / User / Asst).
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+    ]
+
+    def __init__(self, store: "Store", instance: str) -> None:  # type: ignore[name-defined]
+        super().__init__()
+        self._store = store
+        self._instance = instance
+        self._all_rows: list[dict] = []
+        self._filtered_rows: list[dict] = []
+        self._selected_idx: int = -1
+        self._role_filter: str = ""
+
+    def compose(self) -> "ComposeResult":
+        result = self._store.list_window(limit=200)
+        self._all_rows = result.get("rows", [])
+        self._filtered_rows = list(self._all_rows)
+        total = result.get("total", 0)
+
+        with Vertical(id="ctx-dialog"):
+            yield Static(
+                f"[bold]Context viewer[/bold] — [dim]{self._instance}[/dim] "
+                f"([dim]{total} turns total[/dim])",
+                id="ctx-header",
+            )
+            with Horizontal(id="ctx-filter-row"):
+                yield Input(placeholder="filter turns…", id="ctx-filter-input")
+                yield Button("All", id="btn-ctx-role-all")
+                yield Button("User", id="btn-ctx-role-user")
+                yield Button("Asst", id="btn-ctx-role-asst")
+            with Horizontal(id="ctx-panels"):
+                with Vertical(id="ctx-list-panel"):
+                    yield ListView(id="ctx-list")
+                with Vertical(id="ctx-detail-panel"):
+                    yield TextArea(
+                        "← select a turn to view its full content",
+                        read_only=True,
+                        id="ctx-detail-ta",
+                    )
+            with Horizontal(id="ctx-action-row"):
+                yield Button("Evict", id="btn-ctx-evict")
+                yield Button("📌 Pin", id="btn-ctx-pin")
+                yield Button("Unpin", id="btn-ctx-unpin")
+                yield Button("Close  Esc", id="btn-ctx-close")
+
+    def on_mount(self) -> None:
+        self._rebuild_list()
+        self.query_one("#ctx-list", ListView).focus()
+
+    # ---------------------------------------------------------------- list helpers
+
+    def _row_label(self, row: dict) -> str:
+        pin = "📌 " if row.get("pin_label") else "   "
+        ts = str(row.get("timestamp", ""))[:16].replace("T", " ")
+        role = (row.get("role") or "?")[:4]
+        summary = (row.get("summary") or "")[:38]
+        return f"{pin}{row['row_id']:>5} · {role} · {ts} · {summary}"
+
+    def _rebuild_list(self) -> None:
+        try:
+            lv = self.query_one("#ctx-list", ListView)
+            lv.clear()
+            for row in self._filtered_rows:
+                lv.append(ListItem(Static(self._row_label(row))))
+            self._selected_idx = -1
+            ta = self.query_one("#ctx-detail-ta", TextArea)
+            ta.load_text("← select a turn to view its full content")
+        except Exception:
+            # Modal not yet mounted — skip UI update; data is already in _filtered_rows.
+            pass
+
+    def _apply_filters(self) -> None:
+        try:
+            text_filter = self.query_one("#ctx-filter-input", Input).value.lower()
+        except Exception:
+            text_filter = ""
+        rows = self._all_rows
+        if self._role_filter:
+            rows = [r for r in rows if r.get("role", "") == self._role_filter]
+        if text_filter:
+            rows = [r for r in rows if text_filter in r.get("summary", "").lower()
+                    or text_filter in str(r.get("row_id", ""))]
+        self._filtered_rows = rows
+        self._rebuild_list()
+
+    def _fmt_full_content(self, full: dict) -> str:
+        """Render a full turn dict as readable text for the detail panel."""
+        hdr = (
+            f"Turn {full['id']} · {full.get('role', '?')} · {full.get('ts', '')}"
+        )
+        pin = full.get("pin_label")
+        if pin:
+            hdr += f"  [pinned: {pin}]"
+        sep = "─" * 50
+        content = full.get("content", "")
+        if isinstance(content, str):
+            body = content
+        elif isinstance(content, list):
+            parts = []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                btype = b.get("type", "")
+                if btype == "text":
+                    parts.append(b.get("text", ""))
+                elif btype == "tool_use":
+                    inp = b.get("input", {})
+                    import json as _j
+                    inp_str = _j.dumps(inp, indent=2) if isinstance(inp, dict) else str(inp)
+                    parts.append(f"[tool_use: {b.get('name', '?')}]\n{inp_str}")
+                elif btype == "thinking":
+                    snip = (b.get("thinking") or "")[:300]
+                    parts.append(f"<thinking>\n{snip}{'…' if len(b.get('thinking',''))>300 else ''}\n</thinking>")
+            body = "\n\n".join(p for p in parts if p)
+        else:
+            body = str(content)
+        return f"{hdr}\n{sep}\n{body}"
+
+    # ---------------------------------------------------------------- events
+
+    def on_input_changed(self, event: "Input.Changed") -> None:  # type: ignore[name-defined]
+        if event.input.id == "ctx-filter-input":
+            self._apply_filters()
+
+    def on_list_view_highlighted(self, event: "ListView.Highlighted") -> None:  # type: ignore[name-defined]
+        if event.list_view.id != "ctx-list":
+            return
+        idx = event.list_view.index
+        if idx is None or idx < 0 or idx >= len(self._filtered_rows):
+            return
+        self._selected_idx = idx
+        row = self._filtered_rows[idx]
+        full = self._store.get_turn(row["row_id"])
+        if full:
+            ta = self.query_one("#ctx-detail-ta", TextArea)
+            ta.load_text(self._fmt_full_content(full))
+
+    def on_button_pressed(self, event: "Button.Pressed") -> None:  # type: ignore[name-defined]
+        bid = event.button.id
+        if bid == "btn-ctx-close":
+            self.action_close()
+        elif bid == "btn-ctx-role-all":
+            self._role_filter = ""
+            self._apply_filters()
+        elif bid == "btn-ctx-role-user":
+            self._role_filter = "user"
+            self._apply_filters()
+        elif bid == "btn-ctx-role-asst":
+            self._role_filter = "assistant"
+            self._apply_filters()
+        elif bid == "btn-ctx-evict":
+            self._do_evict()
+        elif bid == "btn-ctx-pin":
+            self._do_pin()
+        elif bid == "btn-ctx-unpin":
+            self._do_unpin()
+
+    # ---------------------------------------------------------------- actions
+
+    def _selected_row_id(self) -> "int | None":
+        if self._selected_idx < 0 or self._selected_idx >= len(self._filtered_rows):
+            return None
+        return self._filtered_rows[self._selected_idx]["row_id"]
+
+    def _do_evict(self) -> None:
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        self._store.evict_ids([row_id])
+        self._all_rows = [r for r in self._all_rows if r["row_id"] != row_id]
+        self._apply_filters()
+
+    def _do_pin(self) -> None:
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        self._store.pin_row(row_id, "pinned")
+        # Refresh pin_label in _all_rows
+        for r in self._all_rows:
+            if r["row_id"] == row_id:
+                r["pin_label"] = "pinned"
+                break
+        self._apply_filters()
+
+    def _do_unpin(self) -> None:
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        self._store.unpin_row(row_id)
+        for r in self._all_rows:
+            if r["row_id"] == row_id:
+                r["pin_label"] = None
+                break
+        self._apply_filters()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -657,6 +991,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             yield Button("Send  ⌃S", id="btn-send")
             yield Button(self._inbox_button_label(), id="btn-inbox")
             yield Button("📄 Role", id="btn-role")
+            yield Button("💬 Context", id="btn-context")
             yield Button("Quit  ⌃C", id="btn-quit")
         yield Footer()
 
@@ -1214,13 +1549,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
         ta.focus()
 
     async def on_button_pressed(self, event: "Button.Pressed") -> None:
-        """Handle Send, Inbox, Role, and Quit button clicks."""
+        """Handle Send, Inbox, Role, Context, and Quit button clicks."""
         if event.button.id == "btn-send":
             await self.action_submit_prompt()
         elif event.button.id == "btn-inbox":
             await self.action_check_inbox()
         elif event.button.id == "btn-role":
             await self.action_open_role_editor()
+        elif event.button.id == "btn-context":
+            await self.action_open_context_viewer()
         elif event.button.id == "btn-quit":
             await self.action_quit()
 
@@ -1290,6 +1627,16 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 chat.write(f"[red]role_doc: save failed: {result['error']}[/red]")
 
         await self.push_screen(RoleDocEditorModal(path, content), _on_dismiss)
+
+    async def action_open_context_viewer(self) -> None:
+        """Open the context viewer modal (💬 Context button / /context).
+
+        Displays the rolling window as a searchable, filterable two-panel view:
+        left = turn list (most recent first), right = full content of selected turn.
+        Actions: Evict (remove from window), Pin, Unpin.
+        Changes (evict/pin) take effect immediately in the store.
+        """
+        await self.push_screen(ContextViewerModal(self.store, self.instance))
 
     async def _handle_user_input(self, text: str) -> None:
         """Process a submitted prompt: slash commands, queuing, or turn dispatch."""
@@ -1460,6 +1807,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd in ("/role_doc", "/role-doc", "/roledoc"):
             await self.action_open_role_editor()
+            return
+
+        if cmd in ("/context", "/ctx"):
+            await self.action_open_context_viewer()
             return
 
         chat.write(
@@ -1654,6 +2005,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /compress reads         — stub repeated Read results with diffs",
             "  /inbox                  — toggle peer message delivery on/off",
             "  /role_doc               — open role doc editor (📄 Role button)",
+            "  /context                — open context viewer: browse, evict, pin turns (💬 Context button)",
             "  /name <label>           — set response label (e.g. /name coordinator)",
             "  /name                   — clear label, revert to \"assistant\"",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",

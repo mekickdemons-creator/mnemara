@@ -1605,28 +1605,53 @@ class Store:
 
         if role:
             rows_cur = self.conn.execute(
-                "SELECT id, ts, role, content FROM turns "
+                "SELECT id, ts, role, content, pin_label FROM turns "
                 "WHERE role=? ORDER BY id DESC LIMIT ? OFFSET ?",
                 (role, limit, offset),
             )
         else:
             rows_cur = self.conn.execute(
-                "SELECT id, ts, role, content FROM turns "
+                "SELECT id, ts, role, content, pin_label FROM turns "
                 "ORDER BY id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             )
 
         rows = []
-        for row_id, ts, row_role, content_str in rows_cur.fetchall():
+        for row_id, ts, row_role, content_str, pin_label in rows_cur.fetchall():
             summary = _window_summary(row_role, content_str)
             rows.append({
                 "row_id": row_id,
                 "timestamp": ts,
                 "role": row_role,
                 "summary": summary,
+                "pin_label": pin_label,
             })
 
         return {"ok": True, "rows": rows, "total": total}
+
+    def get_turn(self, row_id: int) -> dict | None:
+        """Return a single turn row by id, or None if not found.
+
+        Returns the same shape as window() entries plus pin_label.
+        """
+        cur = self.conn.execute(
+            "SELECT id, ts, role, content, tool_uses, tokens_in, tokens_out, pin_label "
+            "FROM turns WHERE id=?",
+            (int(row_id),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "ts": row[1],
+            "role": row[2],
+            "content": _maybe_json(row[3]),
+            "tool_uses": json.loads(row[4]) if row[4] else None,
+            "tokens_in": row[5],
+            "tokens_out": row[6],
+            "pin_label": row[7],
+        }
 
     def total_tokens(self) -> tuple[int, int]:
         """Return (estimated_stored_tokens, sum_output_tokens).

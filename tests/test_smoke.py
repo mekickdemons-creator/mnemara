@@ -1087,6 +1087,134 @@ def test_role_doc_editor_no_path_shows_message(home):
     assert any("no role_doc_path" in w for w in written)
 
 
+def test_context_viewer_lists_turns(home):
+    """ContextViewerModal receives turn rows from list_window on compose."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    config.init_instance("ctx_viewer_t")
+    app = tui_mod.MnemaraTUI("ctx_viewer_t")
+    # Seed two turns so the viewer has something to show.
+    app.store.append_turn("user", "hello context viewer")
+    app.store.append_turn("assistant", "context viewer reply")
+
+    collected: list[dict] = []
+
+    class _SpyModal(tui_mod.ContextViewerModal):
+        def compose(self):
+            result = self._store.list_window(limit=200)
+            collected.extend(result.get("rows", []))
+            return super().compose()
+
+    async def _run():
+        async with app.run_test():
+            modal = _SpyModal(app.store, app.instance)
+            await app.push_screen(modal)
+            await app.pop_screen()
+
+    _asyncio.run(_run())
+    app.store.close()
+    assert len(collected) == 2
+    roles = {r["role"] for r in collected}
+    assert "user" in roles
+    assert "assistant" in roles
+
+
+def test_context_viewer_evict_removes_turn(home):
+    """_do_evict() removes the selected turn from the store via store.evict_ids."""
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    config.init_instance("ctx_evict_t")
+    app = tui_mod.MnemaraTUI("ctx_evict_t")
+    app.store.append_turn("user", "turn to evict")
+    app.store.append_turn("user", "turn to keep")
+
+    # Build the modal manually (no screen push needed for unit test).
+    modal = tui_mod.ContextViewerModal(app.store, app.instance)
+    result = app.store.list_window(limit=200)
+    modal._all_rows = result.get("rows", [])
+    modal._filtered_rows = list(modal._all_rows)
+    # Rows are most-recent-first; index 0 = "turn to keep", index 1 = "turn to evict".
+    # Evict the most-recent (turn to keep) — then only "turn to evict" remains.
+    modal._selected_idx = 0
+    modal._do_evict()
+
+    remaining = app.store.list_window(limit=200)
+    app.store.close()
+    assert remaining["total"] == 1
+    assert remaining["rows"][0]["summary"].startswith("turn to evict")
+
+
+def test_context_viewer_pin_unpin(home):
+    """_do_pin() and _do_unpin() toggle pin_label on a turn."""
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    config.init_instance("ctx_pin_t")
+    app = tui_mod.MnemaraTUI("ctx_pin_t")
+    app.store.append_turn("user", "pin target turn")
+
+    modal = tui_mod.ContextViewerModal(app.store, app.instance)
+    result = app.store.list_window(limit=200)
+    modal._all_rows = result.get("rows", [])
+    modal._filtered_rows = list(modal._all_rows)
+
+    # Pin the turn.
+    modal._selected_idx = 0
+    modal._do_pin()
+    pinned = app.store.list_pinned()
+    assert len(pinned) == 1
+    assert pinned[0]["pin_label"] == "pinned"
+
+    # _do_unpin needs _selected_idx reset (rebuild clears it).
+    modal._selected_idx = 0
+    modal._do_unpin()
+    pinned_after = app.store.list_pinned()
+    assert len(pinned_after) == 0
+
+    app.store.close()
+
+
+def test_store_get_turn_returns_full_content(home):
+    """get_turn(row_id) returns the full row dict including content."""
+    from mnemara import config
+    from mnemara.store import Store
+
+    config.init_instance("get_turn_t")
+    store = Store("get_turn_t")
+    store.append_turn("user", "full content check")
+    rows = store.list_window(limit=10)
+    assert rows["total"] == 1
+    row_id = rows["rows"][0]["row_id"]
+    full = store.get_turn(row_id)
+    assert full is not None
+    assert full["id"] == row_id
+    assert full["role"] == "user"
+    assert "full content check" in str(full["content"])
+    store.close()
+
+
+def test_store_list_window_includes_pin_label(home):
+    """list_window() includes pin_label field; None when not pinned."""
+    from mnemara import config
+    from mnemara.store import Store
+
+    config.init_instance("lw_pin_t")
+    store = Store("lw_pin_t")
+    store.append_turn("user", "unpinned turn")
+    rows = store.list_window(limit=10)
+    assert "pin_label" in rows["rows"][0]
+    assert rows["rows"][0]["pin_label"] is None
+    # Pin it and verify.
+    row_id = rows["rows"][0]["row_id"]
+    store.pin_row(row_id, "test-pin")
+    rows2 = store.list_window(limit=10)
+    assert rows2["rows"][0]["pin_label"] == "test-pin"
+    store.close()
+
+
 @pytest.mark.skip(reason="STABLE-era regression: /copy action removed during STABLE pass")
 def test_tui_action_copy_last_writes_to_clipboard(home, monkeypatch):
     """action_copy_last copies the most recent assistant response via pyperclip."""
