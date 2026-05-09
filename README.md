@@ -141,8 +141,8 @@ useful for scripting or non-TTY contexts.
 
 The input area is multi-line. See [Slash commands](#slash-commands-repl-and-tui)
 below for the full keybinding table and the slash-command surface
-(`/models`, `/swap`, `/tokens`, `/evict`, `/export`, `/import`, `/compress reads`,
-`/skeleton`, `/name`, etc.).
+(`/role_doc`, `/context`, `/clear`, `/evict`, `/inbox`, `/models`, `/swap`,
+`/tokens`, `/export`, `/import`, `/compress reads`, `/skeleton`, `/name`, etc.).
 
 ## Role docs
 
@@ -353,18 +353,37 @@ mnemara migrate --instance <name>         # run schema migration on one instance
 
 ## Slash commands (REPL and TUI)
 
+Commands marked **(TUI)** are TUI-only — they open a modal overlay or toggle a
+TUI-specific feature.
+
 ```
-/role <path>         swap role doc (also persists to config)
-/show                print the rolling window
-/clear               wipe the window (with confirm)
+/role <path>         (REPL) swap role doc (also persists to config)
+/role_doc            (TUI) open the role-doc editor modal — edit live; Ctrl+S
+                     saves; changes take effect on the next turn (the role doc
+                     is re-read on every API call)
+/context             (TUI) open the context viewer — tabbed breakdown of where
+                     input tokens are going (tool schemas, role doc, manifest,
+                     pinned rows, working window) with browse / evict / pin
+                     actions and role filtering
+/show                (REPL) print the rolling window
+/clear               comprehensive wipe — strips tool_use blocks, thinking
+                     blocks, and user/assistant turns; pinned rows preserved;
+                     reports the freed-token count
 /models              list available Ollama model tags
 /swap <model|n>      switch model for this and future sessions
 /tokens <N>          set max_window_tokens live (accepts 500k, 1m, 200000)
-/note <text>         append to today's memory file
-/proposals           list pending role-amendment proposals
+/note <text>         (REPL) append to today's memory file
+/proposals           (REPL) list pending role-amendment proposals
+/evict               show eviction stats
+/evict tools         strip tool_use blocks from all stored rows
+/evict thinking      strip thinking blocks from all stored rows
+/evict user          drop all user-turn rows (keep assistant responses)
+/evict assistant     drop all assistant-turn rows (keep user inputs)
 /evict <N>           drop the N oldest rows from the rolling window
+/evict last <N>      drop the N most-recent rows (rollback a bad paste/turn)
+/inbox               (TUI) toggle peer-message delivery on/off
 /stop                cancel the in-flight turn
-/export <path>       round-trip the session (turns + config + role_doc) to markdown
+/export [N] [path]   round-trip the session (turns + config + role_doc) to markdown
 /import <path>       restore a session from a /export markdown file
 /compress reads      manually run compress_repeated_reads on the window
 /skeleton <path>     manually extract Python signatures from a file (debug)
@@ -372,6 +391,18 @@ mnemara migrate --instance <name>         # run schema migration on one instance
 /quit, /exit         save state and exit
 /help                show this list
 ```
+
+### Toolbar buttons
+
+The TUI chat panel exposes a row of buttons below the chat log:
+
+| Button | Action |
+|---|---|
+| `Send  ⌃S` | Send the current input (same as Ctrl+S). |
+| `⚡ Inbox: ON / OFF` | Toggle peer-message delivery live. Only active when peer-poll is configured (see [Peer messaging](#peer-messaging)). |
+| `📄 Role` | Open the role-doc editor modal (same as `/role_doc`). |
+| `💬 Context` | Open the context viewer (same as `/context`). |
+| `Quit  ⌃C` | Save state and exit (same as Ctrl+C). |
 
 ### TUI keybindings
 
