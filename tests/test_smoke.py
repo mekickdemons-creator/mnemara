@@ -2115,8 +2115,8 @@ def test_slash_evict_user_removes_user_turns(home):
     _asyncio.run(_run())
 
 
-def test_slash_clear_wipes_tools_thinking_and_user_turns(home):
-    """/clear strips tool_use blocks, thinking blocks, and user turns from storage."""
+def test_slash_clear_wipes_all_turns_tools_and_thinking(home):
+    """/clear deletes ALL turns (user + assistant) and strips tool/thinking blocks."""
     import asyncio as _asyncio
     import mnemara.config as config_mod
     import mnemara.tui as tui_mod
@@ -2149,15 +2149,11 @@ def test_slash_clear_wipes_tools_thinking_and_user_turns(home):
             await app.run_action("submit_prompt")
             await pilot.pause(0.1)
 
+            # ALL turns deleted — store is empty (except pinned, none here)
             rows = app.store.window()
-            # user turn deleted; two assistant rows remain, both stripped
-            assert all(r["role"] == "assistant" for r in rows), (
-                "user turns should be gone after /clear"
+            assert len(rows) == 0, (
+                f"/clear should leave an empty store, got {len(rows)} rows remaining"
             )
-            for row in rows:
-                block_types = {b.get("type") for b in row["content"]}
-                assert "tool_use" not in block_types, "tool_use blocks should be stripped"
-                assert "thinking" not in block_types, "thinking blocks should be stripped"
 
     _asyncio.run(_run())
 

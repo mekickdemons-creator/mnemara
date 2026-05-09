@@ -1904,27 +1904,32 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write("[dim]nothing in flight[/dim]")
 
     def _slash_clear(self, chat: "RichLog") -> None:
-        """/clear — comprehensive wipe: strips tool_use blocks, thinking blocks,
-        and all user-turn rows from storage, then clears the chat display.
+        """/clear — fresh-start wipe: strips tool_use blocks, thinking blocks,
+        and deletes ALL turn rows (user + assistant) from storage, then clears
+        the chat display.
 
-        Pinned rows are always preserved. This is the one-command cleanup for
-        reclaiming context budget before a long coding session.
+        After /clear only pinned rows and the role doc remain. Status bar and
+        token count update immediately to reflect the emptied store.
+        Pinned rows are always preserved.
         """
         try:
             before, _ = self.store.total_tokens()
-            tools_freed = self.store.evict_tool_use_blocks(all_rows=True, skip_pinned=True)
-            think_freed = self.store.evict_thinking_blocks(all_rows=True, skip_pinned=True)
+            tools_result = self.store.evict_tool_use_blocks(all_rows=True, skip_pinned=True)
+            think_result = self.store.evict_thinking_blocks(all_rows=True, skip_pinned=True)
             user_rows = self.store.evict_by_role("user", skip_pinned=True)
+            asst_rows = self.store.evict_by_role("assistant", skip_pinned=True)
             after, _ = self.store.total_tokens()
+            tools_freed = tools_result.get("blocks_evicted", 0)
+            think_freed = think_result.get("blocks_evicted", 0)
             freed = max(0, before - after)
         except Exception:
-            tools_freed = think_freed = user_rows = freed = 0
+            tools_freed = think_freed = user_rows = asst_rows = freed = 0
 
         chat.clear()
         chat.write(
             f"[dim]clear: stripped {tools_freed} tool block(s), "
             f"{think_freed} thinking block(s), "
-            f"{user_rows} user turn(s) — "
+            f"{user_rows} user turn(s), {asst_rows} assistant turn(s) — "
             f"~{freed:,} tokens freed[/dim]"
         )
         self._refresh_status()
