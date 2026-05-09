@@ -2115,6 +2115,53 @@ def test_slash_evict_user_removes_user_turns(home):
     _asyncio.run(_run())
 
 
+def test_slash_clear_wipes_tools_thinking_and_user_turns(home):
+    """/clear strips tool_use blocks, thinking blocks, and user turns from storage."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("clear_wipe_t")
+    app = tui_mod.MnemaraTUI("clear_wipe_t")
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            # Insert mixed turns: user, assistant with tool_use, assistant with thinking.
+            app.store.append_turn("user", [{"type": "text", "text": "my question"}])
+            app.store.append_turn(
+                "assistant",
+                [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/f"}},
+                    {"type": "text", "text": "used a tool"},
+                ],
+            )
+            app.store.append_turn(
+                "assistant",
+                [
+                    {"type": "thinking", "thinking": "deep thoughts"},
+                    {"type": "text", "text": "final answer"},
+                ],
+            )
+            assert len(app.store.window()) == 3
+
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/clear")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+            rows = app.store.window()
+            # user turn deleted; two assistant rows remain, both stripped
+            assert all(r["role"] == "assistant" for r in rows), (
+                "user turns should be gone after /clear"
+            )
+            for row in rows:
+                block_types = {b.get("type") for b in row["content"]}
+                assert "tool_use" not in block_types, "tool_use blocks should be stripped"
+                assert "thinking" not in block_types, "thinking blocks should be stripped"
+
+    _asyncio.run(_run())
+
+
 def test_store_evict_ids_targets_specific_rows(home):
     """Store.evict_ids deletes only the requested ids; unknown ids ignored."""
     from mnemara.store import Store

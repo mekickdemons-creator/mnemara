@@ -1904,9 +1904,29 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write("[dim]nothing in flight[/dim]")
 
     def _slash_clear(self, chat: "RichLog") -> None:
-        """/clear — erase all visible chat history (does not touch stored rows)."""
+        """/clear — comprehensive wipe: strips tool_use blocks, thinking blocks,
+        and all user-turn rows from storage, then clears the chat display.
+
+        Pinned rows are always preserved. This is the one-command cleanup for
+        reclaiming context budget before a long coding session.
+        """
+        try:
+            before = self.store.total_tokens()
+            tools_freed = self.store.evict_tool_use_blocks(all_rows=True, skip_pinned=True)
+            think_freed = self.store.evict_thinking_blocks(all_rows=True, skip_pinned=True)
+            user_rows = self.store.evict_by_role("user", skip_pinned=True)
+            after = self.store.total_tokens()
+            freed = max(0, before - after)
+        except Exception:
+            tools_freed = think_freed = user_rows = freed = 0
+
         chat.clear()
-        chat.write("[dim]chat display cleared (conversation history is preserved in storage)[/dim]")
+        chat.write(
+            f"[dim]clear: stripped {tools_freed} tool block(s), "
+            f"{think_freed} thinking block(s), "
+            f"{user_rows} user turn(s) — "
+            f"~{freed:,} tokens freed[/dim]"
+        )
         self._refresh_status()
 
     def _slash_evict(self, arg: str, chat: "RichLog") -> None:
@@ -1999,7 +2019,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         lines = [
             "[bold]slash commands[/bold]",
             "  /help, /?               — show this list",
-            "  /clear                  — clear display (keeps history)",
+            "  /clear                  — strip tools, thinking, user turns + clear display",
             "  /models                 — list available models",
             "  /swap MODEL             — switch to MODEL (in-session only)",
             "  /tokens N [--temp]      — set max context window",
