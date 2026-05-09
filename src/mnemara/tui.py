@@ -2036,6 +2036,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
+            "  /skeleton <path>        — show Python skeleton (signatures/docstrings only)",
             "  /inbox                  — toggle peer message delivery on/off",
             "  /role_doc               — open role doc editor (📄 Role button)",
             "  /context                — open context viewer: browse, evict, pin turns (💬 Context button)",
