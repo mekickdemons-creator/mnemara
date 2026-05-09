@@ -1911,11 +1911,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
         reclaiming context budget before a long coding session.
         """
         try:
-            before = self.store.total_tokens()
+            before, _ = self.store.total_tokens()
             tools_freed = self.store.evict_tool_use_blocks(all_rows=True, skip_pinned=True)
             think_freed = self.store.evict_thinking_blocks(all_rows=True, skip_pinned=True)
             user_rows = self.store.evict_by_role("user", skip_pinned=True)
-            after = self.store.total_tokens()
+            after, _ = self.store.total_tokens()
             freed = max(0, before - after)
         except Exception:
             tools_freed = think_freed = user_rows = freed = 0
