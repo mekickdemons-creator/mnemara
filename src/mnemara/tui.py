@@ -25,8 +25,9 @@ try:
     from textual import events as _txt_events
     from textual.app import App, ComposeResult
     from textual.binding import Binding
+    from textual.screen import ModalScreen
     from textual.widgets import Button, Footer, Header, Input, RichLog, Static, TextArea
-    from textual.containers import Horizontal
+    from textual.containers import Horizontal, Vertical
     _TEXTUAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _TEXTUAL_AVAILABLE = False
@@ -205,6 +206,87 @@ Screen {
 .inbox-off:hover {
     background: #444444;
     color: #aaaaaa;
+}
+
+/* ---- Role-doc editor modal ---- */
+RoleDocEditorModal {
+    align: center middle;
+}
+
+#role-editor-dialog {
+    width: 90%;
+    height: 90%;
+    border: round #6f9ad9;
+    background: #1d2330;
+    padding: 1 2;
+}
+
+#role-editor-title {
+    height: 1;
+    color: #8fb6e6;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#role-editor-ta {
+    height: 1fr;
+    border: round #4d6fa3;
+    background: #11151e;
+    color: #ffffff;
+    padding: 0 1;
+}
+
+#role-editor-ta:focus {
+    border: round #6f9ad9;
+}
+
+#role-editor-btn-row {
+    height: 3;
+    background: #1d2330;
+    align: right middle;
+    margin-top: 1;
+}
+
+#btn-role-save {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 14;
+}
+
+#btn-role-save:hover {
+    background: #2a4f7a;
+    color: #8fb6e6;
+}
+
+#btn-role-cancel {
+    background: #2a1f1f;
+    color: #8a6a6a;
+    border: tall #5a3a3a;
+    min-width: 14;
+    margin-left: 1;
+}
+
+#btn-role-cancel:hover {
+    background: #3a2a2a;
+    color: #c08080;
+}
+
+#btn-role {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 12;
+    margin-left: 1;
+}
+
+#btn-role:hover {
+    background: #2a4f7a;
+    color: #8fb6e6;
+}
+
+#btn-role:focus {
+    border: tall #6f9ad9;
 }
 """
 
@@ -409,6 +491,81 @@ class _UserTextArea(TextArea):
 
 
 # ---------------------------------------------------------------------------
+# Role-doc editor modal
+# ---------------------------------------------------------------------------
+
+
+class RoleDocEditorModal(ModalScreen):  # type: ignore[misc]
+    """Full-screen modal overlay for editing the instance role doc.
+
+    Pushed onto the screen stack by MnemaraTUI when the user runs
+    /role_doc or clicks the [📄 Role] button.  The TextArea is pre-populated
+    with the current on-disk role doc content.  Ctrl+S / Save writes it back
+    and dismisses; Escape / Cancel dismisses without writing.
+
+    The role doc is re-read from disk at every API call, so changes take
+    effect immediately on the next turn — no restart required.
+    """
+
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Save", show=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, role_doc_path: str, initial_content: str) -> None:
+        super().__init__()
+        self._role_doc_path = role_doc_path
+        self._initial_content = initial_content
+
+    def compose(self) -> "ComposeResult":
+        short_path = self._role_doc_path or "(no role doc configured)"
+        with Vertical(id="role-editor-dialog"):
+            yield Static(
+                f"[bold]Role doc editor[/bold] — [dim]{short_path}[/dim]",
+                id="role-editor-title",
+            )
+            yield TextArea(
+                self._initial_content,
+                language=None,
+                show_line_numbers=True,
+                tab_behavior="indent",
+                soft_wrap=True,
+                id="role-editor-ta",
+            )
+            with Horizontal(id="role-editor-btn-row"):
+                yield Button("Save  ⌃S", id="btn-role-save")
+                yield Button("Cancel  Esc", id="btn-role-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#role-editor-ta", TextArea).focus()
+
+    def on_button_pressed(self, event: "Button.Pressed") -> None:
+        if event.button.id == "btn-role-save":
+            self.action_save()
+        elif event.button.id == "btn-role-cancel":
+            self.action_cancel()
+
+    def action_save(self) -> None:
+        """Write edited content to disk and dismiss."""
+        ta = self.query_one("#role-editor-ta", TextArea)
+        new_text = ta.text
+        if not self._role_doc_path:
+            self.dismiss({"saved": False, "error": "no role_doc_path configured"})
+            return
+        try:
+            Path(self._role_doc_path).write_text(new_text, encoding="utf-8")
+            self.dismiss({"saved": True, "path": self._role_doc_path, "dirty": new_text != self._initial_content})
+        except Exception as exc:
+            self.dismiss({"saved": False, "error": str(exc)})
+
+    def action_cancel(self) -> None:
+        """Dismiss without saving."""
+        ta = self.query_one("#role-editor-ta", TextArea)
+        dirty = ta.text != self._initial_content
+        self.dismiss({"saved": False, "cancelled": True, "dirty": dirty})
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -499,6 +656,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         with Horizontal(id="btn-row"):
             yield Button("Send  ⌃S", id="btn-send")
             yield Button(self._inbox_button_label(), id="btn-inbox")
+            yield Button("📄 Role", id="btn-role")
             yield Button("Quit  ⌃C", id="btn-quit")
         yield Footer()
 
@@ -1056,11 +1214,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
         ta.focus()
 
     async def on_button_pressed(self, event: "Button.Pressed") -> None:
-        """Handle Send, Inbox, and Quit button clicks."""
+        """Handle Send, Inbox, Role, and Quit button clicks."""
         if event.button.id == "btn-send":
             await self.action_submit_prompt()
         elif event.button.id == "btn-inbox":
             await self.action_check_inbox()
+        elif event.button.id == "btn-role":
+            await self.action_open_role_editor()
         elif event.button.id == "btn-quit":
             await self.action_quit()
 
@@ -1092,6 +1252,44 @@ class MnemaraTUI(App):  # type: ignore[misc]
         # When turned ON, immediately drain any messages that accumulated while OFF.
         if new_state and self._peer_pending_rows and not self._busy:
             await self._process_peer_messages()
+
+    async def action_open_role_editor(self) -> None:
+        """Open the role-doc editor modal (📄 Role button / /role_doc).
+
+        Reads the current role doc from disk, presents it in a full-screen
+        TextArea overlay.  On Save (Ctrl+S), writes the edited content back
+        to disk.  Changes take effect on the next turn — no restart needed
+        because the role doc is re-read from disk at every API call.
+        """
+        chat = self._chat()
+        path = self.cfg.role_doc_path
+        if not path:
+            chat.write(
+                "[dim]role_doc: no role_doc_path configured — "
+                "set it in config.json and restart[/dim]"
+            )
+            return
+        try:
+            content = Path(path).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            content = ""
+        except Exception as exc:
+            chat.write(f"[red]role_doc: could not read {path}: {exc}[/red]")
+            return
+
+        def _on_dismiss(result: dict) -> None:
+            if result.get("saved"):
+                chat.write(
+                    f"[green]role_doc: saved[/green] [dim]{path}[/dim] "
+                    f"— changes take effect on next turn"
+                )
+                log("role_doc_saved", path=path, instance=self.instance)
+            elif result.get("cancelled") and result.get("dirty"):
+                chat.write("[dim]role_doc: cancelled (unsaved changes discarded)[/dim]")
+            elif result.get("error"):
+                chat.write(f"[red]role_doc: save failed: {result['error']}[/red]")
+
+        await self.push_screen(RoleDocEditorModal(path, content), _on_dismiss)
 
     async def _handle_user_input(self, text: str) -> None:
         """Process a submitted prompt: slash commands, queuing, or turn dispatch."""
@@ -1258,6 +1456,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         if cmd == "/inbox":
             await self.action_check_inbox()
+            return
+
+        if cmd in ("/role_doc", "/role-doc", "/roledoc"):
+            await self.action_open_role_editor()
             return
 
         chat.write(
@@ -1451,6 +1653,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
             "  /inbox                  — toggle peer message delivery on/off",
+            "  /role_doc               — open role doc editor (📄 Role button)",
             "  /name <label>           — set response label (e.g. /name coordinator)",
             "  /name                   — clear label, revert to \"assistant\"",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",

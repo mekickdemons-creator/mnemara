@@ -997,6 +997,96 @@ def test_tui_pilot_action_paste(home, monkeypatch):
     app.store.close()
 
 
+# ---------------------------------------------------------------------------
+# Role-doc editor modal tests
+# ---------------------------------------------------------------------------
+
+def test_role_doc_editor_modal_save_writes_file(tmp_path, home):
+    """RoleDocEditorModal saves edited content to disk on action_save."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    role_file = tmp_path / "test_role.md"
+    role_file.write_text("# Original content\n")
+
+    config.init_instance("role_modal_save_t")
+    app = tui_mod.MnemaraTUI("role_modal_save_t")
+
+    async def _run():
+        async with app.run_test() as pilot:
+            modal = tui_mod.RoleDocEditorModal(str(role_file), "# Original content\n")
+            # Pre-populate with modified content.
+            result_holder: list[dict] = []
+            await app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            # Replace text in the TextArea.
+            ta = modal.query_one("#role-editor-ta")
+            ta.load_text("# Edited content\n")
+            await pilot.pause()
+            # Trigger save.
+            modal.action_save()
+            await pilot.pause()
+
+        assert role_file.read_text() == "# Edited content\n"
+        assert result_holder[0]["saved"] is True
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_role_doc_editor_modal_cancel_does_not_write(tmp_path, home):
+    """RoleDocEditorModal cancel dismisses without touching disk."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    role_file = tmp_path / "test_role.md"
+    original = "# Do not overwrite\n"
+    role_file.write_text(original)
+
+    config.init_instance("role_modal_cancel_t")
+    app = tui_mod.MnemaraTUI("role_modal_cancel_t")
+
+    async def _run():
+        async with app.run_test() as pilot:
+            modal = tui_mod.RoleDocEditorModal(str(role_file), original)
+            result_holder: list[dict] = []
+            await app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            modal.action_cancel()
+            await pilot.pause()
+
+        assert role_file.read_text() == original
+        assert result_holder[0]["saved"] is False
+        assert result_holder[0].get("cancelled") is True
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_role_doc_editor_no_path_shows_message(home):
+    """/role_doc with no role_doc_path configured shows a helpful message."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    config.init_instance("role_modal_nopath_t")
+    app = tui_mod.MnemaraTUI("role_modal_nopath_t")
+    # Ensure no role_doc_path.
+    app.cfg.role_doc_path = ""
+    written: list[str] = []
+    app._chat = lambda: type("FakeLog", (), {"write": lambda self, s: written.append(s)})()  # type: ignore[assignment]
+
+    async def _run():
+        async with app.run_test():
+            await app.action_open_role_editor()
+
+    _asyncio.run(_run())
+    app.store.close()
+    assert any("no role_doc_path" in w for w in written)
+
+
 @pytest.mark.skip(reason="STABLE-era regression: /copy action removed during STABLE pass")
 def test_tui_action_copy_last_writes_to_clipboard(home, monkeypatch):
     """action_copy_last copies the most recent assistant response via pyperclip."""
