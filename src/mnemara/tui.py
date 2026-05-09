@@ -818,8 +818,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                     try:
                         ack_conn = _sqlite3.connect(self._architect_db_path())
                         ack_conn.execute(
-                            "UPDATE returns SET status='done' WHERE id=?",
-                            (r["row_id"],)
+                            "UPDATE returns SET status='done', completed_at=? WHERE id=?",
+                            (datetime.now(timezone.utc).isoformat(), r["row_id"])
                         )
                         ack_conn.commit()
                         ack_conn.close()
