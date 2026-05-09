@@ -660,18 +660,21 @@ class MnemaraTUI(App):  # type: ignore[misc]
     def _watermark_path(self) -> Path:
         return Path.home() / ".mnemara" / self.instance / "peer_poll_watermark"
 
-    def _architect_db_path(self) -> str:
-        """Return the resolved path to muninn.db (config override or default)."""
-        return self.cfg.architect_db_path or str(
-            Path.home() / "workspace" / "architect" / "muninn.db"
-        )
+    def _peer_db_path(self) -> str:
+        """Return the configured path to the peer message database.
+
+        Returns an empty string when not configured.  Callers that require
+        the database (polling, watermark init) must check for empty and skip
+        gracefully rather than trying to open a default path.
+        """
+        return self.cfg.peer_db_path
 
     def _load_peer_poll_watermark(self) -> None:
         """Load the persisted high-watermark from disk.
 
         If no watermark file exists (first run with peer poll enabled), initialize
-        to the current max row_id in muninn.db so that all pre-existing rows in the
-        returns table are silently skipped — only messages submitted AFTER this
+        to the current max row_id in the peer message database so that all
+        pre-existing rows are silently skipped — only messages submitted AFTER this
         startup will be delivered.  This prevents the 'stale message flood' on first
         enable.
         """
@@ -686,7 +689,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 pass  # corrupted — re-initialize below
 
         # No watermark file: bootstrap to current max row_id so backlog is skipped.
-        db_path = self._architect_db_path()
+        db_path = self._peer_db_path()
+        if not db_path:
+            self._peer_poll_watermark = 0
+            return
         try:
             conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             try:
@@ -709,7 +715,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             pass  # never crash over watermark persistence
 
     async def _poll_peer_messages(self) -> None:
-        """Background timer: DETECT new peer messages in muninn.db (zero LLM cost).
+        """Background timer: detect new peer messages in the peer database (zero LLM cost).
 
         Fires every peer_poll_interval_seconds (default 30 s).  This method
         only reads SQLite and updates _peer_pending_rows — it never starts an
@@ -723,6 +729,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
         SQLite read, no badge update, no LLM turn.  The ⚡ N badge in the
         status bar is NOT suppressed: messages that were already pending before
         the toggle stay visible so the user can see they are accumulating.
+
+        When peer_db_path is empty the method returns immediately with a
+        warning log entry — callers should not enable polling without configuring
+        the database path.
         """
         # Guard: skip all detection work when polling is toggled OFF.
         if not self.cfg.peer_poll_enabled:
@@ -730,7 +740,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         import sqlite3 as _sqlite3
 
-        db_path = self._architect_db_path()
+        db_path = self._peer_db_path()
+        if not db_path:
+            log("peer_poll_skip_no_db_path")
+            return
+
         peer_roles = [
             r.strip()
             for r in self.cfg.peer_poll_roles.split(",")
@@ -753,11 +767,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
             #
             # Two delivery paths (OR-joined):
             #   1. Sender is in peer_poll_roles AND row is addressed to us or broadcast.
-            #      This is the normal panel-to-panel path (Theseus, Majordomo, etc.).
+            #      This is the normal peer-to-peer path (known senders).
             #   2. Row is explicitly addressed to this panel (recipient_role = self.instance)
             #      regardless of who sent it.
-            #      This is the "new sender" path — Herald, ephemeral agents, or any future
-            #      role not yet in peer_poll_roles can reach a panel without a config update.
+            #      This is the "new sender" path — any sender not yet in peer_poll_roles
+            #      can reach a panel without a config update by using explicit addressing.
             #      recipient_role-targeted delivery is always intentional, so sender-list
             #      gating would only create false negatives.
             cur = conn.execute(
@@ -812,11 +826,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
             for r in new_rows:
                 msg_type = r["payload"].get("type", "")
                 if msg_type in silent_types:
-                    # Auto-ack silently: use the architect MCP tool via the agent
-                    # is not available here (we're in a sync SQLite poll), so
-                    # we mark the row done directly in muninn.db.
+                    # Auto-ack silently: the MCP ack tool is not available in a
+                    # sync SQLite poll context, so we mark the row done directly
+                    # in the peer database.
                     try:
-                        ack_conn = _sqlite3.connect(self._architect_db_path())
+                        ack_conn = _sqlite3.connect(self._peer_db_path())
                         ack_conn.execute(
                             "UPDATE returns SET status='done', completed_at=? WHERE id=?",
                             (datetime.now(timezone.utc).isoformat(), r["row_id"])
@@ -876,14 +890,33 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 f"(row_id={row_id}, topic={topic}) ---\n{payload_pretty}"
             )
 
-        ack_lines = "\n".join(
-            f"  mcp__architect__ack_return(row_id={r['row_id']})" for r in rows
-        )
+        ack_tool = self.cfg.peer_poll_ack_tool
+        submit_tool = self.cfg.peer_poll_submit_tool
+        if ack_tool:
+            ack_lines = "\n".join(
+                f"  {ack_tool}(row_id={r['row_id']})" for r in rows
+            )
+            ack_instruction = f"1. Ack each row:\n{ack_lines}"
+        else:
+            row_ids = ", ".join(str(r["row_id"]) for r in rows)
+            ack_instruction = (
+                f"1. Ack each row (row_id in [{row_ids}]) via whatever ack tool "
+                f"your peer-message system provides."
+            )
+        if submit_tool:
+            reply_instruction = (
+                f"2. Submit your responses via {submit_tool}("
+                f'role="{self.instance}", task_id=<topic>, payload={{...}})'
+            )
+        else:
+            reply_instruction = (
+                f"2. Submit your responses via whatever reply tool your peer-message "
+                f'system provides, identifying yourself as "{self.instance}".'
+            )
         footer = (
             f"\nFor each message, per your role doc protocol:\n"
-            f"1. Ack each row:\n{ack_lines}\n"
-            f"2. Submit your responses via mcp__architect__submit_return("
-            f'role="{self.instance}", task_id=<topic>, payload={{...}})'
+            f"{ack_instruction}\n"
+            f"{reply_instruction}"
         )
 
         message = header + "\n\n".join(parts) + footer
@@ -1418,7 +1451,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
             "  /inbox                  — toggle peer message delivery on/off",
-            "  /name <label>           — set response label (e.g. /name Majordomo)",
+            "  /name <label>           — set response label (e.g. /name coordinator)",
             "  /name                   — clear label, revert to \"assistant\"",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",
             "  /import <path>          — restore turns from a full export file",

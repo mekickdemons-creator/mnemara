@@ -77,7 +77,7 @@ def _make_tui(tmp_path: Path, db_path: str, peer_roles: str = "theseus",
     cfg = config_mod.Config.from_dict({
         "peer_poll_enabled": True,
         "peer_poll_interval_seconds": interval,
-        "architect_db_path": db_path,
+        "peer_db_path": db_path,
         "peer_poll_roles": peer_roles,
         "model": "claude-sonnet-4-6",
     })
@@ -89,7 +89,7 @@ def _make_tui(tmp_path: Path, db_path: str, peer_roles: str = "theseus",
     tui._peer_poll_watermark = 0
     tui._peer_pending_rows = []
     tui._save_peer_poll_watermark = MagicMock()
-    tui._architect_db_path = MagicMock(return_value=db_path)
+    tui._peer_db_path = MagicMock(return_value=db_path)
     tui._chat.return_value = MagicMock()
     tui._handle_user_input = AsyncMock()
     tui._refresh_status = MagicMock()
@@ -106,8 +106,8 @@ def test_peer_poll_config_defaults() -> None:
     cfg = config_mod.Config.from_dict({})
     assert cfg.peer_poll_enabled is False
     assert cfg.peer_poll_interval_seconds == 30   # changed from 90
-    assert cfg.architect_db_path == ""
-    assert cfg.peer_poll_roles == "theseus,herald"
+    assert cfg.peer_db_path == ""
+    assert cfg.peer_poll_roles == ""
 
 
 def test_peer_poll_config_roundtrip() -> None:
@@ -116,15 +116,15 @@ def test_peer_poll_config_roundtrip() -> None:
     original = config_mod.Config.from_dict({
         "peer_poll_enabled": True,
         "peer_poll_interval_seconds": 60,
-        "architect_db_path": "/tmp/muninn.db",
-        "peer_poll_roles": "theseus,majordomo",
+        "peer_db_path": "/tmp/peer.db",
+        "peer_poll_roles": "panel-a,panel-b",
     })
     raw = original.to_dict()
     restored = config_mod.Config.from_dict(raw)
     assert restored.peer_poll_enabled is True
     assert restored.peer_poll_interval_seconds == 60
-    assert restored.architect_db_path == "/tmp/muninn.db"
-    assert restored.peer_poll_roles == "theseus,majordomo"
+    assert restored.peer_db_path == "/tmp/peer.db"
+    assert restored.peer_poll_roles == "panel-a,panel-b"
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +378,9 @@ async def test_process_batches_n_rows_into_one_turn(tmp_path: Path) -> None:
     assert "theseus" in msg
     assert "majordomo" in msg
     assert "cognition-researcher" in msg
-    # Must tell agent to ack and reply.
-    assert "mcp__architect__ack_return" in msg
-    assert "mcp__architect__submit_return" in msg
+    # Must tell agent to ack and reply (generic prose since no tool configured).
+    assert "Ack each row" in msg or "ack tool" in msg
+    assert "reply tool" in msg or "Submit your responses" in msg
     # Header shows total count.
     assert "3 pending" in msg
 
@@ -426,7 +426,7 @@ async def test_process_turn_by_turn_consumes_one_row(tmp_path: Path) -> None:
     tui.cfg = config_mod.Config.from_dict({
         "peer_poll_batch": False,
         "peer_poll_enabled": True,
-        "architect_db_path": "/unused.db",
+        "peer_db_path": "/unused.db",
         "model": "claude-sonnet-4-6",
     })
     tui._peer_pending_rows = [
@@ -462,7 +462,7 @@ async def test_process_turn_by_turn_drains_sequentially(tmp_path: Path) -> None:
     tui.cfg = config_mod.Config.from_dict({
         "peer_poll_batch": False,
         "peer_poll_enabled": True,
-        "architect_db_path": "/unused.db",
+        "peer_db_path": "/unused.db",
         "model": "claude-sonnet-4-6",
     })
     tui._peer_pending_rows = [
@@ -535,7 +535,7 @@ def _make_toggle_tui(tmp_path: Path, *, peer_poll_enabled: bool = True) -> Magic
     cfg = config_mod.Config.from_dict({
         "peer_poll_enabled": peer_poll_enabled,
         "peer_poll_interval_seconds": 30,
-        "architect_db_path": "/unused.db",
+        "peer_db_path": "/unused.db",
         "peer_poll_roles": "theseus",
         "model": "claude-sonnet-4-6",
     })
@@ -907,3 +907,103 @@ async def test_poll_does_not_deliver_unknown_sender_broadcast(tmp_path: Path) ->
 
     # Broadcast from unknown sender is invisible
     assert len(tui._peer_pending_rows) == 0
+
+
+# ---------------------------------------------------------------------------
+# v0.13.0 generalization tests (public-safe defaults, synthetic peer DB)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_peer_poll_disabled_by_default_no_sqlite_activity(tmp_path: Path) -> None:
+    """Feature stays inert with default config — no SQLite reads, no errors.
+
+    Regression: the feature must not attempt to open any database path when
+    peer_poll_enabled=False (the default).  In particular it must not try to
+    open a hard-coded internal path.
+    """
+    from mnemara import config as config_mod
+
+    cfg = config_mod.Config.from_dict({})
+    assert cfg.peer_poll_enabled is False
+    assert cfg.peer_db_path == ""
+    assert cfg.peer_poll_roles == ""
+
+    tui = MagicMock()
+    tui.cfg = cfg
+    tui.instance = "test-panel"
+    tui._busy = False
+    tui._peer_poll_watermark = 0
+    tui._peer_pending_rows = []
+    tui._peer_db_path = MagicMock(return_value="")
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # _peer_db_path must never have been called (early exit at peer_poll_enabled=False).
+    tui._peer_db_path.assert_not_called()
+    # No rows detected.
+    assert tui._peer_pending_rows == []
+
+
+@pytest.mark.asyncio
+async def test_peer_poll_works_against_synthetic_peer_db(tmp_path: Path) -> None:
+    """Feature delivers messages from a schema-compatible sqlite file in tmp_path.
+
+    This exercises the full detection path against a synthetic peer database
+    with no reference to any project-internal paths or names.  Any sqlite file
+    with the documented schema should work.
+    """
+    import sqlite3 as _sqlite3
+
+    # Build a schema-compatible synthetic peer database.
+    peer_db = tmp_path / "peer_messages.db"
+    conn = _sqlite3.connect(str(peer_db))
+    conn.execute("""
+        CREATE TABLE returns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_role TEXT,
+            recipient_role TEXT,
+            task_id TEXT,
+            payload_json TEXT,
+            status TEXT DEFAULT 'pending',
+            submitted_at TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO returns (agent_role, task_id, payload_json, status, submitted_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("panel-a", "task-1", '{"type": "greeting", "msg": "hello"}', "pending",
+         "2026-05-08T00:00:00")
+    )
+    conn.commit()
+    conn.close()
+
+    from mnemara import config as config_mod
+    cfg = config_mod.Config.from_dict({
+        "peer_poll_enabled": True,
+        "peer_db_path": str(peer_db),
+        "peer_poll_roles": "panel-a",
+    })
+
+    tui = MagicMock()
+    tui.cfg = cfg
+    tui.instance = "panel-b"
+    tui._busy = False
+    tui._peer_poll_watermark = 0
+    tui._peer_pending_rows = []
+    tui._save_peer_poll_watermark = MagicMock()
+    tui._peer_db_path = MagicMock(return_value=str(peer_db))
+    tui._chat.return_value = MagicMock()
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # One row should be detected and queued.
+    assert len(tui._peer_pending_rows) == 1
+    row = tui._peer_pending_rows[0]
+    assert row["sender_role"] == "panel-a"
+    assert row["task_id"] == "task-1"
+    assert row["payload"]["type"] == "greeting"
+    # Watermark was saved.
+    tui._save_peer_poll_watermark.assert_called_once()
