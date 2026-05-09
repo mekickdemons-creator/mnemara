@@ -197,7 +197,7 @@ class Config:
     read_skeleton_enabled: bool = False
     file_stat_manifest_enabled: bool = False
     # display — cosmetic label shown in the TUI chat log instead of "assistant"
-    # Set to e.g. "Substrate-engineer" or "Majordomo" to make panel identity
+    # Set to e.g. "agent-A" or "coordinator" to make panel identity
     # visible at a glance. Empty string = keep default "assistant".
     display_name: str = ""
     # v0.3 — graph backend + sleep/replay
@@ -214,18 +214,42 @@ class Config:
     # category).  Default False → backward-compatible: existing behaviour.
     replay_cluster_within_category: bool = False
     # v0.11.0 — autonomous peer-to-peer message polling.
-    # When enabled, the TUI polls muninn.db on a background timer for messages
-    # from peer panels and injects them as agent turns so the panel can ack +
-    # reply without producer relay.
-    # architect_db_path: empty = auto-detect ~/workspace/architect/muninn.db
-    # peer_poll_roles:   comma-separated sender roles to watch, e.g.
-    #                    "theseus,majordomo,cognition-researcher"
-    # peer_poll_interval_seconds: how often to poll (default 90 — within the
-    #   5-min prompt-cache TTL window to keep cache warm between turns).
+    # When enabled, the TUI polls a SQLite peer-message database on a background
+    # timer for incoming messages and injects them as agent turns.
+    #
+    # Detection is a pure SQLite read (zero LLM tokens).  Processing fires
+    # one batched LLM turn when the agent is next idle — N messages always
+    # cost exactly 1 API call regardless of how many arrive between polls.
+    #
+    # peer_db_path:      required when peer_poll_enabled=True; path to the
+    #                    SQLite file containing the peer message table.
+    #                    Feature refuses to start when this is empty.
+    # peer_poll_roles:   comma-separated sender identities to watch, e.g.
+    #                    "panel_a,panel_b".  Empty = watch nobody (opt-in).
+    # peer_poll_interval_seconds: how often to run the SQLite detection pass.
+    #   Default 30 s — cheap enough to run continuously (no LLM cost on empty polls).
     peer_poll_enabled: bool = False
-    peer_poll_interval_seconds: int = 90
-    architect_db_path: str = ""
-    peer_poll_roles: str = "theseus"
+    peer_poll_interval_seconds: int = 30
+    peer_db_path: str = ""
+    peer_poll_roles: str = ""
+    # peer_poll_batch: when True (default), all pending rows are processed in
+    # a single LLM turn — N messages = 1 API call.  Set to False for
+    # turn-by-turn mode: one row per LLM turn, with automatic chaining via
+    # _send_turn's finally block.  Use False when peers send large-context
+    # payloads or when running a small/local model that can't handle a
+    # multi-message batch reliably.
+    peer_poll_batch: bool = True
+    # peer_poll_silent_types: payload.type values that auto-ack WITHOUT an LLM
+    # turn.  Covers the common protocol-close noise.  The panel acks the row,
+    # logs to debug.log, and skips the LLM entirely.  Set to [] to always fire
+    # LLM turns.  None/omitted = use DEFAULT_SILENT_TYPES at runtime.
+    peer_poll_silent_types: list = None  # None → DEFAULT_SILENT_TYPES in tui.py
+    # peer_poll_ack_tool / peer_poll_submit_tool: names of the MCP tools your
+    # peer-message system exposes for ack and reply, e.g. "my_server__ack_msg".
+    # When empty, the injected instruction footer uses generic prose instead of
+    # specific tool names.
+    peer_poll_ack_tool: str = ""
+    peer_poll_submit_tool: str = ""
 
     @classmethod
     def default(cls) -> "Config":
@@ -316,9 +340,13 @@ class Config:
             ),
             display_name=str(d.get("display_name", "")),
             peer_poll_enabled=bool(d.get("peer_poll_enabled", False)),
-            peer_poll_interval_seconds=int(d.get("peer_poll_interval_seconds", 90)),
-            architect_db_path=str(d.get("architect_db_path", "")),
-            peer_poll_roles=str(d.get("peer_poll_roles", "theseus")),
+            peer_poll_interval_seconds=int(d.get("peer_poll_interval_seconds", 30)),
+            peer_db_path=str(d.get("peer_db_path", "")),
+            peer_poll_roles=str(d.get("peer_poll_roles", "")),
+            peer_poll_batch=bool(d.get("peer_poll_batch", True)),
+            peer_poll_silent_types=d.get("peer_poll_silent_types", None),
+            peer_poll_ack_tool=str(d.get("peer_poll_ack_tool", "")),
+            peer_poll_submit_tool=str(d.get("peer_poll_submit_tool", "")),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:

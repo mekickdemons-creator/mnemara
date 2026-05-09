@@ -1003,6 +1003,224 @@ def test_tui_pilot_action_paste(home, monkeypatch):
     app.store.close()
 
 
+# ---------------------------------------------------------------------------
+# Role-doc editor modal tests
+# ---------------------------------------------------------------------------
+
+def test_role_doc_editor_modal_save_writes_file(tmp_path, home):
+    """RoleDocEditorModal saves edited content to disk on action_save."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    role_file = tmp_path / "test_role.md"
+    role_file.write_text("# Original content\n")
+
+    config.init_instance("role_modal_save_t")
+    app = tui_mod.MnemaraTUI("role_modal_save_t")
+
+    async def _run():
+        async with app.run_test() as pilot:
+            modal = tui_mod.RoleDocEditorModal(str(role_file), "# Original content\n")
+            # Pre-populate with modified content.
+            result_holder: list[dict] = []
+            await app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            # Replace text in the TextArea.
+            ta = modal.query_one("#role-editor-ta")
+            ta.load_text("# Edited content\n")
+            await pilot.pause()
+            # Trigger save.
+            modal.action_save()
+            await pilot.pause()
+
+        assert role_file.read_text() == "# Edited content\n"
+        assert result_holder[0]["saved"] is True
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_role_doc_editor_modal_cancel_does_not_write(tmp_path, home):
+    """RoleDocEditorModal cancel dismisses without touching disk."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    role_file = tmp_path / "test_role.md"
+    original = "# Do not overwrite\n"
+    role_file.write_text(original)
+
+    config.init_instance("role_modal_cancel_t")
+    app = tui_mod.MnemaraTUI("role_modal_cancel_t")
+
+    async def _run():
+        async with app.run_test() as pilot:
+            modal = tui_mod.RoleDocEditorModal(str(role_file), original)
+            result_holder: list[dict] = []
+            await app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            modal.action_cancel()
+            await pilot.pause()
+
+        assert role_file.read_text() == original
+        assert result_holder[0]["saved"] is False
+        assert result_holder[0].get("cancelled") is True
+
+    _asyncio.run(_run())
+    app.store.close()
+
+
+def test_role_doc_editor_no_path_shows_message(home):
+    """/role_doc with no role_doc_path configured shows a helpful message."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    config.init_instance("role_modal_nopath_t")
+    app = tui_mod.MnemaraTUI("role_modal_nopath_t")
+    # Ensure no role_doc_path.
+    app.cfg.role_doc_path = ""
+    written: list[str] = []
+    app._chat = lambda: type("FakeLog", (), {"write": lambda self, s: written.append(s)})()  # type: ignore[assignment]
+
+    async def _run():
+        async with app.run_test():
+            await app.action_open_role_editor()
+
+    _asyncio.run(_run())
+    app.store.close()
+    assert any("no role_doc_path" in w for w in written)
+
+
+def test_context_viewer_lists_turns(home):
+    """ContextViewerModal receives turn rows from list_window on compose."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    config.init_instance("ctx_viewer_t")
+    app = tui_mod.MnemaraTUI("ctx_viewer_t")
+    # Seed two turns so the viewer has something to show.
+    app.store.append_turn("user", "hello context viewer")
+    app.store.append_turn("assistant", "context viewer reply")
+
+    collected: list[dict] = []
+
+    class _SpyModal(tui_mod.ContextViewerModal):
+        def compose(self):
+            result = self._store.list_window(limit=200)
+            collected.extend(result.get("rows", []))
+            return super().compose()
+
+    async def _run():
+        async with app.run_test():
+            modal = _SpyModal(app.store, app.instance)
+            await app.push_screen(modal)
+            await app.pop_screen()
+
+    _asyncio.run(_run())
+    app.store.close()
+    assert len(collected) == 2
+    roles = {r["role"] for r in collected}
+    assert "user" in roles
+    assert "assistant" in roles
+
+
+def test_context_viewer_evict_removes_turn(home):
+    """_do_evict() removes the selected turn from the store via store.evict_ids."""
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    config.init_instance("ctx_evict_t")
+    app = tui_mod.MnemaraTUI("ctx_evict_t")
+    app.store.append_turn("user", "turn to evict")
+    app.store.append_turn("user", "turn to keep")
+
+    # Build the modal manually (no screen push needed for unit test).
+    modal = tui_mod.ContextViewerModal(app.store, app.instance)
+    result = app.store.list_window(limit=200)
+    modal._all_rows = result.get("rows", [])
+    modal._filtered_rows = list(modal._all_rows)
+    # Rows are most-recent-first; index 0 = "turn to keep", index 1 = "turn to evict".
+    # Evict the most-recent (turn to keep) — then only "turn to evict" remains.
+    modal._selected_idx = 0
+    modal._do_evict()
+
+    remaining = app.store.list_window(limit=200)
+    app.store.close()
+    assert remaining["total"] == 1
+    assert remaining["rows"][0]["summary"].startswith("turn to evict")
+
+
+def test_context_viewer_pin_unpin(home):
+    """_do_pin() and _do_unpin() toggle pin_label on a turn."""
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    config.init_instance("ctx_pin_t")
+    app = tui_mod.MnemaraTUI("ctx_pin_t")
+    app.store.append_turn("user", "pin target turn")
+
+    modal = tui_mod.ContextViewerModal(app.store, app.instance)
+    result = app.store.list_window(limit=200)
+    modal._all_rows = result.get("rows", [])
+    modal._filtered_rows = list(modal._all_rows)
+
+    # Pin the turn.
+    modal._selected_idx = 0
+    modal._do_pin()
+    pinned = app.store.list_pinned()
+    assert len(pinned) == 1
+    assert pinned[0]["pin_label"] == "pinned"
+
+    # _do_unpin needs _selected_idx reset (rebuild clears it).
+    modal._selected_idx = 0
+    modal._do_unpin()
+    pinned_after = app.store.list_pinned()
+    assert len(pinned_after) == 0
+
+    app.store.close()
+
+
+def test_store_get_turn_returns_full_content(home):
+    """get_turn(row_id) returns the full row dict including content."""
+    from mnemara import config
+    from mnemara.store import Store
+
+    config.init_instance("get_turn_t")
+    store = Store("get_turn_t")
+    store.append_turn("user", "full content check")
+    rows = store.list_window(limit=10)
+    assert rows["total"] == 1
+    row_id = rows["rows"][0]["row_id"]
+    full = store.get_turn(row_id)
+    assert full is not None
+    assert full["id"] == row_id
+    assert full["role"] == "user"
+    assert "full content check" in str(full["content"])
+    store.close()
+
+
+def test_store_list_window_includes_pin_label(home):
+    """list_window() includes pin_label field; None when not pinned."""
+    from mnemara import config
+    from mnemara.store import Store
+
+    config.init_instance("lw_pin_t")
+    store = Store("lw_pin_t")
+    store.append_turn("user", "unpinned turn")
+    rows = store.list_window(limit=10)
+    assert "pin_label" in rows["rows"][0]
+    assert rows["rows"][0]["pin_label"] is None
+    # Pin it and verify.
+    row_id = rows["rows"][0]["row_id"]
+    store.pin_row(row_id, "test-pin")
+    rows2 = store.list_window(limit=10)
+    assert rows2["rows"][0]["pin_label"] == "test-pin"
+    store.close()
+
+
 @pytest.mark.skip(reason="STABLE-era regression: /copy action removed during STABLE pass")
 def test_tui_action_copy_last_writes_to_clipboard(home, monkeypatch):
     """action_copy_last copies the most recent assistant response via pyperclip."""
@@ -1800,6 +2018,147 @@ def test_slash_evict_n_drops_oldest_not_newest(home):
             texts = [r["content"][0]["text"] for r in rows]
             assert texts == ["msg2", "msg3", "msg4"], (
                 f"Expected oldest rows gone, got {texts}"
+            )
+
+    _asyncio.run(_run())
+
+
+def test_store_evict_by_role_user(home):
+    """evict_by_role('user') removes all user rows, leaving assistant rows."""
+    from mnemara.store import Store
+
+    store = Store("evict_role_user_t")
+    store.append_turn("user", [{"type": "text", "text": "q1"}])
+    store.append_turn("assistant", [{"type": "text", "text": "a1"}])
+    store.append_turn("user", [{"type": "text", "text": "q2"}])
+    store.append_turn("assistant", [{"type": "text", "text": "a2"}])
+    assert len(store.window()) == 4
+
+    deleted = store.evict_by_role("user")
+    assert deleted == 2
+    rows = store.window()
+    assert len(rows) == 2
+    roles = [r["role"] for r in rows]
+    assert roles == ["assistant", "assistant"], f"Only assistant rows should survive, got {roles}"
+    texts = [r["content"][0]["text"] for r in rows]
+    assert "a1" in texts and "a2" in texts
+    store.close()
+
+
+def test_store_evict_by_role_assistant(home):
+    """evict_by_role('assistant') removes all assistant rows, leaving user rows."""
+    from mnemara.store import Store
+
+    store = Store("evict_role_asst_t")
+    store.append_turn("user", [{"type": "text", "text": "q1"}])
+    store.append_turn("assistant", [{"type": "text", "text": "a1"}])
+    store.append_turn("user", [{"type": "text", "text": "q2"}])
+    assert len(store.window()) == 3
+
+    deleted = store.evict_by_role("assistant")
+    assert deleted == 1
+    rows = store.window()
+    assert len(rows) == 2
+    assert all(r["role"] == "user" for r in rows)
+    store.close()
+
+
+def test_store_evict_by_role_skips_pinned(home):
+    """evict_by_role respects skip_pinned=True by default."""
+    from mnemara.store import Store
+
+    store = Store("evict_role_pin_t")
+    store.append_turn("user", [{"type": "text", "text": "keep me"}])
+    row_id = store.window()[0]["id"]
+    store.pin_row(row_id, "important")
+
+    store.append_turn("user", [{"type": "text", "text": "drop me"}])
+
+    deleted = store.evict_by_role("user")
+    assert deleted == 1  # only the unpinned row
+    rows = store.window()
+    assert len(rows) == 1
+    assert rows[0]["content"][0]["text"] == "keep me"
+    store.close()
+
+
+def test_store_evict_by_role_invalid(home):
+    """evict_by_role raises ValueError for unsupported roles."""
+    from mnemara.store import Store
+    import pytest
+
+    store = Store("evict_role_invalid_t")
+    with pytest.raises(ValueError, match="role must be"):
+        store.evict_by_role("system")
+    store.close()
+
+
+def test_slash_evict_user_removes_user_turns(home):
+    """/evict user drops all user-turn rows via the TUI slash command."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("evict_user_slash_t")
+    app = tui_mod.MnemaraTUI("evict_user_slash_t")
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            app.store.append_turn("user", [{"type": "text", "text": "user q1"}])
+            app.store.append_turn("assistant", [{"type": "text", "text": "asst a1"}])
+            app.store.append_turn("user", [{"type": "text", "text": "user q2"}])
+            assert len(app.store.window()) == 3
+
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/evict user")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+            rows = app.store.window()
+            assert len(rows) == 1, f"Expected 1 row (assistant only), got {len(rows)}"
+            assert rows[0]["role"] == "assistant"
+
+    _asyncio.run(_run())
+
+
+def test_slash_clear_wipes_all_turns_tools_and_thinking(home):
+    """/clear deletes ALL turns (user + assistant) and strips tool/thinking blocks."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("clear_wipe_t")
+    app = tui_mod.MnemaraTUI("clear_wipe_t")
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            # Insert mixed turns: user, assistant with tool_use, assistant with thinking.
+            app.store.append_turn("user", [{"type": "text", "text": "my question"}])
+            app.store.append_turn(
+                "assistant",
+                [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/f"}},
+                    {"type": "text", "text": "used a tool"},
+                ],
+            )
+            app.store.append_turn(
+                "assistant",
+                [
+                    {"type": "thinking", "thinking": "deep thoughts"},
+                    {"type": "text", "text": "final answer"},
+                ],
+            )
+            assert len(app.store.window()) == 3
+
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/clear")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+            # ALL turns deleted — store is empty (except pinned, none here)
+            rows = app.store.window()
+            assert len(rows) == 0, (
+                f"/clear should leave an empty store, got {len(rows)} rows remaining"
             )
 
     _asyncio.run(_run())

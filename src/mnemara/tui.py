@@ -25,8 +25,9 @@ try:
     from textual import events as _txt_events
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.widgets import Button, Footer, Header, Input, RichLog, Static, TextArea
-    from textual.containers import Horizontal
+    from textual.screen import ModalScreen
+    from textual.widgets import Button, Footer, Header, Input, ListItem, ListView, RichLog, Static, TextArea
+    from textual.containers import Horizontal, Vertical
     _TEXTUAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _TEXTUAL_AVAILABLE = False
@@ -177,6 +178,235 @@ Screen {
 
 #btn-quit:focus {
     border: tall #a05050;
+}
+
+#btn-inbox {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 16;
+    margin-left: 1;
+}
+
+#btn-inbox:hover {
+    background: #2a4f7a;
+    color: #8fb6e6;
+}
+
+#btn-inbox:focus {
+    border: tall #6f9ad9;
+}
+
+.inbox-off {
+    background: #3a3a3a;
+    color: #888888;
+    border: tall #555555;
+}
+
+.inbox-off:hover {
+    background: #444444;
+    color: #aaaaaa;
+}
+
+/* ---- Role-doc editor modal ---- */
+RoleDocEditorModal {
+    align: center middle;
+}
+
+#role-editor-dialog {
+    width: 90%;
+    height: 90%;
+    border: round #6f9ad9;
+    background: #1d2330;
+    padding: 1 2;
+}
+
+#role-editor-title {
+    height: 1;
+    color: #8fb6e6;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#role-editor-ta {
+    height: 1fr;
+    border: round #4d6fa3;
+    background: #11151e;
+    color: #ffffff;
+    padding: 0 1;
+}
+
+#role-editor-ta:focus {
+    border: round #6f9ad9;
+}
+
+#role-editor-btn-row {
+    height: 3;
+    background: #1d2330;
+    align: right middle;
+    margin-top: 1;
+}
+
+#btn-role-save {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 14;
+}
+
+#btn-role-save:hover {
+    background: #2a4f7a;
+    color: #8fb6e6;
+}
+
+#btn-role-cancel {
+    background: #2a1f1f;
+    color: #8a6a6a;
+    border: tall #5a3a3a;
+    min-width: 14;
+    margin-left: 1;
+}
+
+#btn-role-cancel:hover {
+    background: #3a2a2a;
+    color: #c08080;
+}
+
+#btn-role {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 12;
+    margin-left: 1;
+}
+
+#btn-role:hover {
+    background: #2a4f7a;
+    color: #8fb6e6;
+}
+
+#btn-role:focus {
+    border: tall #6f9ad9;
+}
+
+/* ---- Context viewer modal ---- */
+ContextViewerModal {
+    align: center middle;
+}
+
+#ctx-dialog {
+    width: 95%;
+    height: 95%;
+    border: round #6f9ad9;
+    background: #1d2330;
+    padding: 1 2;
+}
+
+#ctx-header {
+    height: 1;
+    color: #8fb6e6;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#ctx-filter-row {
+    height: 3;
+    background: #1d2330;
+    margin-bottom: 1;
+}
+
+#ctx-filter-input {
+    width: 1fr;
+    border: tall #4d6fa3;
+    background: #11151e;
+    color: #ffffff;
+}
+
+#ctx-panels {
+    height: 1fr;
+}
+
+#ctx-list-panel {
+    width: 2fr;
+    border: round #4d6fa3;
+    margin-right: 1;
+}
+
+#ctx-list {
+    height: 1fr;
+    background: #11151e;
+}
+
+#ctx-detail-panel {
+    width: 3fr;
+    border: round #4d6fa3;
+}
+
+#ctx-detail-ta {
+    height: 1fr;
+    background: #11151e;
+    color: #d0d8e8;
+    padding: 0 1;
+}
+
+#ctx-action-row {
+    height: 3;
+    background: #1d2330;
+    align: left middle;
+    margin-top: 1;
+}
+
+#btn-ctx-evict {
+    background: #2a1f1f;
+    color: #c08080;
+    border: tall #5a3a3a;
+    min-width: 10;
+}
+
+#btn-ctx-pin {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 10;
+    margin-left: 1;
+}
+
+#btn-ctx-unpin {
+    background: #1a2a1a;
+    color: #6fad6f;
+    border: tall #3a6f3a;
+    min-width: 10;
+    margin-left: 1;
+}
+
+#btn-ctx-close {
+    background: #2a2a2a;
+    color: #888888;
+    border: tall #444444;
+    min-width: 14;
+    margin-left: 1;
+}
+
+#btn-ctx-evict:hover { background: #3a2a2a; }
+#btn-ctx-pin:hover   { background: #2a4f7a; }
+#btn-ctx-unpin:hover { background: #2a3a2a; }
+#btn-ctx-close:hover { background: #333333; }
+
+#btn-context {
+    background: #1a2a1a;
+    color: #6fad6f;
+    border: tall #3a6f3a;
+    min-width: 14;
+    margin-left: 1;
+}
+
+#btn-context:hover {
+    background: #2a3a2a;
+    color: #8fc88f;
+}
+
+#btn-context:focus {
+    border: tall #6fad6f;
 }
 """
 
@@ -381,6 +611,295 @@ class _UserTextArea(TextArea):
 
 
 # ---------------------------------------------------------------------------
+# Role-doc editor modal
+# ---------------------------------------------------------------------------
+
+
+class RoleDocEditorModal(ModalScreen):  # type: ignore[misc]
+    """Full-screen modal overlay for editing the instance role doc.
+
+    Pushed onto the screen stack by MnemaraTUI when the user runs
+    /role_doc or clicks the [📄 Role] button.  The TextArea is pre-populated
+    with the current on-disk role doc content.  Ctrl+S / Save writes it back
+    and dismisses; Escape / Cancel dismisses without writing.
+
+    The role doc is re-read from disk at every API call, so changes take
+    effect immediately on the next turn — no restart required.
+    """
+
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Save", show=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, role_doc_path: str, initial_content: str) -> None:
+        super().__init__()
+        self._role_doc_path = role_doc_path
+        self._initial_content = initial_content
+
+    def compose(self) -> "ComposeResult":
+        short_path = self._role_doc_path or "(no role doc configured)"
+        with Vertical(id="role-editor-dialog"):
+            yield Static(
+                f"[bold]Role doc editor[/bold] — [dim]{short_path}[/dim]",
+                id="role-editor-title",
+            )
+            yield TextArea(
+                self._initial_content,
+                language=None,
+                show_line_numbers=True,
+                tab_behavior="indent",
+                soft_wrap=True,
+                id="role-editor-ta",
+            )
+            with Horizontal(id="role-editor-btn-row"):
+                yield Button("Save  ⌃S", id="btn-role-save")
+                yield Button("Cancel  Esc", id="btn-role-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#role-editor-ta", TextArea).focus()
+
+    def on_button_pressed(self, event: "Button.Pressed") -> None:
+        if event.button.id == "btn-role-save":
+            self.action_save()
+        elif event.button.id == "btn-role-cancel":
+            self.action_cancel()
+
+    def action_save(self) -> None:
+        """Write edited content to disk and dismiss."""
+        ta = self.query_one("#role-editor-ta", TextArea)
+        new_text = ta.text
+        if not self._role_doc_path:
+            self.dismiss({"saved": False, "error": "no role_doc_path configured"})
+            return
+        try:
+            Path(self._role_doc_path).write_text(new_text, encoding="utf-8")
+            self.dismiss({"saved": True, "path": self._role_doc_path, "dirty": new_text != self._initial_content})
+        except Exception as exc:
+            self.dismiss({"saved": False, "error": str(exc)})
+
+    def action_cancel(self) -> None:
+        """Dismiss without saving."""
+        ta = self.query_one("#role-editor-ta", TextArea)
+        dirty = ta.text != self._initial_content
+        self.dismiss({"saved": False, "cancelled": True, "dirty": dirty})
+
+
+class ContextViewerModal(ModalScreen):  # type: ignore[misc]
+    """Full-screen modal overlay for viewing and managing the rolling-window context.
+
+    Pushed onto the screen stack by MnemaraTUI when the user runs /context or
+    clicks the [💬 Context] button.
+
+    Left panel: scrollable list of turns (most recent first) with row_id, role,
+    timestamp, and summary. Pin marker (📌) shown for pinned rows.
+
+    Right panel: read-only TextArea showing the full content of the selected turn.
+
+    Actions: Evict (removes from window), Pin / Unpin, Close.
+    Filter: live text filter + role filter buttons (All / User / Asst).
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+    ]
+
+    def __init__(self, store: "Store", instance: str) -> None:  # type: ignore[name-defined]
+        super().__init__()
+        self._store = store
+        self._instance = instance
+        self._all_rows: list[dict] = []
+        self._filtered_rows: list[dict] = []
+        self._selected_idx: int = -1
+        self._role_filter: str = ""
+
+    def compose(self) -> "ComposeResult":
+        result = self._store.list_window(limit=200)
+        self._all_rows = result.get("rows", [])
+        self._filtered_rows = list(self._all_rows)
+        total = result.get("total", 0)
+
+        with Vertical(id="ctx-dialog"):
+            yield Static(
+                f"[bold]Context viewer[/bold] — [dim]{self._instance}[/dim] "
+                f"([dim]{total} turns total[/dim])",
+                id="ctx-header",
+            )
+            with Horizontal(id="ctx-filter-row"):
+                yield Input(placeholder="filter turns…", id="ctx-filter-input")
+                yield Button("All", id="btn-ctx-role-all")
+                yield Button("User", id="btn-ctx-role-user")
+                yield Button("Asst", id="btn-ctx-role-asst")
+            with Horizontal(id="ctx-panels"):
+                with Vertical(id="ctx-list-panel"):
+                    yield ListView(id="ctx-list")
+                with Vertical(id="ctx-detail-panel"):
+                    yield TextArea(
+                        "← select a turn to view its full content",
+                        read_only=True,
+                        id="ctx-detail-ta",
+                    )
+            with Horizontal(id="ctx-action-row"):
+                yield Button("Evict", id="btn-ctx-evict")
+                yield Button("📌 Pin", id="btn-ctx-pin")
+                yield Button("Unpin", id="btn-ctx-unpin")
+                yield Button("Close  Esc", id="btn-ctx-close")
+
+    def on_mount(self) -> None:
+        self._rebuild_list()
+        self.query_one("#ctx-list", ListView).focus()
+
+    # ---------------------------------------------------------------- list helpers
+
+    def _row_label(self, row: dict) -> str:
+        pin = "📌 " if row.get("pin_label") else "   "
+        ts = str(row.get("timestamp", ""))[:16].replace("T", " ")
+        role = (row.get("role") or "?")[:4]
+        summary = (row.get("summary") or "")[:38]
+        return f"{pin}{row['row_id']:>5} · {role} · {ts} · {summary}"
+
+    def _rebuild_list(self) -> None:
+        try:
+            lv = self.query_one("#ctx-list", ListView)
+            lv.clear()
+            for row in self._filtered_rows:
+                lv.append(ListItem(Static(self._row_label(row))))
+            self._selected_idx = -1
+            ta = self.query_one("#ctx-detail-ta", TextArea)
+            ta.load_text("← select a turn to view its full content")
+        except Exception:
+            # Modal not yet mounted — skip UI update; data is already in _filtered_rows.
+            pass
+
+    def _apply_filters(self) -> None:
+        try:
+            text_filter = self.query_one("#ctx-filter-input", Input).value.lower()
+        except Exception:
+            text_filter = ""
+        rows = self._all_rows
+        if self._role_filter:
+            rows = [r for r in rows if r.get("role", "") == self._role_filter]
+        if text_filter:
+            rows = [r for r in rows if text_filter in r.get("summary", "").lower()
+                    or text_filter in str(r.get("row_id", ""))]
+        self._filtered_rows = rows
+        self._rebuild_list()
+
+    def _fmt_full_content(self, full: dict) -> str:
+        """Render a full turn dict as readable text for the detail panel."""
+        hdr = (
+            f"Turn {full['id']} · {full.get('role', '?')} · {full.get('ts', '')}"
+        )
+        pin = full.get("pin_label")
+        if pin:
+            hdr += f"  [pinned: {pin}]"
+        sep = "─" * 50
+        content = full.get("content", "")
+        if isinstance(content, str):
+            body = content
+        elif isinstance(content, list):
+            parts = []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                btype = b.get("type", "")
+                if btype == "text":
+                    parts.append(b.get("text", ""))
+                elif btype == "tool_use":
+                    inp = b.get("input", {})
+                    import json as _j
+                    inp_str = _j.dumps(inp, indent=2) if isinstance(inp, dict) else str(inp)
+                    parts.append(f"[tool_use: {b.get('name', '?')}]\n{inp_str}")
+                elif btype == "thinking":
+                    snip = (b.get("thinking") or "")[:300]
+                    parts.append(f"<thinking>\n{snip}{'…' if len(b.get('thinking',''))>300 else ''}\n</thinking>")
+            body = "\n\n".join(p for p in parts if p)
+        else:
+            body = str(content)
+        return f"{hdr}\n{sep}\n{body}"
+
+    # ---------------------------------------------------------------- events
+
+    def on_input_changed(self, event: "Input.Changed") -> None:  # type: ignore[name-defined]
+        if event.input.id == "ctx-filter-input":
+            self._apply_filters()
+
+    def on_list_view_highlighted(self, event: "ListView.Highlighted") -> None:  # type: ignore[name-defined]
+        if event.list_view.id != "ctx-list":
+            return
+        idx = event.list_view.index
+        if idx is None or idx < 0 or idx >= len(self._filtered_rows):
+            return
+        self._selected_idx = idx
+        row = self._filtered_rows[idx]
+        full = self._store.get_turn(row["row_id"])
+        if full:
+            ta = self.query_one("#ctx-detail-ta", TextArea)
+            ta.load_text(self._fmt_full_content(full))
+
+    def on_button_pressed(self, event: "Button.Pressed") -> None:  # type: ignore[name-defined]
+        bid = event.button.id
+        if bid == "btn-ctx-close":
+            self.action_close()
+        elif bid == "btn-ctx-role-all":
+            self._role_filter = ""
+            self._apply_filters()
+        elif bid == "btn-ctx-role-user":
+            self._role_filter = "user"
+            self._apply_filters()
+        elif bid == "btn-ctx-role-asst":
+            self._role_filter = "assistant"
+            self._apply_filters()
+        elif bid == "btn-ctx-evict":
+            self._do_evict()
+        elif bid == "btn-ctx-pin":
+            self._do_pin()
+        elif bid == "btn-ctx-unpin":
+            self._do_unpin()
+
+    # ---------------------------------------------------------------- actions
+
+    def _selected_row_id(self) -> "int | None":
+        if self._selected_idx < 0 or self._selected_idx >= len(self._filtered_rows):
+            return None
+        return self._filtered_rows[self._selected_idx]["row_id"]
+
+    def _do_evict(self) -> None:
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        self._store.evict_ids([row_id])
+        self._all_rows = [r for r in self._all_rows if r["row_id"] != row_id]
+        self._apply_filters()
+
+    def _do_pin(self) -> None:
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        self._store.pin_row(row_id, "pinned")
+        # Refresh pin_label in _all_rows
+        for r in self._all_rows:
+            if r["row_id"] == row_id:
+                r["pin_label"] = "pinned"
+                break
+        self._apply_filters()
+
+    def _do_unpin(self) -> None:
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        self._store.unpin_row(row_id)
+        for r in self._all_rows:
+            if r["row_id"] == row_id:
+                r["pin_label"] = None
+                break
+        self._apply_filters()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -425,7 +944,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._queued_input: str | None = None  # input received while busy; fires after turn
 
         # Peer-poll state (v0.11.0 autonomous inter-panel messaging).
-        self._delivered_peer_row_ids: set[int] = set()
+        # _peer_poll_watermark: persisted high-watermark (max row_id seen so far).
+        #   Only rows with id > watermark are delivered.  Persists across restarts so
+        #   historical backlog is never re-delivered.  Loaded from disk in on_mount.
+        # _peer_pending_rows: detected but not yet processed; batched into one LLM turn.
+        self._peer_poll_watermark: int = 0
+        self._peer_pending_rows: list[dict] = []
         self._peer_poll_timer = None  # set in on_mount when peer_poll_enabled
 
         # Spinner state.
@@ -465,6 +989,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
         )
         with Horizontal(id="btn-row"):
             yield Button("Send  ⌃S", id="btn-send")
+            yield Button(self._inbox_button_label(), id="btn-inbox")
+            yield Button("📄 Role", id="btn-role")
+            yield Button("💬 Context", id="btn-context")
             yield Button("Quit  ⌃C", id="btn-quit")
         yield Footer()
 
@@ -519,6 +1046,9 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             self._spinner_timer = None
 
+        # Sync inbox button CSS class to the loaded config state.
+        self._update_inbox_button()
+
         self._render_history()
         self._warn_if_context_near_limit()
         self._focus_input_after_refresh()
@@ -526,11 +1056,13 @@ class MnemaraTUI(App):  # type: ignore[misc]
         # Start autonomous peer-message poller if configured.
         if self.cfg.peer_poll_enabled:
             try:
+                self._load_peer_poll_watermark()
                 interval = max(30, self.cfg.peer_poll_interval_seconds)
                 self._peer_poll_timer = self.set_interval(
                     interval, self._poll_peer_messages
                 )
-                log("peer_poll_started", interval=interval, roles=self.cfg.peer_poll_roles)
+                log("peer_poll_started", interval=interval, roles=self.cfg.peer_poll_roles,
+                    watermark=self._peer_poll_watermark)
             except Exception:
                 self._peer_poll_timer = None
 
@@ -549,6 +1081,14 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     _CONTEXT_WARN_RATIO = 0.80        # trigger auto-evict when >= 80% of max_window_tokens
     _CONTEXT_AUTO_EVICT_TARGET = 0.60  # trim to 60% on startup auto-evict
+
+    # Peer messages whose payload.type matches these strings are auto-acked
+    # silently — no LLM turn, just a debug.log entry.  Covers protocol-close
+    # noise (ack, thread-close, pong_ack, etc.).  Overridable via config.
+    _DEFAULT_SILENT_PEER_TYPES: frozenset[str] = frozenset({
+        "ack", "ack_close", "ack_close_final", "ack_thread_terminal",
+        "ack_close_2", "pong_ack", "thread_close", "thread_close_final",
+    })
 
     def _warn_if_context_near_limit(self) -> None:
         """Auto-evict on startup if the rolling window is already near capacity.
@@ -592,22 +1132,112 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
     # ---------------------------------------------------------------- peer poll
 
-    async def _poll_peer_messages(self) -> None:
-        """Background timer: poll muninn.db for messages from peer panels.
+    def _inbox_button_label(self) -> str:
+        """Return the inbox button label matching current peer_poll_enabled state."""
+        if self.cfg.peer_poll_enabled:
+            return "⚡ Inbox: ON"
+        return "📭 Inbox: OFF"
 
-        Fires every peer_poll_interval_seconds (default 90).  Delivers at most
-        ONE message per tick — if the agent is busy, skip this tick entirely
-        (the row has not been added to _delivered_peer_row_ids, so it will be
-        re-discovered and delivered on the next tick after the turn completes).
+    def _update_inbox_button(self) -> None:
+        """Sync the inbox button label and CSS class to current peer_poll_enabled."""
+        try:
+            btn = self.query_one("#btn-inbox", Button)
+            btn.label = self._inbox_button_label()
+            if self.cfg.peer_poll_enabled:
+                btn.remove_class("inbox-off")
+            else:
+                btn.add_class("inbox-off")
+        except Exception:
+            pass  # widget may not be mounted yet (e.g. during compose)
 
-        The injected turn tells the agent to ack and submit a return using the
-        existing MCP tools it already knows how to call.
+    def _watermark_path(self) -> Path:
+        return Path.home() / ".mnemara" / self.instance / "peer_poll_watermark"
+
+    def _peer_db_path(self) -> str:
+        """Return the configured path to the peer message database.
+
+        Returns an empty string when not configured.  Callers that require
+        the database (polling, watermark init) must check for empty and skip
+        gracefully rather than trying to open a default path.
+        """
+        return self.cfg.peer_db_path
+
+    def _load_peer_poll_watermark(self) -> None:
+        """Load the persisted high-watermark from disk.
+
+        If no watermark file exists (first run with peer poll enabled), initialize
+        to the current max row_id in the peer message database so that all
+        pre-existing rows are silently skipped — only messages submitted AFTER this
+        startup will be delivered.  This prevents the 'stale message flood' on first
+        enable.
         """
         import sqlite3 as _sqlite3
 
-        db_path = self.cfg.architect_db_path or str(
-            Path.home() / "workspace" / "architect" / "muninn.db"
-        )
+        wm_path = self._watermark_path()
+        if wm_path.exists():
+            try:
+                self._peer_poll_watermark = int(wm_path.read_text().strip())
+                return
+            except Exception:
+                pass  # corrupted — re-initialize below
+
+        # No watermark file: bootstrap to current max row_id so backlog is skipped.
+        db_path = self._peer_db_path()
+        if not db_path:
+            self._peer_poll_watermark = 0
+            return
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM returns").fetchone()
+                self._peer_poll_watermark = row[0] if row else 0
+            finally:
+                conn.close()
+        except Exception:
+            self._peer_poll_watermark = 0
+
+        self._save_peer_poll_watermark()
+        log("peer_poll_watermark_init", watermark=self._peer_poll_watermark)
+
+    def _save_peer_poll_watermark(self) -> None:
+        """Persist the current watermark to disk."""
+        try:
+            wm_path = self._watermark_path()
+            wm_path.write_text(str(self._peer_poll_watermark))
+        except Exception:
+            pass  # never crash over watermark persistence
+
+    async def _poll_peer_messages(self) -> None:
+        """Background timer: detect new peer messages in the peer database (zero LLM cost).
+
+        Fires every peer_poll_interval_seconds (default 30 s).  This method
+        only reads SQLite and updates _peer_pending_rows — it never starts an
+        LLM turn.  Actual processing (one batched LLM turn) is deferred to
+        _process_peer_messages(), which fires when the agent is next idle.
+
+        Detection/processing split keeps token cost at zero on empty polls and
+        batches N arriving messages into exactly 1 API call instead of N.
+
+        When peer_poll_enabled is False the method returns immediately — no
+        SQLite read, no badge update, no LLM turn.  The ⚡ N badge in the
+        status bar is NOT suppressed: messages that were already pending before
+        the toggle stay visible so the user can see they are accumulating.
+
+        When peer_db_path is empty the method returns immediately with a
+        warning log entry — callers should not enable polling without configuring
+        the database path.
+        """
+        # Guard: skip all detection work when polling is toggled OFF.
+        if not self.cfg.peer_poll_enabled:
+            return
+
+        import sqlite3 as _sqlite3
+
+        db_path = self._peer_db_path()
+        if not db_path:
+            log("peer_poll_skip_no_db_path")
+            return
+
         peer_roles = [
             r.strip()
             for r in self.cfg.peer_poll_roles.split(",")
@@ -621,60 +1251,179 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             return
 
+        new_rows: list[dict] = []
         try:
             placeholders = ",".join("?" * len(peer_roles))
+            # Only fetch rows ABOVE the persisted watermark — prevents backlog re-delivery
+            # on every restart.  The watermark is advanced + saved after each detection
+            # batch so future polls and restarts see only genuinely new messages.
+            #
+            # Two delivery paths (OR-joined):
+            #   1. Sender is in peer_poll_roles AND row is addressed to us or broadcast.
+            #      This is the normal peer-to-peer path (known senders).
+            #   2. Row is explicitly addressed to this panel (recipient_role = self.instance)
+            #      regardless of who sent it.
+            #      This is the "new sender" path — any sender not yet in peer_poll_roles
+            #      can reach a panel without a config update by using explicit addressing.
+            #      recipient_role-targeted delivery is always intentional, so sender-list
+            #      gating would only create false negatives.
             cur = conn.execute(
                 f"SELECT id, agent_role, task_id, payload_json, submitted_at "
                 f"FROM returns "
-                f"WHERE status='pending' AND agent_role IN ({placeholders}) "
+                f"WHERE status='pending' AND id > ? AND ("
+                f"  (agent_role IN ({placeholders}) AND (recipient_role IS NULL OR recipient_role = ?))"
+                f"  OR recipient_role = ?"
+                f") "
                 f"ORDER BY id ASC LIMIT 20",
-                peer_roles,
+                [self._peer_poll_watermark] + peer_roles + [self.instance, self.instance],
             )
-            rows = cur.fetchall()
+            for row_id, sender_role, task_id, payload_json, submitted_at in cur.fetchall():
+                try:
+                    payload = json.loads(payload_json) if payload_json else {}
+                except Exception:
+                    payload = {"raw": payload_json}
+                new_rows.append({
+                    "row_id": row_id,
+                    "sender_role": sender_role,
+                    "task_id": task_id or "(no topic)",
+                    "payload": payload,
+                    "submitted_at": submitted_at,
+                })
         except Exception:
-            rows = []
+            pass
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
 
-        for row_id, sender_role, task_id, payload_json, submitted_at in rows:
-            if row_id in self._delivered_peer_row_ids:
-                continue
-            # If a turn is in flight, skip this tick entirely — retry next tick.
-            # Do NOT add to _delivered_peer_row_ids yet so we re-discover it.
-            if self._busy:
-                break
-            # Claim the row before yielding so a concurrent tick can't re-deliver.
-            self._delivered_peer_row_ids.add(row_id)
+        if new_rows:
+            # Advance watermark to highest id seen; persist immediately so a crash
+            # or restart won't re-deliver these rows.
+            max_id = max(r["row_id"] for r in new_rows)
+            if max_id > self._peer_poll_watermark:
+                self._peer_poll_watermark = max_id
+                self._save_peer_poll_watermark()
 
-            try:
-                payload = json.loads(payload_json) if payload_json else {}
-            except Exception:
-                payload = {"raw": payload_json}
+            # Split into silent (auto-ack, no LLM) vs active (needs LLM turn).
+            # Silent types: ack, thread-close, pong_ack, etc. — protocol noise
+            # that doesn't need the agent's attention.  We ack them here, log
+            # them, and skip them.  Active rows go to _peer_pending_rows as before.
+            _default_silent = MnemaraTUI._DEFAULT_SILENT_PEER_TYPES
+            silent_types: frozenset[str] = (
+                frozenset(self.cfg.peer_poll_silent_types)
+                if self.cfg.peer_poll_silent_types is not None
+                else _default_silent
+            )
+            active_rows: list[dict] = []
+            for r in new_rows:
+                msg_type = r["payload"].get("type", "")
+                if msg_type in silent_types:
+                    # Auto-ack silently: the MCP ack tool is not available in a
+                    # sync SQLite poll context, so we mark the row done directly
+                    # in the peer database.
+                    try:
+                        ack_conn = _sqlite3.connect(self._peer_db_path())
+                        ack_conn.execute(
+                            "UPDATE returns SET status='done', completed_at=? WHERE id=?",
+                            (datetime.now(timezone.utc).isoformat(), r["row_id"])
+                        )
+                        ack_conn.commit()
+                        ack_conn.close()
+                    except Exception:
+                        pass
+                    log("peer_silent_ack",
+                        sender=r["sender_role"], row_id=r["row_id"],
+                        msg_type=msg_type, topic=r["task_id"])
+                else:
+                    active_rows.append(r)
+                    log("peer_ping_detected",
+                        sender=r["sender_role"], row_id=r["row_id"], topic=r["task_id"])
 
-            topic = task_id or "(no topic)"
-            payload_pretty = json.dumps(payload, indent=2)
-            message = (
-                f"[PEER MESSAGE from {sender_role} — row_id={row_id} — topic={topic}]\n\n"
-                f"{payload_pretty}\n\n"
-                f"Process this message per your role doc protocol:\n"
-                f"1. Call mcp__architect__ack_return(row_id={row_id})\n"
-                f"2. Submit your response via mcp__architect__submit_return("
-                f'role="{self.instance}", task_id="{topic}", '
-                f'payload={{"status": "done", "summary": "..."}})'
+            self._peer_pending_rows.extend(active_rows)
+            # Show ⚡ badge in status bar immediately (no LLM cost).
+            self._refresh_status()
+            # If there are active rows and we're idle, process now; otherwise
+            # the _send_turn finally block drains them after the current turn ends.
+            if active_rows and not self._busy:
+                await self._process_peer_messages()
+
+    async def _process_peer_messages(self) -> None:
+        """Batch ALL pending peer rows into ONE LLM turn (called when idle).
+
+        N messages → 1 API call.  Called from:
+        - _poll_peer_messages() when not busy at detection time
+        - _send_turn()'s finally block after each turn completes
+        - action_check_inbox() (Inbox button / /inbox command)
+        """
+        if not self._peer_pending_rows or self._busy:
+            return
+
+        # Batch mode (default): consume all pending rows in one LLM turn.
+        # Turn-by-turn mode (peer_poll_batch=False): consume only the first
+        # row; the remainder stay in _peer_pending_rows and are drained by
+        # _send_turn's finally block after this turn completes.
+        if self.cfg.peer_poll_batch:
+            rows = list(self._peer_pending_rows)
+            self._peer_pending_rows.clear()
+        else:
+            rows = [self._peer_pending_rows.pop(0)]
+        self._refresh_status()
+
+        count = len(rows)
+        header = f"[PEER MESSAGES — {count} pending]\n\n"
+        parts: list[str] = []
+        for i, r in enumerate(rows, 1):
+            row_id = r["row_id"]
+            sender = r["sender_role"]
+            topic = r["task_id"]
+            payload_pretty = json.dumps(r["payload"], indent=2)
+            parts.append(
+                f"--- Message {i}/{count}: from {sender} "
+                f"(row_id={row_id}, topic={topic}) ---\n{payload_pretty}"
             )
 
-            self._chat().write(
-                f"[dim]📨 incoming from [bold]{sender_role}[/bold] "
-                f"(row_id={row_id} · topic: {topic})[/dim]"
+        ack_tool = self.cfg.peer_poll_ack_tool
+        submit_tool = self.cfg.peer_poll_submit_tool
+        if ack_tool:
+            ack_lines = "\n".join(
+                f"  {ack_tool}(row_id={r['row_id']})" for r in rows
             )
-            log("peer_message_received", sender=sender_role, row_id=row_id, topic=topic)
+            ack_instruction = f"1. Ack each row:\n{ack_lines}"
+        else:
+            row_ids = ", ".join(str(r["row_id"]) for r in rows)
+            ack_instruction = (
+                f"1. Ack each row (row_id in [{row_ids}]) via whatever ack tool "
+                f"your peer-message system provides."
+            )
+        if submit_tool:
+            reply_instruction = (
+                f"2. Submit your responses via {submit_tool}("
+                f'role="{self.instance}", task_id=<topic>, payload={{...}})'
+            )
+        else:
+            reply_instruction = (
+                f"2. Submit your responses via whatever reply tool your peer-message "
+                f'system provides, identifying yourself as "{self.instance}".'
+            )
+        footer = (
+            f"\nFor each message, per your role doc protocol:\n"
+            f"{ack_instruction}\n"
+            f"{reply_instruction}"
+        )
 
-            await self._handle_user_input(message)
-            # One message per tick — let the agent process it before the next.
-            break
+        message = header + "\n\n".join(parts) + footer
+
+        # Show a single chat notice for all batched messages.
+        senders = ", ".join(r["sender_role"] for r in rows)
+        self._chat().write(
+            f"[dim]📨 [bold]{count}[/bold] peer message(s) from "
+            f"[bold]{senders}[/bold] — processing now[/dim]"
+        )
+        log("peer_messages_processing", count=count,
+            row_ids=[r["row_id"] for r in rows])
+
+        await self._handle_user_input(message)
 
     # ---------------------------------------------------------------- chat log
 
@@ -740,9 +1489,11 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception:
             ev_str = "0r"
         queue_str = " [yellow]⏸ queued[/yellow]" if self._queued_input is not None else ""
+        inbox_count = len(self._peer_pending_rows)
+        inbox_str = f" [bold yellow]⚡ {inbox_count}[/bold yellow]" if inbox_count > 0 else ""
         return (
             f"turns: {nturns} | tokens: {tin}/{self.cfg.max_window_tokens} (out: {tout} cum) | "
-            f"model: {self.cfg.model} | evicted: {ev_str}{queue_str}"
+            f"model: {self.cfg.model} | evicted: {ev_str}{queue_str}{inbox_str}"
         )
 
     def _status_text(self) -> str:
@@ -798,11 +1549,94 @@ class MnemaraTUI(App):  # type: ignore[misc]
         ta.focus()
 
     async def on_button_pressed(self, event: "Button.Pressed") -> None:
-        """Handle Send and Quit button clicks."""
+        """Handle Send, Inbox, Role, Context, and Quit button clicks."""
         if event.button.id == "btn-send":
             await self.action_submit_prompt()
+        elif event.button.id == "btn-inbox":
+            await self.action_check_inbox()
+        elif event.button.id == "btn-role":
+            await self.action_open_role_editor()
+        elif event.button.id == "btn-context":
+            await self.action_open_context_viewer()
         elif event.button.id == "btn-quit":
             await self.action_quit()
+
+    async def action_check_inbox(self) -> None:
+        """Toggle peer message delivery on/off (Inbox button / /inbox).
+
+        Flips cfg.peer_poll_enabled, persists to config.json, updates the
+        button label + style live, and logs the new state to debug.log.
+        When toggled ON, any already-pending rows are processed immediately
+        if the agent is idle.
+        """
+        self.cfg.peer_poll_enabled = not self.cfg.peer_poll_enabled
+        new_state = self.cfg.peer_poll_enabled
+
+        try:
+            config_mod.save(self.instance, self.cfg)
+        except Exception as exc:
+            self._chat().write(f"[red]inbox: config save failed: {exc}[/red]")
+
+        self._update_inbox_button()
+        log("peer_poll_toggled", enabled=new_state, instance=self.instance)
+
+        state_label = "ON" if new_state else "OFF"
+        self._chat().write(
+            f"[dim]inbox: peer message delivery toggled "
+            f"[bold]{state_label}[/bold] (persisted)[/dim]"
+        )
+
+        # When turned ON, immediately drain any messages that accumulated while OFF.
+        if new_state and self._peer_pending_rows and not self._busy:
+            await self._process_peer_messages()
+
+    async def action_open_role_editor(self) -> None:
+        """Open the role-doc editor modal (📄 Role button / /role_doc).
+
+        Reads the current role doc from disk, presents it in a full-screen
+        TextArea overlay.  On Save (Ctrl+S), writes the edited content back
+        to disk.  Changes take effect on the next turn — no restart needed
+        because the role doc is re-read from disk at every API call.
+        """
+        chat = self._chat()
+        path = self.cfg.role_doc_path
+        if not path:
+            chat.write(
+                "[dim]role_doc: no role_doc_path configured — "
+                "set it in config.json and restart[/dim]"
+            )
+            return
+        try:
+            content = Path(path).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            content = ""
+        except Exception as exc:
+            chat.write(f"[red]role_doc: could not read {path}: {exc}[/red]")
+            return
+
+        def _on_dismiss(result: dict) -> None:
+            if result.get("saved"):
+                chat.write(
+                    f"[green]role_doc: saved[/green] [dim]{path}[/dim] "
+                    f"— changes take effect on next turn"
+                )
+                log("role_doc_saved", path=path, instance=self.instance)
+            elif result.get("cancelled") and result.get("dirty"):
+                chat.write("[dim]role_doc: cancelled (unsaved changes discarded)[/dim]")
+            elif result.get("error"):
+                chat.write(f"[red]role_doc: save failed: {result['error']}[/red]")
+
+        await self.push_screen(RoleDocEditorModal(path, content), _on_dismiss)
+
+    async def action_open_context_viewer(self) -> None:
+        """Open the context viewer modal (💬 Context button / /context).
+
+        Displays the rolling window as a searchable, filterable two-panel view:
+        left = turn list (most recent first), right = full content of selected turn.
+        Actions: Evict (remove from window), Pin, Unpin.
+        Changes (evict/pin) take effect immediately in the store.
+        """
+        await self.push_screen(ContextViewerModal(self.store, self.instance))
 
     async def _handle_user_input(self, text: str) -> None:
         """Process a submitted prompt: slash commands, queuing, or turn dispatch."""
@@ -887,13 +1721,21 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._busy = False
             self._refresh_status()
             self._focus_input_after_refresh()
-            # Drain the input queue — fire the next message automatically.
+            # Drain the user input queue — fire the next message automatically.
             if self._queued_input is not None:
                 queued = self._queued_input
                 self._queued_input = None
                 self._refresh_status()
                 self.run_worker(
                     self._send_turn(queued),
+                    name="mnemara_turn",
+                    group="turn",
+                    exclusive=True,
+                )
+            # Drain any peer messages that arrived while we were busy.
+            elif self._peer_pending_rows:
+                self.run_worker(
+                    self._process_peer_messages(),
                     name="mnemara_turn",
                     group="turn",
                     exclusive=True,
@@ -959,6 +1801,17 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._slash_name(arg, chat)
             return
 
+        if cmd == "/inbox":
+            await self.action_check_inbox()
+            return
+
+        if cmd in ("/role_doc", "/role-doc", "/roledoc"):
+            await self.action_open_role_editor()
+            return
+
+        if cmd in ("/context", "/ctx"):
+            await self.action_open_context_viewer()
+            return
 
         chat.write(
             f"[dim]unknown command: {cmd} — try /help for a full list[/dim]"
@@ -1051,19 +1904,46 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write("[dim]nothing in flight[/dim]")
 
     def _slash_clear(self, chat: "RichLog") -> None:
-        """/clear — erase all visible chat history (does not touch stored rows)."""
+        """/clear — fresh-start wipe: strips tool_use blocks, thinking blocks,
+        and deletes ALL turn rows (user + assistant) from storage, then clears
+        the chat display.
+
+        After /clear only pinned rows and the role doc remain. Status bar and
+        token count update immediately to reflect the emptied store.
+        Pinned rows are always preserved.
+        """
+        try:
+            before, _ = self.store.total_tokens()
+            tools_result = self.store.evict_tool_use_blocks(all_rows=True, skip_pinned=True)
+            think_result = self.store.evict_thinking_blocks(all_rows=True, skip_pinned=True)
+            user_rows = self.store.evict_by_role("user", skip_pinned=True)
+            asst_rows = self.store.evict_by_role("assistant", skip_pinned=True)
+            after, _ = self.store.total_tokens()
+            tools_freed = tools_result.get("blocks_evicted", 0)
+            think_freed = think_result.get("blocks_evicted", 0)
+            freed = max(0, before - after)
+        except Exception:
+            tools_freed = think_freed = user_rows = asst_rows = freed = 0
+
         chat.clear()
-        chat.write("[dim]chat display cleared (conversation history is preserved in storage)[/dim]")
+        chat.write(
+            f"[dim]clear: stripped {tools_freed} tool block(s), "
+            f"{think_freed} thinking block(s), "
+            f"{user_rows} user turn(s), {asst_rows} assistant turn(s) — "
+            f"~{freed:,} tokens freed[/dim]"
+        )
         self._refresh_status()
 
     def _slash_evict(self, arg: str, chat: "RichLog") -> None:
-        """/evict [tools|thinking|N|last N] — free context budget.
+        """/evict [tools|thinking|user|assistant|N|last N] — free context budget.
 
-        /evict tools    — strip tool_use blocks from all stored rows
-        /evict thinking — strip thinking blocks from all stored rows
-        /evict N        — drop the N oldest rows (budget reclaim, keeps recent context)
-        /evict last N   — drop the N most-recent rows (rollback a bad paste/turn)
-        /evict          — show eviction stats
+        /evict tools      — strip tool_use blocks from all stored rows
+        /evict thinking   — strip thinking blocks from all stored rows
+        /evict user       — drop all user-turn rows (keeps assistant responses)
+        /evict assistant  — drop all assistant-turn rows (keeps user inputs)
+        /evict N          — drop the N oldest rows (budget reclaim, keeps recent context)
+        /evict last N     — drop the N most-recent rows (rollback a bad paste/turn)
+        /evict            — show eviction stats
         """
         arg = arg.strip().lower()
         ev = self.store.get_eviction_stats()
@@ -1084,6 +1964,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 result = self.store.evict_thinking_blocks(all_rows=True)
                 freed = result.get("blocks_evicted", result.get("rows_modified", 0))
                 chat.write(f"[green]/evict thinking:[/green] {freed} thinking block(s) stripped")
+            elif arg in ("user", "assistant"):
+                dropped = self.store.evict_by_role(arg)
+                label = "user input(s)" if arg == "user" else "assistant response(s)"
+                chat.write(f"[green]/evict {arg}:[/green] {dropped} {label} evicted")
             elif arg.isdigit():
                 n = int(arg)
                 dropped = self.store.evict_oldest(n)
@@ -1093,7 +1977,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 dropped = self.store.evict_last(n)
                 chat.write(f"[green]/evict last {n}:[/green] {dropped} most-recent row(s) evicted")
             else:
-                chat.write("[dim]/evict [tools|thinking|N|last N] — see /help[/dim]")
+                chat.write("[dim]/evict [tools|thinking|user|assistant|N|last N] — see /help[/dim]")
                 return
         except Exception as exc:
             chat.write(f"[red]evict error: {exc}[/red]")
@@ -1135,23 +2019,28 @@ class MnemaraTUI(App):  # type: ignore[misc]
         except Exception as exc:
             chat.write(f"[red]name updated in memory but config save failed: {exc}[/red]")
 
-
     def _slash_help(self, chat: "RichLog") -> None:
         """/help — list available slash commands."""
         lines = [
             "[bold]slash commands[/bold]",
             "  /help, /?               — show this list",
-            "  /clear                  — clear display (keeps history)",
+            "  /clear                  — strip tools, thinking, user turns + clear display",
             "  /models                 — list available models",
             "  /swap MODEL             — switch to MODEL (in-session only)",
             "  /tokens N [--temp]      — set max context window",
             "  /evict                  — show eviction stats",
             "  /evict tools            — strip tool_use blocks",
             "  /evict thinking         — strip thinking blocks",
+            "  /evict user             — drop all user turns (keep assistant responses)",
+            "  /evict assistant        — drop all assistant turns (keep user inputs)",
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
-            "  /name <label>           — set response label (e.g. /name Majordomo)",
+            "  /skeleton <path>        — show Python skeleton (signatures/docstrings only)",
+            "  /inbox                  — toggle peer message delivery on/off",
+            "  /role_doc               — open role doc editor (📄 Role button)",
+            "  /context                — open context viewer: browse, evict, pin turns (💬 Context button)",
+            "  /name <label>           — set response label (e.g. /name coordinator)",
             "  /name                   — clear label, revert to \"assistant\"",
             "  /export [N] [path]      — export turns + config + role_doc to markdown",
             "  /import <path>          — restore turns from a full export file",

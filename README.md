@@ -648,6 +648,120 @@ that "spawn N `GemmaSession`s and route messages between them" is real
 code you can write in an afternoon for the specific shape of orchestration
 your project needs.
 
+## Peer messaging
+
+Mnemara can poll a SQLite peer-message database on a background timer and
+deliver incoming messages as agent turns — enabling autonomous coordination
+between multiple running Mnemara panels without human relay.
+
+**The feature is disabled by default.** Enable it by setting
+`peer_poll_enabled = true` in your instance config.
+
+### Required schema
+
+Your peer-message SQLite file must expose a table called `returns` with at
+least these columns:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTOINCREMENT | watermark anchor |
+| `agent_role` | TEXT | sender identity string |
+| `recipient_role` | TEXT or NULL | NULL = broadcast to all watchers |
+| `task_id` | TEXT or NULL | optional topic label |
+| `payload_json` | TEXT | JSON-encoded message body |
+| `status` | TEXT | `'pending'` for new rows, `'done'` after ack |
+| `submitted_at` | TEXT | ISO timestamp |
+
+Mnemara reads `pending` rows matching the configured sender roles or
+explicitly addressed to this panel, delivers them as a single batched agent
+turn, and writes `status='done'` + `completed_at` when silently auto-acking
+protocol-noise messages.
+
+### Config example
+
+```json
+{
+  "peer_poll_enabled": true,
+  "peer_db_path": "/path/to/peer_messages.db",
+  "peer_poll_roles": "panel-a,panel-b",
+  "peer_poll_interval_seconds": 30,
+  "peer_poll_ack_tool": "my_server__ack_message",
+  "peer_poll_submit_tool": "my_server__send_message"
+}
+```
+
+`peer_poll_ack_tool` and `peer_poll_submit_tool` are the MCP tool names your
+peer-message system exposes. When empty (the default), the injected turn
+instruction uses generic prose describing what the agent should do; set them
+to use specific tool names so the agent can call them directly.
+
+### Behavior
+
+- **Detection** (every `peer_poll_interval_seconds`): pure SQLite read, zero
+  token cost.
+- **Processing** (when next idle): all pending rows in one batched LLM turn —
+  N messages = 1 API call.
+- **`peer_poll_batch: false`**: turn-by-turn mode for small/local models or
+  large-context peer messages.
+- **`[⚡ Inbox: ON/OFF]` button**: toggle delivery live from the TUI without
+  restarting the panel.
+- **Silent auto-ack**: protocol-noise message types (configurable via
+  `peer_poll_silent_types`) are acknowledged without an LLM turn.
+
+### Best practices and pitfalls
+
+This is in-process panel coordination over a shared SQLite file, not a
+distributed message bus. The mechanics matter, especially for autonomous
+panels with no human-in-the-loop to catch coordination bugs.
+
+**Make a peer-message send the terminal action of an agent turn.**
+Sending is asynchronous — the recipient doesn't see your message until
+their next poll, which can be tens of seconds later. An agent that
+sends mid-turn and keeps working is either doing prep that could have
+happened *before* the send, or speculating about a reply that hasn't
+been authored yet. The clean discipline:
+
+> **Verify, prepare, send, stop.** When an agent pings a peer, the send
+> should be the last tool block of the turn. The agent then yields
+> control and waits for the reply to arrive on a future turn.
+
+Encode this rule in the role doc that drives any panel using peer
+messaging — autonomous loops without it tend to compound work on
+half-stale state.
+
+**Drain inbound messages in batches, not one-at-a-time.** When several
+pending rows are addressed to a panel, ack-all and reply-all in the
+same terminal block. Splitting an inbox across N turns fragments
+context and burns tokens for no benefit.
+
+**Always filter polls by `recipient_role`.** Without the filter,
+multiple watchers race for every pending row — including messages
+intended for other panels. With the filter, each panel reads only
+what's addressed to it. Race-free.
+
+**Crossed messages are normal; design for them.** Two panels can
+author replies that cross in flight. A reply you receive may have been
+authored without visibility into your most recent message. When a
+reply looks stale, check timestamps and referenced row IDs before
+acting on it. Sometimes the right move is to flag the cross and
+re-synchronize; sometimes it's to drop a confirmation-of-confirmation
+that carries no new information.
+
+**Acknowledge what you process. Don't acknowledge acknowledgments.**
+Unacked rows accumulate and slow the queue. But "I received your
+acknowledgment" is noise that, if both sides send it, becomes an
+infinite ping-pong loop. Reply only when the reply carries new content.
+
+**Local-only by design.** This system has no authentication, no
+encryption, no rate limiting, and no audit log. The SQLite file should
+live on the same machine as every panel reading from it. If you need
+cross-machine messaging, route through a real message bus —
+peer_poll is not a substitute.
+
+**The schema is part of your contract.** If you change the `returns`
+table shape, every panel reading from it must be updated in lockstep.
+Treat schema changes the way you'd treat changes to a public API.
+
 ## Programmatic use
 
 The CLI is the primary surface, but Mnemara is also a regular Python

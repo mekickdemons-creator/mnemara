@@ -275,7 +275,7 @@ def migrate_cmd(all_instances: bool, instance_name: str | None) -> None:
 
     Examples:
         mnemara migrate --all
-        mnemara migrate --instance majordomo
+        mnemara migrate --instance my-panel
     """
     if not all_instances and not instance_name:
         console.print("[red]provide --all or --instance <name>[/red]")

@@ -1,11 +1,17 @@
-"""v0.11.0 — autonomous peer-poll tests.
+"""v0.11.0 — autonomous peer-poll tests (v0.12.0 detect/process split).
 
-Tests for _poll_peer_messages: background timer that reads muninn.db
-and injects peer panel messages as agent turns without producer relay.
+Detection is now token-free (pure SQLite → _peer_pending_rows).
+Processing is lazy — all pending rows batched into ONE LLM turn when idle.
 
-Uses sqlite3 directly to seed a test muninn.db, then calls the
-poll method on a minimal MnemaraTUI instance.  No real Textual
-pilot needed — the method is async and directly testable.
+Test coverage:
+- Config defaults (interval now 30 s)
+- Detection fills _peer_pending_rows without LLM call when busy
+- Detection fires _process_peer_messages immediately when idle
+- _process_peer_messages batches N rows into 1 _handle_user_input call
+- _process_peer_messages is a no-op when _peer_pending_rows is empty
+- ⚡ N badge appears in status text when rows are pending
+- Non-watched roles, non-pending status, duplicate rows all skipped
+- Missing muninn.db handled gracefully
 """
 from __future__ import annotations
 
@@ -64,18 +70,14 @@ def _seed_return(db: Path, *, agent_role: str, task_id: str, payload: dict,
 
 
 def _make_tui(tmp_path: Path, db_path: str, peer_roles: str = "theseus",
-              interval: int = 90) -> MagicMock:
-    """Build a minimal MnemaraTUI-like mock that exercises _poll_peer_messages.
-
-    We instantiate the real method via an unbound call, injecting only the
-    attributes the method actually touches.
-    """
+              interval: int = 30, busy: bool = False) -> MagicMock:
+    """Build a minimal MnemaraTUI-like mock that exercises the poll/process methods."""
     from mnemara import config as config_mod
 
     cfg = config_mod.Config.from_dict({
         "peer_poll_enabled": True,
         "peer_poll_interval_seconds": interval,
-        "architect_db_path": db_path,
+        "peer_db_path": db_path,
         "peer_poll_roles": peer_roles,
         "model": "claude-sonnet-4-6",
     })
@@ -83,64 +85,94 @@ def _make_tui(tmp_path: Path, db_path: str, peer_roles: str = "theseus",
     tui = MagicMock()
     tui.cfg = cfg
     tui.instance = "substrate"
-    tui._busy = False
-    tui._delivered_peer_row_ids = set()
+    tui._busy = busy
+    tui._peer_poll_watermark = 0
+    tui._peer_pending_rows = []
+    tui._save_peer_poll_watermark = MagicMock()
+    tui._peer_db_path = MagicMock(return_value=db_path)
     tui._chat.return_value = MagicMock()
     tui._handle_user_input = AsyncMock()
+    tui._refresh_status = MagicMock()
     return tui
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Config tests
 # ---------------------------------------------------------------------------
 
 def test_peer_poll_config_defaults() -> None:
-    """New config fields load with sensible defaults when absent from dict."""
+    """Default interval is now 30 s (was 90); other defaults unchanged."""
     from mnemara import config as config_mod
     cfg = config_mod.Config.from_dict({})
     assert cfg.peer_poll_enabled is False
-    assert cfg.peer_poll_interval_seconds == 90
-    assert cfg.architect_db_path == ""
-    assert cfg.peer_poll_roles == "theseus"
+    assert cfg.peer_poll_interval_seconds == 30   # changed from 90
+    assert cfg.peer_db_path == ""
+    assert cfg.peer_poll_roles == ""
 
 
 def test_peer_poll_config_roundtrip() -> None:
-    """Config serialises and deserialises all four new fields cleanly."""
+    """Config serialises and deserialises all peer-poll fields cleanly."""
     from mnemara import config as config_mod
     original = config_mod.Config.from_dict({
         "peer_poll_enabled": True,
         "peer_poll_interval_seconds": 60,
-        "architect_db_path": "/tmp/muninn.db",
-        "peer_poll_roles": "theseus,majordomo",
+        "peer_db_path": "/tmp/peer.db",
+        "peer_poll_roles": "panel-a,panel-b",
     })
     raw = original.to_dict()
     restored = config_mod.Config.from_dict(raw)
     assert restored.peer_poll_enabled is True
     assert restored.peer_poll_interval_seconds == 60
-    assert restored.architect_db_path == "/tmp/muninn.db"
-    assert restored.peer_poll_roles == "theseus,majordomo"
+    assert restored.peer_db_path == "/tmp/peer.db"
+    assert restored.peer_poll_roles == "panel-a,panel-b"
 
+
+# ---------------------------------------------------------------------------
+# Detection tests (_poll_peer_messages — no LLM, pure SQLite)
+# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_poll_delivers_pending_row(tmp_path: Path) -> None:
-    """A pending row from a watched role is delivered as a user turn."""
+async def test_poll_detect_fills_pending_no_lm_when_busy(tmp_path: Path) -> None:
+    """When busy, detection claims the row into _peer_pending_rows but does NOT
+    call _handle_user_input — processing defers until the turn completes."""
     from mnemara.tui import MnemaraTUI
 
     db = _make_muninn_db(tmp_path)
-    row_id = _seed_return(db, agent_role="theseus", task_id="ping-42",
-                          payload={"type": "directive", "msg": "hello substrate"})
+    row_id = _seed_return(db, agent_role="theseus", task_id="t1",
+                          payload={"msg": "queued"})
 
-    tui = _make_tui(tmp_path, str(db))
+    tui = _make_tui(tmp_path, str(db), busy=True)
+    # _process_peer_messages is a real async method; mock it on the tui object
+    tui._process_peer_messages = AsyncMock()
+
     await MnemaraTUI._poll_peer_messages(tui)
 
-    assert row_id in tui._delivered_peer_row_ids
-    tui._handle_user_input.assert_awaited_once()
-    injected = tui._handle_user_input.call_args[0][0]
-    assert "theseus" in injected
-    assert f"row_id={row_id}" in injected
-    assert "ping-42" in injected
-    assert "ack_return" in injected
-    assert "submit_return" in injected
+    # Watermark must have advanced to >= row_id (will not be re-detected on restart).
+    assert tui._peer_poll_watermark >= row_id
+    # Row must be in the pending list waiting for next idle window.
+    assert any(r["row_id"] == row_id for r in tui._peer_pending_rows)
+    # _process_peer_messages must NOT have fired (agent was busy).
+    tui._process_peer_messages.assert_not_awaited()
+    # _handle_user_input must NOT have fired.
+    tui._handle_user_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_detect_triggers_process_when_idle(tmp_path: Path) -> None:
+    """When idle, detection immediately calls _process_peer_messages."""
+    from mnemara.tui import MnemaraTUI
+
+    db = _make_muninn_db(tmp_path)
+    row_id = _seed_return(db, agent_role="theseus", task_id="t1",
+                          payload={"msg": "hello"})
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui._process_peer_messages = AsyncMock()
+
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    assert tui._peer_poll_watermark >= row_id
+    tui._process_peer_messages.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -153,14 +185,17 @@ async def test_poll_skips_non_watched_roles(tmp_path: Path) -> None:
                  payload={"msg": "irrelevant"})
 
     tui = _make_tui(tmp_path, str(db), peer_roles="theseus")
+    tui._process_peer_messages = AsyncMock()
+
     await MnemaraTUI._poll_peer_messages(tui)
 
-    tui._handle_user_input.assert_not_awaited()
+    assert len(tui._peer_pending_rows) == 0
+    tui._process_peer_messages.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_poll_skips_non_pending_rows(tmp_path: Path) -> None:
-    """Rows with status != 'pending' are not delivered."""
+    """Rows with status != 'pending' are not detected."""
     from mnemara.tui import MnemaraTUI
 
     db = _make_muninn_db(tmp_path)
@@ -168,85 +203,65 @@ async def test_poll_skips_non_pending_rows(tmp_path: Path) -> None:
                  payload={"msg": "already done"}, status="done")
 
     tui = _make_tui(tmp_path, str(db))
+    tui._process_peer_messages = AsyncMock()
+
     await MnemaraTUI._poll_peer_messages(tui)
 
-    tui._handle_user_input.assert_not_awaited()
+    assert len(tui._peer_pending_rows) == 0
+    tui._process_peer_messages.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_poll_skips_already_delivered(tmp_path: Path) -> None:
-    """A row already in _delivered_peer_row_ids is not re-delivered."""
+async def test_poll_skips_rows_at_or_below_watermark(tmp_path: Path) -> None:
+    """Rows at or below the watermark are not re-delivered (restart safety).
+
+    This is the core fix for the stale-message-flood bug: when a panel restarts,
+    the watermark is loaded from disk and historical rows (id <= watermark) are
+    silently skipped.  Only rows with id > watermark are delivered.
+    """
     from mnemara.tui import MnemaraTUI
 
     db = _make_muninn_db(tmp_path)
-    row_id = _seed_return(db, agent_role="theseus", task_id="t1",
-                          payload={"msg": "hi"})
+    old_row_id = _seed_return(db, agent_role="theseus", task_id="old",
+                              payload={"msg": "stale"})
+    new_row_id = _seed_return(db, agent_role="theseus", task_id="new",
+                              payload={"msg": "fresh"})
 
     tui = _make_tui(tmp_path, str(db))
-    tui._delivered_peer_row_ids.add(row_id)
+    # Simulate a restart where watermark was saved after old_row was processed.
+    tui._peer_poll_watermark = old_row_id
+    tui._process_peer_messages = AsyncMock()
+
     await MnemaraTUI._poll_peer_messages(tui)
 
-    tui._handle_user_input.assert_not_awaited()
+    # Only the new row should be pending.
+    assert len(tui._peer_pending_rows) == 1
+    assert tui._peer_pending_rows[0]["row_id"] == new_row_id
+    # Watermark advanced to the new row.
+    assert tui._peer_poll_watermark == new_row_id
+    tui._process_peer_messages.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_poll_skips_when_busy(tmp_path: Path) -> None:
-    """When _busy is True, no row is delivered (retry next tick)."""
+async def test_poll_batches_multiple_rows_in_one_detection(tmp_path: Path) -> None:
+    """Multiple pending rows are all claimed in a single detection pass."""
     from mnemara.tui import MnemaraTUI
 
     db = _make_muninn_db(tmp_path)
-    row_id = _seed_return(db, agent_role="theseus", task_id="t1",
-                          payload={"msg": "queued"})
+    row_id_1 = _seed_return(db, agent_role="theseus", task_id="t1", payload={"n": 1})
+    row_id_2 = _seed_return(db, agent_role="theseus", task_id="t2", payload={"n": 2})
+    row_id_3 = _seed_return(db, agent_role="majordomo", task_id="t3", payload={"n": 3})
 
-    tui = _make_tui(tmp_path, str(db))
-    tui._busy = True
+    tui = _make_tui(tmp_path, str(db), peer_roles="theseus,majordomo")
+    tui._process_peer_messages = AsyncMock()
+
     await MnemaraTUI._poll_peer_messages(tui)
 
-    # Row must NOT be in delivered set — it should be retried next tick.
-    assert row_id not in tui._delivered_peer_row_ids
-    tui._handle_user_input.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_poll_delivers_one_per_tick(tmp_path: Path) -> None:
-    """Multiple pending rows deliver one per tick (break after first delivery)."""
-    from mnemara.tui import MnemaraTUI
-
-    db = _make_muninn_db(tmp_path)
-    row_id_1 = _seed_return(db, agent_role="theseus", task_id="t1",
-                             payload={"n": 1})
-    row_id_2 = _seed_return(db, agent_role="theseus", task_id="t2",
-                             payload={"n": 2})
-
-    tui = _make_tui(tmp_path, str(db))
-    await MnemaraTUI._poll_peer_messages(tui)
-
-    # Only one delivery per tick.
-    assert tui._handle_user_input.await_count == 1
-    # The first (lowest id) row was delivered.
-    assert row_id_1 in tui._delivered_peer_row_ids
-    # The second row is pending — will be delivered on the next tick.
-    assert row_id_2 not in tui._delivered_peer_row_ids
-
-
-@pytest.mark.asyncio
-async def test_poll_multi_tick_drains_queue(tmp_path: Path) -> None:
-    """Running the poll twice drains two pending rows across two ticks."""
-    from mnemara.tui import MnemaraTUI
-
-    db = _make_muninn_db(tmp_path)
-    row_id_1 = _seed_return(db, agent_role="theseus", task_id="t1",
-                             payload={"n": 1})
-    row_id_2 = _seed_return(db, agent_role="theseus", task_id="t2",
-                             payload={"n": 2})
-
-    tui = _make_tui(tmp_path, str(db))
-    await MnemaraTUI._poll_peer_messages(tui)  # tick 1 → delivers row 1
-    await MnemaraTUI._poll_peer_messages(tui)  # tick 2 → delivers row 2
-
-    assert tui._handle_user_input.await_count == 2
-    assert row_id_1 in tui._delivered_peer_row_ids
-    assert row_id_2 in tui._delivered_peer_row_ids
+    # All three rows claimed in one detection pass; watermark advanced to max.
+    assert tui._peer_poll_watermark == max(row_id_1, row_id_2, row_id_3)
+    assert len(tui._peer_pending_rows) == 3
+    # _process_peer_messages called exactly once (not once per row).
+    tui._process_peer_messages.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -261,10 +276,12 @@ async def test_poll_multi_role_filter(tmp_path: Path) -> None:
                  payload={"x": 2})  # not watched
 
     tui = _make_tui(tmp_path, str(db), peer_roles="theseus,majordomo")
+    tui._process_peer_messages = AsyncMock()
+
     await MnemaraTUI._poll_peer_messages(tui)
 
-    assert row_theseus in tui._delivered_peer_row_ids
-    assert tui._handle_user_input.await_count == 1
+    assert tui._peer_poll_watermark >= row_theseus
+    assert len(tui._peer_pending_rows) == 1
 
 
 @pytest.mark.asyncio
@@ -273,37 +290,720 @@ async def test_poll_handles_missing_db_gracefully(tmp_path: Path) -> None:
     from mnemara.tui import MnemaraTUI
 
     tui = _make_tui(tmp_path, str(tmp_path / "nonexistent.db"))
+    tui._process_peer_messages = AsyncMock()
+
     # Should not raise.
     await MnemaraTUI._poll_peer_messages(tui)
+    assert len(tui._peer_pending_rows) == 0
+    tui._process_peer_messages.assert_not_awaited()
+
+
+def test_load_watermark_bootstraps_to_current_max_on_first_run(tmp_path: Path) -> None:
+    """On first enable (no watermark file), _load_peer_poll_watermark sets watermark
+    to the current max row_id so all existing rows are skipped on the first poll.
+
+    This is the direct regression test for the stale-message-flood bug: when
+    peer_poll_enabled is first set to True, panels should not be flooded with
+    every historical pending return in muninn.db.
+    """
+    from mnemara.tui import MnemaraTUI
+
+    db = _make_muninn_db(tmp_path)
+    row_1 = _seed_return(db, agent_role="theseus", task_id="old1", payload={"x": 1})
+    row_2 = _seed_return(db, agent_role="theseus", task_id="old2", payload={"x": 2})
+    row_3 = _seed_return(db, agent_role="majordomo", task_id="old3", payload={"x": 3})
+
+    tui = _make_tui(tmp_path, str(db))
+    # Watermark file does NOT exist — simulates first run.
+    assert not (tmp_path / "peer_poll_watermark").exists()
+    # _watermark_path must return a path inside tmp_path (not real ~/.mnemara).
+    tui._watermark_path = MagicMock(return_value=tmp_path / "peer_poll_watermark")
+
+    MnemaraTUI._load_peer_poll_watermark(tui)
+
+    # Watermark should be set to max existing row_id.
+    assert tui._peer_poll_watermark == max(row_1, row_2, row_3)
+    # _save_peer_poll_watermark must have been called to persist the bootstrap value.
+    tui._save_peer_poll_watermark.assert_called_once()
+
+
+def test_load_watermark_reads_persisted_value(tmp_path: Path) -> None:
+    """On restart, _load_peer_poll_watermark reads the saved watermark from disk."""
+    from mnemara.tui import MnemaraTUI
+
+    db = _make_muninn_db(tmp_path)
+    wm_file = tmp_path / "peer_poll_watermark"
+    wm_file.write_text("42")
+
+    tui = _make_tui(tmp_path, str(db))
+    tui._watermark_path = MagicMock(return_value=wm_file)
+
+    MnemaraTUI._load_peer_poll_watermark(tui)
+
+    assert tui._peer_poll_watermark == 42
+
+
+# ---------------------------------------------------------------------------
+# Processing tests (_process_peer_messages — batched LLM turn)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_process_batches_n_rows_into_one_turn(tmp_path: Path) -> None:
+    """_process_peer_messages batches 3 pending rows into exactly 1 LLM call."""
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_tui(tmp_path, "/unused.db")
+    tui._peer_pending_rows = [
+        {"row_id": 10, "sender_role": "theseus", "task_id": "topic-A",
+         "payload": {"type": "directive"}, "submitted_at": "2026-05-08"},
+        {"row_id": 11, "sender_role": "majordomo", "task_id": "topic-B",
+         "payload": {"type": "status"}, "submitted_at": "2026-05-08"},
+        {"row_id": 12, "sender_role": "cognition-researcher", "task_id": "topic-C",
+         "payload": {"type": "observation"}, "submitted_at": "2026-05-08"},
+    ]
+
+    await MnemaraTUI._process_peer_messages(tui)
+
+    # Exactly ONE LLM call regardless of row count.
+    tui._handle_user_input.assert_awaited_once()
+    # Pending list is drained.
+    assert tui._peer_pending_rows == []
+
+    msg = tui._handle_user_input.call_args[0][0]
+    # All three row_ids present in one message.
+    assert "row_id=10" in msg
+    assert "row_id=11" in msg
+    assert "row_id=12" in msg
+    # All three senders present.
+    assert "theseus" in msg
+    assert "majordomo" in msg
+    assert "cognition-researcher" in msg
+    # Must tell agent to ack and reply (generic prose since no tool configured).
+    assert "Ack each row" in msg or "ack tool" in msg
+    assert "reply tool" in msg or "Submit your responses" in msg
+    # Header shows total count.
+    assert "3 pending" in msg
+
+
+@pytest.mark.asyncio
+async def test_process_noop_when_no_pending(tmp_path: Path) -> None:
+    """_process_peer_messages is a no-op when _peer_pending_rows is empty."""
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_tui(tmp_path, "/unused.db")
+    tui._peer_pending_rows = []
+
+    await MnemaraTUI._process_peer_messages(tui)
+
     tui._handle_user_input.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_poll_message_format_includes_required_instructions(
-    tmp_path: Path,
-) -> None:
-    """Injected message contains ack and submit_return instructions for the agent."""
+async def test_process_noop_when_busy(tmp_path: Path) -> None:
+    """_process_peer_messages does nothing when agent is busy."""
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_tui(tmp_path, "/unused.db", busy=True)
+    tui._peer_pending_rows = [
+        {"row_id": 5, "sender_role": "theseus", "task_id": "t",
+         "payload": {}, "submitted_at": "2026-05-08"},
+    ]
+
+    await MnemaraTUI._process_peer_messages(tui)
+
+    # Rows must remain for when busy clears.
+    assert len(tui._peer_pending_rows) == 1
+    tui._handle_user_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_turn_by_turn_consumes_one_row(tmp_path: Path) -> None:
+    """peer_poll_batch=False: _process_peer_messages fires ONE turn per call."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_tui(tmp_path, "/unused.db")
+    tui.cfg = config_mod.Config.from_dict({
+        "peer_poll_batch": False,
+        "peer_poll_enabled": True,
+        "peer_db_path": "/unused.db",
+        "model": "claude-sonnet-4-6",
+    })
+    tui._peer_pending_rows = [
+        {"row_id": 20, "sender_role": "theseus", "task_id": "first",
+         "payload": {"n": 1}, "submitted_at": "2026-05-08"},
+        {"row_id": 21, "sender_role": "theseus", "task_id": "second",
+         "payload": {"n": 2}, "submitted_at": "2026-05-08"},
+        {"row_id": 22, "sender_role": "theseus", "task_id": "third",
+         "payload": {"n": 3}, "submitted_at": "2026-05-08"},
+    ]
+
+    await MnemaraTUI._process_peer_messages(tui)
+
+    # Exactly one LLM call fired.
+    tui._handle_user_input.assert_awaited_once()
+    # Only the first row consumed; two remain.
+    assert len(tui._peer_pending_rows) == 2
+    assert tui._peer_pending_rows[0]["row_id"] == 21
+    # The message targets only the first row.
+    msg = tui._handle_user_input.call_args[0][0]
+    assert "row_id=20" in msg
+    assert "row_id=21" not in msg
+    assert "row_id=22" not in msg
+
+
+@pytest.mark.asyncio
+async def test_process_turn_by_turn_drains_sequentially(tmp_path: Path) -> None:
+    """peer_poll_batch=False: three calls drain three rows one at a time."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_tui(tmp_path, "/unused.db")
+    tui.cfg = config_mod.Config.from_dict({
+        "peer_poll_batch": False,
+        "peer_poll_enabled": True,
+        "peer_db_path": "/unused.db",
+        "model": "claude-sonnet-4-6",
+    })
+    tui._peer_pending_rows = [
+        {"row_id": 30, "sender_role": "theseus", "task_id": "a",
+         "payload": {}, "submitted_at": "2026-05-08"},
+        {"row_id": 31, "sender_role": "theseus", "task_id": "b",
+         "payload": {}, "submitted_at": "2026-05-08"},
+        {"row_id": 32, "sender_role": "theseus", "task_id": "c",
+         "payload": {}, "submitted_at": "2026-05-08"},
+    ]
+
+    # Simulate three idle windows (e.g. _send_turn finally block fires 3x).
+    await MnemaraTUI._process_peer_messages(tui)
+    assert len(tui._peer_pending_rows) == 2
+
+    await MnemaraTUI._process_peer_messages(tui)
+    assert len(tui._peer_pending_rows) == 1
+
+    await MnemaraTUI._process_peer_messages(tui)
+    assert tui._peer_pending_rows == []
+
+    # Three turns fired, one per call.
+    assert tui._handle_user_input.await_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Status bar ⚡ badge test
+# ---------------------------------------------------------------------------
+
+def _make_status_tui(pending_count: int) -> MagicMock:
+    """Build a minimal tui mock for _compute_status_text calls."""
+    from mnemara.tui import MnemaraTUI
+    tui = MagicMock()
+    tui._queued_input = None
+    tui._peer_pending_rows = [{"row_id": i} for i in range(pending_count)]
+    tui.store.total_tokens.return_value = (1000, 500)
+    tui.store.window.return_value = [{}] * 5
+    tui.store.get_eviction_stats.return_value = {"rows_evicted": 0, "blocks_evicted": 0}
+    tui.cfg.max_window_tokens = 150_000
+    tui.cfg.model = "claude-sonnet-4-6"
+    return tui
+
+
+def test_status_bar_shows_inbox_count() -> None:
+    """_compute_status_text includes ⚡ N when _peer_pending_rows is non-empty."""
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_status_tui(2)
+    status = MnemaraTUI._compute_status_text(tui)
+    assert "⚡ 2" in status
+
+
+def test_status_bar_no_badge_when_empty() -> None:
+    """_compute_status_text shows no ⚡ when inbox is empty."""
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_status_tui(0)
+    status = MnemaraTUI._compute_status_text(tui)
+    assert "⚡" not in status
+
+
+# ---------------------------------------------------------------------------
+# Inbox toggle tests
+# ---------------------------------------------------------------------------
+
+def _make_toggle_tui(tmp_path: Path, *, peer_poll_enabled: bool = True) -> MagicMock:
+    """Build a TUI-like mock suitable for testing action_check_inbox toggle."""
+    from mnemara import config as config_mod
+
+    cfg = config_mod.Config.from_dict({
+        "peer_poll_enabled": peer_poll_enabled,
+        "peer_poll_interval_seconds": 30,
+        "peer_db_path": "/unused.db",
+        "peer_poll_roles": "theseus",
+        "model": "claude-sonnet-4-6",
+    })
+
+    tui = MagicMock()
+    tui.cfg = cfg
+    tui.instance = "substrate"
+    tui._busy = False
+    tui._peer_pending_rows = []
+    tui._chat.return_value = MagicMock()
+    tui._handle_user_input = AsyncMock()
+    tui._refresh_status = MagicMock()
+    tui._update_inbox_button = MagicMock()
+    tui._process_peer_messages = AsyncMock()
+    return tui
+
+
+@pytest.mark.asyncio
+async def test_inbox_toggle_flips_config_and_saves(tmp_path: Path) -> None:
+    """action_check_inbox toggles peer_poll_enabled and persists via config_mod.save."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_toggle_tui(tmp_path, peer_poll_enabled=True)
+
+    with patch.object(config_mod, "save") as mock_save:
+        # First call: ON -> OFF
+        await MnemaraTUI.action_check_inbox(tui)
+        assert tui.cfg.peer_poll_enabled is False
+        mock_save.assert_called_once_with("substrate", tui.cfg)
+
+        mock_save.reset_mock()
+
+        # Second call: OFF -> ON
+        await MnemaraTUI.action_check_inbox(tui)
+        assert tui.cfg.peer_poll_enabled is True
+        mock_save.assert_called_once_with("substrate", tui.cfg)
+
+
+@pytest.mark.asyncio
+async def test_inbox_toggle_updates_button_each_time(tmp_path: Path) -> None:
+    """action_check_inbox calls _update_inbox_button after every toggle."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_toggle_tui(tmp_path, peer_poll_enabled=False)
+
+    with patch.object(config_mod, "save"):
+        await MnemaraTUI.action_check_inbox(tui)  # OFF -> ON
+        assert tui._update_inbox_button.call_count == 1
+
+        await MnemaraTUI.action_check_inbox(tui)  # ON -> OFF
+        assert tui._update_inbox_button.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_inbox_toggle_on_drains_pending_when_idle(tmp_path: Path) -> None:
+    """Toggling ON when there are pending rows immediately drains them."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_toggle_tui(tmp_path, peer_poll_enabled=False)
+    tui._peer_pending_rows = [
+        {"row_id": 99, "sender_role": "theseus", "task_id": "t",
+         "payload": {}, "submitted_at": "2026-05-08"},
+    ]
+
+    with patch.object(config_mod, "save"):
+        # OFF -> ON: should call _process_peer_messages since idle + pending
+        await MnemaraTUI.action_check_inbox(tui)
+
+    tui._process_peer_messages.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_inbox_toggle_on_no_drain_when_busy(tmp_path: Path) -> None:
+    """Toggling ON while busy does NOT immediately drain pending rows."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_toggle_tui(tmp_path, peer_poll_enabled=False)
+    tui._busy = True
+    tui._peer_pending_rows = [
+        {"row_id": 99, "sender_role": "theseus", "task_id": "t",
+         "payload": {}, "submitted_at": "2026-05-08"},
+    ]
+
+    with patch.object(config_mod, "save"):
+        await MnemaraTUI.action_check_inbox(tui)
+
+    # Still toggled ON
+    assert tui.cfg.peer_poll_enabled is True
+    # But _process_peer_messages should NOT fire while busy
+    tui._process_peer_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_skips_when_peer_poll_disabled(tmp_path: Path) -> None:
+    """_poll_peer_messages is a complete no-op when peer_poll_enabled=False.
+
+    No SQLite read, no badge update, no LLM turn — detection is fully skipped.
+    """
     from mnemara.tui import MnemaraTUI
 
     db = _make_muninn_db(tmp_path)
-    row_id = _seed_return(
-        db,
-        agent_role="theseus",
-        task_id="research-project-alpha",
-        payload={"type": "directive", "content": "start the research project"},
-    )
+    _seed_return(db, agent_role="theseus", task_id="t1",
+                 payload={"msg": "should be ignored"})
 
-    tui = _make_tui(tmp_path, str(db))
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    # Disable polling
+    tui.cfg.peer_poll_enabled = False
+    tui._process_peer_messages = AsyncMock()
+
     await MnemaraTUI._poll_peer_messages(tui)
 
-    msg = tui._handle_user_input.call_args[0][0]
-    # Must tell the agent its row_id for acking
-    assert f"row_id={row_id}" in msg
-    # Must contain explicit ack instruction
-    assert "mcp__architect__ack_return" in msg
-    # Must contain explicit submit_return instruction with substrate identity
-    assert 'role="substrate"' in msg
-    # Must contain the topic name
-    assert "research-project-alpha" in msg
-    # Must contain the payload content
-    assert "start the research project" in msg
+    # Nothing should have been detected or processed
+    assert len(tui._peer_pending_rows) == 0
+    assert tui._peer_poll_watermark == 0  # unchanged
+    tui._process_peer_messages.assert_not_awaited()
+    tui._refresh_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Button label tests
+# ---------------------------------------------------------------------------
+
+def test_inbox_button_label_on() -> None:
+    """_inbox_button_label returns '⚡ Inbox: ON' when peer_poll_enabled=True."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = MagicMock()
+    tui.cfg = config_mod.Config.from_dict({
+        "peer_poll_enabled": True,
+        "model": "claude-sonnet-4-6",
+    })
+    label = MnemaraTUI._inbox_button_label(tui)
+    assert label == "⚡ Inbox: ON"
+
+
+def test_inbox_button_label_off() -> None:
+    """_inbox_button_label returns '📭 Inbox: OFF' when peer_poll_enabled=False."""
+    from mnemara import config as config_mod
+    from mnemara.tui import MnemaraTUI
+
+    tui = MagicMock()
+    tui.cfg = config_mod.Config.from_dict({
+        "peer_poll_enabled": False,
+        "model": "claude-sonnet-4-6",
+    })
+    label = MnemaraTUI._inbox_button_label(tui)
+    assert label == "📭 Inbox: OFF"
+
+
+def test_status_bar_shows_badge_when_off_and_pending() -> None:
+    """⚡ N badge appears even when peer_poll_enabled=False (messages accumulating)."""
+    from mnemara.tui import MnemaraTUI
+
+    tui = _make_status_tui(3)
+    # Simulate polling is OFF but messages are still pending from before the toggle
+    tui.cfg.peer_poll_enabled = False
+    status = MnemaraTUI._compute_status_text(tui)
+    assert "⚡ 3" in status
+
+
+# ---------------------------------------------------------------------------
+# Recipient-role routing filter tests (regression for 2026-05-08 cross-panel leak)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_poll_delivers_rows_addressed_to_self(tmp_path: Path) -> None:
+    """Only rows with recipient_role=<self.instance> or NULL are delivered.
+
+    Regression for 2026-05-08 observation: without the recipient_role filter,
+    every panel watching for 'substrate'-authored messages received ALL substrate
+    rows regardless of who they were addressed to (cross-panel leakage).
+    """
+    import sqlite3
+
+    db = _make_muninn_db(tmp_path)
+    # Row 1: addressed to THIS panel ('substrate') — should be delivered
+    _seed_return(db, agent_role="theseus", task_id="for-me",
+                 payload={"msg": "addressed to substrate"},
+                 recipient_role="substrate")
+    # Row 2: addressed to a different panel — should NOT be delivered
+    _seed_return(db, agent_role="theseus", task_id="not-for-me",
+                 payload={"msg": "addressed to majordomo"},
+                 recipient_role="majordomo")
+    # Row 3: broadcast (recipient_role=NULL) — should be delivered
+    _seed_return(db, agent_role="theseus", task_id="broadcast",
+                 payload={"msg": "broadcast to all"},
+                 recipient_role=None)
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui.instance = "substrate"
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Only rows 1 (targeted to substrate) and 3 (broadcast) should be in pending
+    assert len(tui._peer_pending_rows) == 2
+    task_ids = {r["task_id"] for r in tui._peer_pending_rows}
+    assert "for-me" in task_ids
+    assert "broadcast" in task_ids
+    assert "not-for-me" not in task_ids
+
+
+@pytest.mark.asyncio
+async def test_poll_skips_rows_addressed_to_other_panels(tmp_path: Path) -> None:
+    """Messages addressed to a different panel are completely invisible to this one."""
+    db = _make_muninn_db(tmp_path)
+    _seed_return(db, agent_role="theseus", task_id="for-majordomo",
+                 payload={"msg": "secret for majordomo"},
+                 recipient_role="majordomo")
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui.instance = "substrate"
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Nothing delivered — the message was not for this panel
+    assert len(tui._peer_pending_rows) == 0
+    tui._process_peer_messages.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Silent auto-ack tests (regression for 2026-05-08 usage spike from thread-close noise)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_poll_silent_types_are_auto_acked_not_queued(tmp_path: Path) -> None:
+    """Messages with silent payload types are auto-acked without queuing an LLM turn.
+
+    Regression for 2026-05-08 observation: 10+ thread-close acks ("ack_close",
+    "ack_thread_terminal", "pong_ack") fired 10+ LLM turns in 30 minutes, eating
+    the token budget.  Silent auto-ack drops them silently.
+    """
+    db = _make_muninn_db(tmp_path)
+    # Active message — should be queued for LLM
+    active_id = _seed_return(db, agent_role="theseus", task_id="real-work",
+                             payload={"type": "directive", "msg": "do something"})
+    # Silent messages — should be auto-acked, NOT queued
+    silent_id1 = _seed_return(db, agent_role="theseus", task_id="ping-test",
+                               payload={"type": "ack_close", "msg": "closing"})
+    silent_id2 = _seed_return(db, agent_role="theseus", task_id="ping-test",
+                               payload={"type": "pong_ack", "msg": "pong received"})
+    silent_id3 = _seed_return(db, agent_role="theseus", task_id="ping-test",
+                               payload={"type": "ack_thread_terminal", "msg": "done"})
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Only the active row should be in pending
+    assert len(tui._peer_pending_rows) == 1
+    assert tui._peer_pending_rows[0]["task_id"] == "real-work"
+
+    # Silent rows should have been acked (status='done') in the db
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(str(db))
+    for sid in (silent_id1, silent_id2, silent_id3):
+        row = conn.execute("SELECT status FROM returns WHERE id=?", (sid,)).fetchone()
+        assert row[0] == "done", f"row {sid} should be auto-acked, got status={row[0]}"
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_poll_all_silent_no_lm_turn(tmp_path: Path) -> None:
+    """When ALL detected rows are silent, no LLM turn fires at all."""
+    db = _make_muninn_db(tmp_path)
+    _seed_return(db, agent_role="theseus", task_id="noise",
+                 payload={"type": "ack_close"})
+    _seed_return(db, agent_role="theseus", task_id="noise2",
+                 payload={"type": "thread_close_final"})
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # No active rows, no LLM turn
+    assert len(tui._peer_pending_rows) == 0
+    tui._process_peer_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_silent_types_override_via_config(tmp_path: Path) -> None:
+    """peer_poll_silent_types config overrides the default silent set."""
+    db = _make_muninn_db(tmp_path)
+    # "ack_close" is normally silent, but we'll override to empty list
+    _seed_return(db, agent_role="theseus", task_id="noise",
+                 payload={"type": "ack_close", "msg": "would normally be silent"})
+
+    from mnemara import config as config_mod
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui.cfg.peer_poll_silent_types = []  # override: nothing is silent
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # With empty silent list, ack_close is NOT auto-acked — it goes to pending
+    assert len(tui._peer_pending_rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# New-sender delivery (recipient_role path — independent of peer_poll_roles)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_poll_delivers_targeted_message_from_unknown_sender(tmp_path: Path) -> None:
+    """A message explicitly addressed to this panel is delivered even if the
+    sender is NOT in peer_poll_roles.
+
+    Regression for 2026-05-08 Herald delivery failure: Herald is not in the
+    default peer_poll_roles list, so its messages sat pending indefinitely.
+    The fix: recipient_role=<self.instance> is an unconditional delivery path
+    that bypasses the sender allow-list entirely.
+    """
+    db = _make_muninn_db(tmp_path)
+    # Herald sends a merge confirmation — not in peer_poll_roles
+    _seed_return(db, agent_role="herald", task_id="merge-confirm",
+                 payload={"type": "confirm_request", "msg": "Ready to merge?"},
+                 recipient_role="substrate")
+
+    from mnemara import config as config_mod
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    # Explicitly exclude herald from peer_poll_roles to prove the path is sender-independent
+    tui.cfg.peer_poll_roles = "theseus,majordomo"
+    tui.instance = "substrate"
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Herald's message must be delivered despite not being in peer_poll_roles
+    assert len(tui._peer_pending_rows) == 1
+    assert tui._peer_pending_rows[0]["task_id"] == "merge-confirm"
+
+
+@pytest.mark.asyncio
+async def test_poll_does_not_deliver_unknown_sender_broadcast(tmp_path: Path) -> None:
+    """A broadcast (recipient_role=NULL) from an unknown sender is NOT delivered.
+
+    The unconditional path only applies to explicitly-addressed messages.
+    Broadcast from an unknown sender would be noise — a new role the panel
+    doesn't know about shouldn't flood everyone's inbox with its side-channel
+    traffic just because it uses broadcast addressing.
+    """
+    db = _make_muninn_db(tmp_path)
+    # Unknown sender broadcasting (recipient_role=NULL)
+    _seed_return(db, agent_role="unknown-role", task_id="unknown-broadcast",
+                 payload={"type": "ping", "msg": "broadcast from unknown"})
+
+    from mnemara import config as config_mod
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui.cfg.peer_poll_roles = "theseus,majordomo"  # unknown-role not included
+    tui.instance = "substrate"
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Broadcast from unknown sender is invisible
+    assert len(tui._peer_pending_rows) == 0
+
+
+# ---------------------------------------------------------------------------
+# v0.13.0 generalization tests (public-safe defaults, synthetic peer DB)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_peer_poll_disabled_by_default_no_sqlite_activity(tmp_path: Path) -> None:
+    """Feature stays inert with default config — no SQLite reads, no errors.
+
+    Regression: the feature must not attempt to open any database path when
+    peer_poll_enabled=False (the default).  In particular it must not try to
+    open a hard-coded internal path.
+    """
+    from mnemara import config as config_mod
+
+    cfg = config_mod.Config.from_dict({})
+    assert cfg.peer_poll_enabled is False
+    assert cfg.peer_db_path == ""
+    assert cfg.peer_poll_roles == ""
+
+    tui = MagicMock()
+    tui.cfg = cfg
+    tui.instance = "test-panel"
+    tui._busy = False
+    tui._peer_poll_watermark = 0
+    tui._peer_pending_rows = []
+    tui._peer_db_path = MagicMock(return_value="")
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # _peer_db_path must never have been called (early exit at peer_poll_enabled=False).
+    tui._peer_db_path.assert_not_called()
+    # No rows detected.
+    assert tui._peer_pending_rows == []
+
+
+@pytest.mark.asyncio
+async def test_peer_poll_works_against_synthetic_peer_db(tmp_path: Path) -> None:
+    """Feature delivers messages from a schema-compatible sqlite file in tmp_path.
+
+    This exercises the full detection path against a synthetic peer database
+    with no reference to any project-internal paths or names.  Any sqlite file
+    with the documented schema should work.
+    """
+    import sqlite3 as _sqlite3
+
+    # Build a schema-compatible synthetic peer database.
+    peer_db = tmp_path / "peer_messages.db"
+    conn = _sqlite3.connect(str(peer_db))
+    conn.execute("""
+        CREATE TABLE returns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_role TEXT,
+            recipient_role TEXT,
+            task_id TEXT,
+            payload_json TEXT,
+            status TEXT DEFAULT 'pending',
+            submitted_at TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO returns (agent_role, task_id, payload_json, status, submitted_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("panel-a", "task-1", '{"type": "greeting", "msg": "hello"}', "pending",
+         "2026-05-08T00:00:00")
+    )
+    conn.commit()
+    conn.close()
+
+    from mnemara import config as config_mod
+    cfg = config_mod.Config.from_dict({
+        "peer_poll_enabled": True,
+        "peer_db_path": str(peer_db),
+        "peer_poll_roles": "panel-a",
+    })
+
+    tui = MagicMock()
+    tui.cfg = cfg
+    tui.instance = "panel-b"
+    tui._busy = False
+    tui._peer_poll_watermark = 0
+    tui._peer_pending_rows = []
+    tui._save_peer_poll_watermark = MagicMock()
+    tui._peer_db_path = MagicMock(return_value=str(peer_db))
+    tui._chat.return_value = MagicMock()
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # One row should be detected and queued.
+    assert len(tui._peer_pending_rows) == 1
+    row = tui._peer_pending_rows[0]
+    assert row["sender_role"] == "panel-a"
+    assert row["task_id"] == "task-1"
+    assert row["payload"]["type"] == "greeting"
+    # Watermark was saved.
+    tui._save_peer_poll_watermark.assert_called_once()
