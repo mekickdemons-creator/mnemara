@@ -89,6 +89,7 @@ def _make_tui(tmp_path: Path, db_path: str, peer_roles: str = "theseus",
     tui._peer_poll_watermark = 0
     tui._peer_pending_rows = []
     tui._save_peer_poll_watermark = MagicMock()
+    tui._architect_db_path = MagicMock(return_value=db_path)
     tui._chat.return_value = MagicMock()
     tui._handle_user_input = AsyncMock()
     tui._refresh_status = MagicMock()
@@ -106,7 +107,7 @@ def test_peer_poll_config_defaults() -> None:
     assert cfg.peer_poll_enabled is False
     assert cfg.peer_poll_interval_seconds == 30   # changed from 90
     assert cfg.architect_db_path == ""
-    assert cfg.peer_poll_roles == "theseus"
+    assert cfg.peer_poll_roles == "theseus,herald"
 
 
 def test_peer_poll_config_roundtrip() -> None:
@@ -761,3 +762,148 @@ async def test_poll_skips_rows_addressed_to_other_panels(tmp_path: Path) -> None
     # Nothing delivered — the message was not for this panel
     assert len(tui._peer_pending_rows) == 0
     tui._process_peer_messages.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Silent auto-ack tests (regression for 2026-05-08 usage spike from thread-close noise)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_poll_silent_types_are_auto_acked_not_queued(tmp_path: Path) -> None:
+    """Messages with silent payload types are auto-acked without queuing an LLM turn.
+
+    Regression for 2026-05-08 observation: 10+ thread-close acks ("ack_close",
+    "ack_thread_terminal", "pong_ack") fired 10+ LLM turns in 30 minutes, eating
+    the token budget.  Silent auto-ack drops them silently.
+    """
+    db = _make_muninn_db(tmp_path)
+    # Active message — should be queued for LLM
+    active_id = _seed_return(db, agent_role="theseus", task_id="real-work",
+                             payload={"type": "directive", "msg": "do something"})
+    # Silent messages — should be auto-acked, NOT queued
+    silent_id1 = _seed_return(db, agent_role="theseus", task_id="ping-test",
+                               payload={"type": "ack_close", "msg": "closing"})
+    silent_id2 = _seed_return(db, agent_role="theseus", task_id="ping-test",
+                               payload={"type": "pong_ack", "msg": "pong received"})
+    silent_id3 = _seed_return(db, agent_role="theseus", task_id="ping-test",
+                               payload={"type": "ack_thread_terminal", "msg": "done"})
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Only the active row should be in pending
+    assert len(tui._peer_pending_rows) == 1
+    assert tui._peer_pending_rows[0]["task_id"] == "real-work"
+
+    # Silent rows should have been acked (status='done') in the db
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(str(db))
+    for sid in (silent_id1, silent_id2, silent_id3):
+        row = conn.execute("SELECT status FROM returns WHERE id=?", (sid,)).fetchone()
+        assert row[0] == "done", f"row {sid} should be auto-acked, got status={row[0]}"
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_poll_all_silent_no_lm_turn(tmp_path: Path) -> None:
+    """When ALL detected rows are silent, no LLM turn fires at all."""
+    db = _make_muninn_db(tmp_path)
+    _seed_return(db, agent_role="theseus", task_id="noise",
+                 payload={"type": "ack_close"})
+    _seed_return(db, agent_role="theseus", task_id="noise2",
+                 payload={"type": "thread_close_final"})
+
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # No active rows, no LLM turn
+    assert len(tui._peer_pending_rows) == 0
+    tui._process_peer_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_silent_types_override_via_config(tmp_path: Path) -> None:
+    """peer_poll_silent_types config overrides the default silent set."""
+    db = _make_muninn_db(tmp_path)
+    # "ack_close" is normally silent, but we'll override to empty list
+    _seed_return(db, agent_role="theseus", task_id="noise",
+                 payload={"type": "ack_close", "msg": "would normally be silent"})
+
+    from mnemara import config as config_mod
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui.cfg.peer_poll_silent_types = []  # override: nothing is silent
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # With empty silent list, ack_close is NOT auto-acked — it goes to pending
+    assert len(tui._peer_pending_rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# New-sender delivery (recipient_role path — independent of peer_poll_roles)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_poll_delivers_targeted_message_from_unknown_sender(tmp_path: Path) -> None:
+    """A message explicitly addressed to this panel is delivered even if the
+    sender is NOT in peer_poll_roles.
+
+    Regression for 2026-05-08 Herald delivery failure: Herald is not in the
+    default peer_poll_roles list, so its messages sat pending indefinitely.
+    The fix: recipient_role=<self.instance> is an unconditional delivery path
+    that bypasses the sender allow-list entirely.
+    """
+    db = _make_muninn_db(tmp_path)
+    # Herald sends a merge confirmation — not in peer_poll_roles
+    _seed_return(db, agent_role="herald", task_id="merge-confirm",
+                 payload={"type": "confirm_request", "msg": "Ready to merge?"},
+                 recipient_role="substrate")
+
+    from mnemara import config as config_mod
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    # Explicitly exclude herald from peer_poll_roles to prove the path is sender-independent
+    tui.cfg.peer_poll_roles = "theseus,majordomo"
+    tui.instance = "substrate"
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Herald's message must be delivered despite not being in peer_poll_roles
+    assert len(tui._peer_pending_rows) == 1
+    assert tui._peer_pending_rows[0]["task_id"] == "merge-confirm"
+
+
+@pytest.mark.asyncio
+async def test_poll_does_not_deliver_unknown_sender_broadcast(tmp_path: Path) -> None:
+    """A broadcast (recipient_role=NULL) from an unknown sender is NOT delivered.
+
+    The unconditional path only applies to explicitly-addressed messages.
+    Broadcast from an unknown sender would be noise — a new role the panel
+    doesn't know about shouldn't flood everyone's inbox with its side-channel
+    traffic just because it uses broadcast addressing.
+    """
+    db = _make_muninn_db(tmp_path)
+    # Unknown sender broadcasting (recipient_role=NULL)
+    _seed_return(db, agent_role="unknown-role", task_id="unknown-broadcast",
+                 payload={"type": "ping", "msg": "broadcast from unknown"})
+
+    from mnemara import config as config_mod
+    tui = _make_tui(tmp_path, str(db), busy=False)
+    tui.cfg.peer_poll_roles = "theseus,majordomo"  # unknown-role not included
+    tui.instance = "substrate"
+    tui._process_peer_messages = AsyncMock()
+
+    from mnemara.tui import MnemaraTUI
+    await MnemaraTUI._poll_peer_messages(tui)
+
+    # Broadcast from unknown sender is invisible
+    assert len(tui._peer_pending_rows) == 0

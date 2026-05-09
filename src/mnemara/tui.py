@@ -589,6 +589,14 @@ class MnemaraTUI(App):  # type: ignore[misc]
     _CONTEXT_WARN_RATIO = 0.80        # trigger auto-evict when >= 80% of max_window_tokens
     _CONTEXT_AUTO_EVICT_TARGET = 0.60  # trim to 60% on startup auto-evict
 
+    # Peer messages whose payload.type matches these strings are auto-acked
+    # silently — no LLM turn, just a debug.log entry.  Covers protocol-close
+    # noise (ack, thread-close, pong_ack, etc.).  Overridable via config.
+    _DEFAULT_SILENT_PEER_TYPES: frozenset[str] = frozenset({
+        "ack", "ack_close", "ack_close_final", "ack_thread_terminal",
+        "ack_close_2", "pong_ack", "thread_close", "thread_close_final",
+    })
+
     def _warn_if_context_near_limit(self) -> None:
         """Auto-evict on startup if the rolling window is already near capacity.
 
@@ -652,6 +660,12 @@ class MnemaraTUI(App):  # type: ignore[misc]
     def _watermark_path(self) -> Path:
         return Path.home() / ".mnemara" / self.instance / "peer_poll_watermark"
 
+    def _architect_db_path(self) -> str:
+        """Return the resolved path to muninn.db (config override or default)."""
+        return self.cfg.architect_db_path or str(
+            Path.home() / "workspace" / "architect" / "muninn.db"
+        )
+
     def _load_peer_poll_watermark(self) -> None:
         """Load the persisted high-watermark from disk.
 
@@ -672,9 +686,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 pass  # corrupted — re-initialize below
 
         # No watermark file: bootstrap to current max row_id so backlog is skipped.
-        db_path = self.cfg.architect_db_path or str(
-            Path.home() / "workspace" / "architect" / "muninn.db"
-        )
+        db_path = self._architect_db_path()
         try:
             conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             try:
@@ -718,9 +730,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
 
         import sqlite3 as _sqlite3
 
-        db_path = self.cfg.architect_db_path or str(
-            Path.home() / "workspace" / "architect" / "muninn.db"
-        )
+        db_path = self._architect_db_path()
         peer_roles = [
             r.strip()
             for r in self.cfg.peer_poll_roles.split(",")
@@ -740,19 +750,25 @@ class MnemaraTUI(App):  # type: ignore[misc]
             # Only fetch rows ABOVE the persisted watermark — prevents backlog re-delivery
             # on every restart.  The watermark is advanced + saved after each detection
             # batch so future polls and restarts see only genuinely new messages.
-            # recipient_role filter: deliver rows addressed to THIS panel OR broadcast
-            # (recipient_role IS NULL).  Without this, every panel watching for
-            # "substrate"-authored messages would receive ALL substrate rows regardless
-            # of who they were addressed to — cross-panel leakage confirmed by
-            # cognition-researcher in the 2026-05-08 round-trip test (row 582).
+            #
+            # Two delivery paths (OR-joined):
+            #   1. Sender is in peer_poll_roles AND row is addressed to us or broadcast.
+            #      This is the normal panel-to-panel path (Theseus, Majordomo, etc.).
+            #   2. Row is explicitly addressed to this panel (recipient_role = self.instance)
+            #      regardless of who sent it.
+            #      This is the "new sender" path — Herald, ephemeral agents, or any future
+            #      role not yet in peer_poll_roles can reach a panel without a config update.
+            #      recipient_role-targeted delivery is always intentional, so sender-list
+            #      gating would only create false negatives.
             cur = conn.execute(
                 f"SELECT id, agent_role, task_id, payload_json, submitted_at "
                 f"FROM returns "
-                f"WHERE status='pending' AND agent_role IN ({placeholders}) "
-                f"AND id > ? "
-                f"AND (recipient_role IS NULL OR recipient_role = ?) "
+                f"WHERE status='pending' AND id > ? AND ("
+                f"  (agent_role IN ({placeholders}) AND (recipient_role IS NULL OR recipient_role = ?))"
+                f"  OR recipient_role = ?"
+                f") "
                 f"ORDER BY id ASC LIMIT 20",
-                peer_roles + [self._peer_poll_watermark, self.instance],
+                [self._peer_poll_watermark] + peer_roles + [self.instance, self.instance],
             )
             for row_id, sender_role, task_id, payload_json, submitted_at in cur.fetchall():
                 try:
@@ -782,15 +798,47 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 self._peer_poll_watermark = max_id
                 self._save_peer_poll_watermark()
 
-            self._peer_pending_rows.extend(new_rows)
+            # Split into silent (auto-ack, no LLM) vs active (needs LLM turn).
+            # Silent types: ack, thread-close, pong_ack, etc. — protocol noise
+            # that doesn't need the agent's attention.  We ack them here, log
+            # them, and skip them.  Active rows go to _peer_pending_rows as before.
+            _default_silent = MnemaraTUI._DEFAULT_SILENT_PEER_TYPES
+            silent_types: frozenset[str] = (
+                frozenset(self.cfg.peer_poll_silent_types)
+                if self.cfg.peer_poll_silent_types is not None
+                else _default_silent
+            )
+            active_rows: list[dict] = []
             for r in new_rows:
-                log("peer_ping_detected",
-                    sender=r["sender_role"], row_id=r["row_id"], topic=r["task_id"])
+                msg_type = r["payload"].get("type", "")
+                if msg_type in silent_types:
+                    # Auto-ack silently: use the architect MCP tool via the agent
+                    # is not available here (we're in a sync SQLite poll), so
+                    # we mark the row done directly in muninn.db.
+                    try:
+                        ack_conn = _sqlite3.connect(self._architect_db_path())
+                        ack_conn.execute(
+                            "UPDATE returns SET status='done' WHERE id=?",
+                            (r["row_id"],)
+                        )
+                        ack_conn.commit()
+                        ack_conn.close()
+                    except Exception:
+                        pass
+                    log("peer_silent_ack",
+                        sender=r["sender_role"], row_id=r["row_id"],
+                        msg_type=msg_type, topic=r["task_id"])
+                else:
+                    active_rows.append(r)
+                    log("peer_ping_detected",
+                        sender=r["sender_role"], row_id=r["row_id"], topic=r["task_id"])
+
+            self._peer_pending_rows.extend(active_rows)
             # Show ⚡ badge in status bar immediately (no LLM cost).
             self._refresh_status()
-            # If idle right now, process immediately; otherwise let the
-            # _send_turn finally block drain them after the current turn ends.
-            if not self._busy:
+            # If there are active rows and we're idle, process now; otherwise
+            # the _send_turn finally block drains them after the current turn ends.
+            if active_rows and not self._busy:
                 await self._process_peer_messages()
 
     async def _process_peer_messages(self) -> None:

@@ -231,7 +231,7 @@ class Config:
     peer_poll_enabled: bool = False
     peer_poll_interval_seconds: int = 30
     architect_db_path: str = ""
-    peer_poll_roles: str = "theseus"
+    peer_poll_roles: str = "theseus,herald"
     # peer_poll_batch: when True (default), all pending rows are processed in
     # a single LLM turn — N messages = 1 API call.  Set to False for
     # turn-by-turn mode: one row per LLM turn, with automatic chaining via
@@ -239,6 +239,11 @@ class Config:
     # payloads or when running a small/local model that can't handle a
     # multi-message batch reliably.
     peer_poll_batch: bool = True
+    # peer_poll_silent_types: payload.type values that auto-ack WITHOUT an LLM
+    # turn.  Covers the common protocol-close noise.  The panel acks the row,
+    # logs to debug.log, and skips the LLM entirely.  Set to [] to always fire
+    # LLM turns.  None/omitted = use DEFAULT_SILENT_TYPES at runtime.
+    peer_poll_silent_types: list = None  # None → DEFAULT_SILENT_TYPES in tui.py
 
     @classmethod
     def default(cls) -> "Config":
@@ -331,8 +336,9 @@ class Config:
             peer_poll_enabled=bool(d.get("peer_poll_enabled", False)),
             peer_poll_interval_seconds=int(d.get("peer_poll_interval_seconds", 30)),
             architect_db_path=str(d.get("architect_db_path", "")),
-            peer_poll_roles=str(d.get("peer_poll_roles", "theseus")),
+            peer_poll_roles=str(d.get("peer_poll_roles", "theseus,herald")),
             peer_poll_batch=bool(d.get("peer_poll_batch", True)),
+            peer_poll_silent_types=d.get("peer_poll_silent_types", None),
         )
 
     def policy_for(self, tool: str) -> ToolPolicy:
