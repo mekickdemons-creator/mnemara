@@ -491,6 +491,39 @@ class Store:
             self._bump_eviction_stats(rows=n)
         return n
 
+    def evict_by_role(self, role: str, *, skip_pinned: bool = True) -> int:
+        """Delete ALL rows with a given role ('user' or 'assistant').
+
+        Useful for bulk-clearing user prompts while keeping assistant responses
+        (or vice-versa). Pinned rows are skipped by default.
+
+        Returns count of rows actually deleted.
+        """
+        role = role.lower()
+        if role not in ("user", "assistant"):
+            raise ValueError(f"role must be 'user' or 'assistant', got {role!r}")
+        if skip_pinned:
+            cur = self.conn.execute(
+                "SELECT id FROM turns WHERE role = ? AND pin_label IS NULL",
+                (role,),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT id FROM turns WHERE role = ?", (role,)
+            )
+        ids = [r[0] for r in cur.fetchall()]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(
+            f"DELETE FROM turns WHERE id IN ({placeholders})", ids
+        )
+        self.conn.commit()
+        n = len(ids)
+        if n:
+            self._bump_eviction_stats(rows=n)
+        return n
+
     def evict_ids(self, ids: list[int]) -> int:
         """Delete specific row ids. Returns count actually deleted.
 

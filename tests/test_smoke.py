@@ -2017,6 +2017,104 @@ def test_slash_evict_n_drops_oldest_not_newest(home):
     _asyncio.run(_run())
 
 
+def test_store_evict_by_role_user(home):
+    """evict_by_role('user') removes all user rows, leaving assistant rows."""
+    from mnemara.store import Store
+
+    store = Store("evict_role_user_t")
+    store.append_turn("user", [{"type": "text", "text": "q1"}])
+    store.append_turn("assistant", [{"type": "text", "text": "a1"}])
+    store.append_turn("user", [{"type": "text", "text": "q2"}])
+    store.append_turn("assistant", [{"type": "text", "text": "a2"}])
+    assert len(store.window()) == 4
+
+    deleted = store.evict_by_role("user")
+    assert deleted == 2
+    rows = store.window()
+    assert len(rows) == 2
+    roles = [r["role"] for r in rows]
+    assert roles == ["assistant", "assistant"], f"Only assistant rows should survive, got {roles}"
+    texts = [r["content"][0]["text"] for r in rows]
+    assert "a1" in texts and "a2" in texts
+    store.close()
+
+
+def test_store_evict_by_role_assistant(home):
+    """evict_by_role('assistant') removes all assistant rows, leaving user rows."""
+    from mnemara.store import Store
+
+    store = Store("evict_role_asst_t")
+    store.append_turn("user", [{"type": "text", "text": "q1"}])
+    store.append_turn("assistant", [{"type": "text", "text": "a1"}])
+    store.append_turn("user", [{"type": "text", "text": "q2"}])
+    assert len(store.window()) == 3
+
+    deleted = store.evict_by_role("assistant")
+    assert deleted == 1
+    rows = store.window()
+    assert len(rows) == 2
+    assert all(r["role"] == "user" for r in rows)
+    store.close()
+
+
+def test_store_evict_by_role_skips_pinned(home):
+    """evict_by_role respects skip_pinned=True by default."""
+    from mnemara.store import Store
+
+    store = Store("evict_role_pin_t")
+    store.append_turn("user", [{"type": "text", "text": "keep me"}])
+    row_id = store.window()[0]["id"]
+    store.pin_row(row_id, "important")
+
+    store.append_turn("user", [{"type": "text", "text": "drop me"}])
+
+    deleted = store.evict_by_role("user")
+    assert deleted == 1  # only the unpinned row
+    rows = store.window()
+    assert len(rows) == 1
+    assert rows[0]["content"][0]["text"] == "keep me"
+    store.close()
+
+
+def test_store_evict_by_role_invalid(home):
+    """evict_by_role raises ValueError for unsupported roles."""
+    from mnemara.store import Store
+    import pytest
+
+    store = Store("evict_role_invalid_t")
+    with pytest.raises(ValueError, match="role must be"):
+        store.evict_by_role("system")
+    store.close()
+
+
+def test_slash_evict_user_removes_user_turns(home):
+    """/evict user drops all user-turn rows via the TUI slash command."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("evict_user_slash_t")
+    app = tui_mod.MnemaraTUI("evict_user_slash_t")
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            app.store.append_turn("user", [{"type": "text", "text": "user q1"}])
+            app.store.append_turn("assistant", [{"type": "text", "text": "asst a1"}])
+            app.store.append_turn("user", [{"type": "text", "text": "user q2"}])
+            assert len(app.store.window()) == 3
+
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/evict user")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+            rows = app.store.window()
+            assert len(rows) == 1, f"Expected 1 row (assistant only), got {len(rows)}"
+            assert rows[0]["role"] == "assistant"
+
+    _asyncio.run(_run())
+
+
 def test_store_evict_ids_targets_specific_rows(home):
     """Store.evict_ids deletes only the requested ids; unknown ids ignored."""
     from mnemara.store import Store

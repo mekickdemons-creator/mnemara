@@ -1910,13 +1910,15 @@ class MnemaraTUI(App):  # type: ignore[misc]
         self._refresh_status()
 
     def _slash_evict(self, arg: str, chat: "RichLog") -> None:
-        """/evict [tools|thinking|N|last N] — free context budget.
+        """/evict [tools|thinking|user|assistant|N|last N] — free context budget.
 
-        /evict tools    — strip tool_use blocks from all stored rows
-        /evict thinking — strip thinking blocks from all stored rows
-        /evict N        — drop the N oldest rows (budget reclaim, keeps recent context)
-        /evict last N   — drop the N most-recent rows (rollback a bad paste/turn)
-        /evict          — show eviction stats
+        /evict tools      — strip tool_use blocks from all stored rows
+        /evict thinking   — strip thinking blocks from all stored rows
+        /evict user       — drop all user-turn rows (keeps assistant responses)
+        /evict assistant  — drop all assistant-turn rows (keeps user inputs)
+        /evict N          — drop the N oldest rows (budget reclaim, keeps recent context)
+        /evict last N     — drop the N most-recent rows (rollback a bad paste/turn)
+        /evict            — show eviction stats
         """
         arg = arg.strip().lower()
         ev = self.store.get_eviction_stats()
@@ -1937,6 +1939,10 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 result = self.store.evict_thinking_blocks(all_rows=True)
                 freed = result.get("blocks_evicted", result.get("rows_modified", 0))
                 chat.write(f"[green]/evict thinking:[/green] {freed} thinking block(s) stripped")
+            elif arg in ("user", "assistant"):
+                dropped = self.store.evict_by_role(arg)
+                label = "user input(s)" if arg == "user" else "assistant response(s)"
+                chat.write(f"[green]/evict {arg}:[/green] {dropped} {label} evicted")
             elif arg.isdigit():
                 n = int(arg)
                 dropped = self.store.evict_oldest(n)
@@ -1946,7 +1952,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
                 dropped = self.store.evict_last(n)
                 chat.write(f"[green]/evict last {n}:[/green] {dropped} most-recent row(s) evicted")
             else:
-                chat.write("[dim]/evict [tools|thinking|N|last N] — see /help[/dim]")
+                chat.write("[dim]/evict [tools|thinking|user|assistant|N|last N] — see /help[/dim]")
                 return
         except Exception as exc:
             chat.write(f"[red]evict error: {exc}[/red]")
@@ -2000,6 +2006,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict                  — show eviction stats",
             "  /evict tools            — strip tool_use blocks",
             "  /evict thinking         — strip thinking blocks",
+            "  /evict user             — drop all user turns (keep assistant responses)",
+            "  /evict assistant        — drop all assistant turns (keep user inputs)",
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
             "  /compress reads         — stub repeated Read results with diffs",
