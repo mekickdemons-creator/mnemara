@@ -363,11 +363,17 @@ TUI-specific feature.
 /role <path>         (REPL) swap role doc (also persists to config)
 /role_doc            (TUI) open the role-doc editor modal — edit live; Ctrl+S
                      saves; changes take effect on the next turn (the role doc
-                     is re-read on every API call)
+                     is re-read on every API call). Modal exposes
+                     [📋 Paste] / [⎘ Copy] buttons (raw terminal paste keys
+                     can be intercepted by the OS terminal before reaching
+                     Textual's modal focus — the buttons go through pyperclip
+                     directly and are reliable across terminals).
 /context             (TUI) open the context viewer — tabbed breakdown of where
                      input tokens are going (tool schemas, role doc, manifest,
                      pinned rows, working window) with browse / evict / pin
-                     actions and role filtering
+                     actions and role filtering. Detail panel is editable;
+                     [💾 Save edit] writes the change back to the row in
+                     place. [📋 Paste] / [⎘ Copy] available too.
 /show                (REPL) print the rolling window
 /clear               comprehensive wipe — strips tool_use blocks, thinking
                      blocks, and user/assistant turns; pinned rows preserved;
@@ -496,6 +502,56 @@ Format: append-only Markdown, one block per note:
 
 Worth remembering across sessions.
 ```
+
+## Named slots — persistent state primitive
+
+Some state is neither a memory note (write-once, append-only) nor a turn
+in the rolling window (FIFO-evicted as the conversation grows). It's a
+single value that *changes in place* — current health, current location,
+current mood, the latest reading from a sensor, the value of a counter
+that ticks every frame.
+
+Mnemara exposes a `upsert_slot` MCP tool for exactly that:
+
+```
+upsert_slot(label, role, content) -> row_id
+```
+
+- If a row with `pin_label == label` already exists, the row is **updated
+  in place** — same `row_id`, content replaced, timestamp refreshed.
+- If no such row exists, a new pinned row is **inserted**.
+
+Slot rows are pinned. They never get FIFO-evicted from the rolling window,
+no matter how long the session runs. The context viewer shows them with a
+`📌 [slot: <label>]` badge so you can see the current state of the world
+at a glance.
+
+**Why this matters:** without `upsert_slot`, an agent with mutable state
+(a game character with HP, a robot reporting battery level, a panel
+tracking the latest deploy status) has two bad options. Either it
+`append_turn` every tick — and the rolling window fills up with stale
+state-snapshots — or it relies on memory files, which require an extra
+read step and aren't always in context. Slots solve both: in context every
+turn, mutable in place, never bloating the window.
+
+**Aethon-style example.** A character has health, stamina, and hunger.
+Each combat tick, the simulator updates the slots:
+
+```
+upsert_slot("health",   "system", "HP: 73 / 100")
+upsert_slot("stamina",  "system", "stamina: 41 / 100")
+upsert_slot("hunger",   "system", "hunger: 62 / 100  (eat soon)")
+```
+
+The character's panel sees current values at slot 0..N every turn. No
+state-resolution math, no ECS, no separate game-state DB read into
+context — the context *is* the state. Tick the slot, the next agent turn
+reads the new value.
+
+Combine with role-doc swap for state that changes the agent's *identity*
+rather than its inventory: pointing `role_doc_path` at `drunk.md` for the
+duration of an inebriation status doesn't add a debuff, it makes the
+agent run as a drunk person until the condition lifts.
 
 ## Context budget — agent-side eviction tools
 
