@@ -641,7 +641,8 @@ class RoleDocEditorModal(ModalScreen):  # type: ignore[misc]
         short_path = self._role_doc_path or "(no role doc configured)"
         with Vertical(id="role-editor-dialog"):
             yield Static(
-                f"[bold]Role doc editor[/bold] — [dim]{short_path}[/dim]",
+                f"[bold]Role doc editor[/bold] — [dim]{short_path}[/dim]  "
+                "[dim]⌃C copy · ⌃X cut · ⌃V paste[/dim]",
                 id="role-editor-title",
             )
             yield TextArea(
@@ -658,6 +659,44 @@ class RoleDocEditorModal(ModalScreen):  # type: ignore[misc]
 
     def on_mount(self) -> None:
         self.query_one("#role-editor-ta", TextArea).focus()
+
+    async def _on_key(self, event: "Key") -> None:  # type: ignore[name-defined]
+        """Intercept clipboard keys before app-level priority bindings fire.
+
+        The app has priority=True on ctrl+c (quit) and ctrl+v (paste via
+        pyperclip).  Inside the role doc editor those keys must behave as
+        clipboard operations within the TextArea instead.
+        """
+        ta = self.query_one("#role-editor-ta", TextArea)
+        if event.key == "ctrl+c":
+            event.prevent_default()
+            event.stop()
+            try:
+                import pyperclip  # type: ignore[import]
+                if ta.selected_text:
+                    pyperclip.copy(ta.selected_text)
+            except Exception:
+                pass
+        elif event.key == "ctrl+x":
+            event.prevent_default()
+            event.stop()
+            try:
+                import pyperclip  # type: ignore[import]
+                if ta.selected_text:
+                    pyperclip.copy(ta.selected_text)
+                    ta.insert("")  # replaces selection with empty → cut
+            except Exception:
+                pass
+        elif event.key == "ctrl+v":
+            event.prevent_default()
+            event.stop()
+            try:
+                import pyperclip  # type: ignore[import]
+                text = pyperclip.paste()
+                if text:
+                    ta.insert(text)
+            except Exception:
+                pass
 
     def on_button_pressed(self, event: "Button.Pressed") -> None:
         if event.button.id == "btn-role-save":
@@ -748,6 +787,24 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
     def on_mount(self) -> None:
         self._rebuild_list()
         self.query_one("#ctx-list", ListView).focus()
+
+    async def _on_key(self, event: "Key") -> None:  # type: ignore[name-defined]
+        """Intercept ctrl+c to copy selected text from the detail panel.
+
+        The app-level ctrl+c binding has priority=True and would trigger quit.
+        In the context viewer ctrl+c should copy whatever text is selected in
+        the read-only detail TextArea instead.
+        """
+        if event.key == "ctrl+c":
+            event.prevent_default()
+            event.stop()
+            try:
+                import pyperclip  # type: ignore[import]
+                ta = self.query_one("#ctx-detail-ta", TextArea)
+                if ta.selected_text:
+                    pyperclip.copy(ta.selected_text)
+            except Exception:
+                pass
 
     # ---------------------------------------------------------------- list helpers
 
