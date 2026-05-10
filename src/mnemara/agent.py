@@ -111,6 +111,7 @@ _UNPIN_ROW_TOOL = "mcp__mnemara_memory__unpin_row"
 _LIST_PINNED_TOOL = "mcp__mnemara_memory__list_pinned"
 _READ_SKELETON_TOOL = "mcp__mnemara_memory__read_skeleton"
 _LIST_WINDOW_TOOL = "mcp__mnemara_memory__list_window"
+_UPSERT_SLOT_TOOL = "mcp__mnemara_memory__upsert_slot"
 
 
 # Hard context ceilings per model family — the API's absolute token limit.
@@ -1647,6 +1648,27 @@ class AgentSession:
                 "content": [{"type": "text", "text": json.dumps(result)}]
             }
 
+        @tool(
+            "upsert_slot",
+            "Insert or overwrite a named persistent slot in the rolling window. "
+            "If a turn with pin_label == label already exists its content is "
+            "replaced in place; otherwise a new pinned turn is created. "
+            "Use this for live game-state slots (health, hunger, location, etc.) "
+            "so repeated updates don't append new rows.",
+            {"label": str, "role": str, "content": str},
+        )
+        async def _upsert_slot_tool(args: dict[str, Any]) -> dict[str, Any]:
+            label = (args.get("label") or "").strip()
+            if not label:
+                return {"content": [{"type": "text", "text": '{"ok": false, "error": "label is required"}'}]}
+            role_val = (args.get("role") or "user").strip()
+            content_val = str(args.get("content") or "")
+            try:
+                row_id = session.store.upsert_slot(label, role_val, content_val)
+                return {"content": [{"type": "text", "text": json.dumps({"ok": True, "row_id": row_id, "label": label})}]}
+            except Exception as exc:
+                return {"content": [{"type": "text", "text": json.dumps({"ok": False, "error": str(exc)})}]}
+
         registered = [
             _write_memory_tool,
             _inspect_context_tool,
@@ -1676,6 +1698,7 @@ class AgentSession:
             _list_pinned_tool,
             _evict_older_than_tool,
             _list_window_tool,
+            _upsert_slot_tool,
         ]
         if getattr(self.cfg, "read_skeleton_enabled", False):
             registered.append(_read_skeleton_tool)
@@ -1727,6 +1750,7 @@ class AgentSession:
             _UNPIN_ROW_TOOL,
             _LIST_PINNED_TOOL,
             _LIST_WINDOW_TOOL,
+            _UPSERT_SLOT_TOOL,
         ]
         if getattr(self.cfg, "read_skeleton_enabled", False):
             allowed_tools.append(_READ_SKELETON_TOOL)
@@ -2120,6 +2144,8 @@ def _map_tool_target(tool_name: str, tool_input: dict[str, Any]) -> tuple[str | 
         return "ListPinned", ""
     if tool_name == _LIST_WINDOW_TOOL or tool_name.endswith("__list_window"):
         return "ListWindow", ""
+    if tool_name == _UPSERT_SLOT_TOOL or tool_name.endswith("__upsert_slot"):
+        return "UpsertSlot", str(tool_input.get("label") or "")
     if tool_name == _READ_SKELETON_TOOL or tool_name.endswith("__read_skeleton"):
         return "Read", str(tool_input.get("file_path") or "")
     return None, ""
