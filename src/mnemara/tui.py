@@ -453,6 +453,23 @@ ContextViewerModal {
 #btn-context:focus {
     border: tall #6fad6f;
 }
+
+#btn-compress {
+    background: #2a1f35;
+    color: #a080d0;
+    border: tall #5a3a80;
+    min-width: 14;
+    margin-left: 1;
+}
+
+#btn-compress:hover {
+    background: #3a2a4a;
+    color: #c0a0f0;
+}
+
+#btn-compress:focus {
+    border: tall #a080d0;
+}
 """
 
 # ---------------------------------------------------------------------------
@@ -1150,6 +1167,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             yield Button(self._inbox_button_label(), id="btn-inbox")
             yield Button("📄 Role", id="btn-role")
             yield Button("💬 Context", id="btn-context")
+            yield Button("🗜 Compress", id="btn-compress")
             yield Button("Quit  ⌃C", id="btn-quit")
         yield Footer()
 
@@ -1707,7 +1725,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
         ta.focus()
 
     async def on_button_pressed(self, event: "Button.Pressed") -> None:
-        """Handle Send, Inbox, Role, Context, and Quit button clicks."""
+        """Handle Send, Inbox, Role, Context, Compress, and Quit button clicks."""
         if event.button.id == "btn-send":
             await self.action_submit_prompt()
         elif event.button.id == "btn-inbox":
@@ -1716,6 +1734,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             await self.action_open_role_editor()
         elif event.button.id == "btn-context":
             await self.action_open_context_viewer()
+        elif event.button.id == "btn-compress":
+            self._compress_to_tokens(target_tokens=None, chat=self._chat())
         elif event.button.id == "btn-quit":
             await self.action_quit()
 
@@ -1947,8 +1967,23 @@ class MnemaraTUI(App):  # type: ignore[misc]
             self._slash_help(chat)
             return
 
-        if line.strip() == "/compress reads":
-            self._slash_compress_reads(chat)
+        if cmd == "/compress":
+            stripped_arg = arg.strip().lower()
+            if stripped_arg == "reads":
+                self._slash_compress_reads(chat)
+            else:
+                # /compress <N>  or  /compress (bare = 25% default)
+                target: int | None = None
+                if stripped_arg:
+                    try:
+                        target = _parse_size(stripped_arg)
+                    except ValueError:
+                        chat.write(
+                            "[dim]usage: /compress [reads | <token-count>] "
+                            "— e.g. /compress 20000 or /compress 500k[/dim]"
+                        )
+                        return
+                self._compress_to_tokens(target_tokens=target, chat=chat)
             return
 
         if cmd == "/skeleton":
@@ -2153,6 +2188,70 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write(f"[red]compress reads error: {exc}[/red]")
         self._refresh_status()
 
+    # Compression to a token target — used by /compress <N> and 🗜 Compress button
+    _COMPRESS_DEFAULT_RATIO = 0.25  # button: compress to 25% of current tokens
+
+    def _compress_to_tokens(
+        self, target_tokens: int | None, chat: "RichLog"
+    ) -> None:
+        """Compress the rolling window to target_tokens, skipping pinned turns.
+
+        Pass target_tokens=None to compress to 25% of the current estimated
+        token count (the default used by the 🗜 Compress button).
+
+        Three-pass strategy (same order every time):
+          1. evict_thinking_blocks    — strip thinking blocks (all rows, skip pinned)
+          2. evict_write_pairs        — stub Edit/Write/Read body content (skip pinned)
+          3. evict_tool_use_blocks    — strip full tool_use blocks (skip pinned)
+          4. Bulk-evict oldest rows   — FIFO until total_tokens() <= target
+
+        Pinned turns and role docs are never touched.
+        Reports what each pass freed, then the final token count.
+        """
+        try:
+            before, _ = self.store.total_tokens()
+            if target_tokens is None:
+                target_tokens = max(0, int(before * self._COMPRESS_DEFAULT_RATIO))
+
+            think_result = self.store.evict_thinking_blocks(
+                all_rows=True, skip_pinned=True
+            )
+            think_freed = think_result.get("blocks_evicted", 0)
+
+            write_result = self.store.evict_write_pairs(skip_pinned=True)
+            write_freed = write_result.get("blocks_evicted", write_result.get("rows_modified", 0))
+
+            tool_result = self.store.evict_tool_use_blocks(
+                all_rows=True, skip_pinned=True
+            )
+            tool_freed = tool_result.get("blocks_evicted", 0)
+
+            # FIFO evict oldest rows until at or below target
+            rows_dropped = 0
+            current, _ = self.store.total_tokens()
+            while current > target_tokens:
+                dropped = self.store.evict_oldest(10, skip_pinned=True)
+                if dropped == 0:
+                    break  # nothing left to evict (all pinned or empty)
+                rows_dropped += dropped
+                current, _ = self.store.total_tokens()
+
+            after, _ = self.store.total_tokens()
+            freed = max(0, before - after)
+
+            chat.write(
+                f"[green]compress:[/green] "
+                f"{think_freed} thinking block(s), "
+                f"{write_freed} write pair(s), "
+                f"{tool_freed} tool block(s) stripped; "
+                f"{rows_dropped} oldest row(s) evicted — "
+                f"~{freed:,} tokens freed "
+                f"(~{before:,} → ~{after:,})"
+            )
+        except Exception as exc:
+            chat.write(f"[red]compress error: {exc}[/red]")
+        self._refresh_status()
+
     async def _slash_skeleton(self, arg: str) -> None:
         """/skeleton <path> — display Python skeleton (signatures + docstrings only)."""
         chat = self.query_one("#chatlog", RichLog)
@@ -2193,6 +2292,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /evict assistant        — drop all assistant turns (keep user inputs)",
             "  /evict N                — drop N oldest rows (budget reclaim)",
             "  /evict last N           — drop N most-recent rows (rollback)",
+            "  /compress               — compress to 25% of current tokens (strips thinking/tools/write pairs, evicts oldest)",
+            "  /compress <N>           — compress to N tokens (e.g. /compress 20000 or /compress 500k)",
             "  /compress reads         — stub repeated Read results with diffs",
             "  /skeleton <path>        — show Python skeleton (signatures/docstrings only)",
             "  /inbox                  — toggle peer message delivery on/off",
