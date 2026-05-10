@@ -1971,6 +1971,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
             stripped_arg = arg.strip().lower()
             if stripped_arg == "reads":
                 self._slash_compress_reads(chat)
+            elif stripped_arg == "smart":
+                await self._slash_compress_smart(chat)
             else:
                 # /compress <N>  or  /compress (bare = 25% default)
                 target: int | None = None
@@ -1979,8 +1981,8 @@ class MnemaraTUI(App):  # type: ignore[misc]
                         target = _parse_size(stripped_arg)
                     except ValueError:
                         chat.write(
-                            "[dim]usage: /compress [reads | <token-count>] "
-                            "— e.g. /compress 20000 or /compress 500k[/dim]"
+                            "[dim]usage: /compress [reads | smart | <token-count>] "
+                            "— e.g. /compress 20000 or /compress 500k or /compress smart[/dim]"
                         )
                         return
                 self._compress_to_tokens(target_tokens=target, chat=chat)
@@ -2188,6 +2190,41 @@ class MnemaraTUI(App):  # type: ignore[misc]
             chat.write(f"[red]compress reads error: {exc}[/red]")
         self._refresh_status()
 
+    async def _slash_compress_smart(self, chat: "RichLog") -> None:
+        """/compress smart — fire a judgment-driven audit turn.
+
+        Injects a structured audit prompt as a real user turn so the agent
+        reviews its own rolling window, decides what is stale or redundant,
+        and calls evict_ids / evict_thinking_blocks / evict_write_pairs with
+        deliberate intent.  Unlike /compress <N> (mechanical FIFO), this path
+        lets the agent weigh content before evicting.
+
+        Posts a brief notice to chat, then hands off to _handle_user_input so
+        the full turn lifecycle (streaming, tool-use display, status bar update)
+        runs as normal.  The agent's reply is the compression report.
+        """
+        chat.write(
+            "[dim]🧠 compress smart: injecting audit turn — "
+            "agent will review context and evict by judgment…[/dim]"
+        )
+        _SMART_COMPRESS_PROMPT = (
+            "Please audit your rolling window and compress it using your own judgment. "
+            "Steps:\n"
+            "1. Call list_window() to read summaries of all current turns.\n"
+            "2. Identify which turns are stale or low-value: resolved feature threads "
+            "where work is committed, superseded information, trivial one-liners, "
+            "duplicate summaries, and old coordination acks.\n"
+            "3. Call evict_thinking_blocks(all_rows=True, skip_pinned=True) and "
+            "evict_write_pairs(skip_pinned=True) to strip bulk content first.\n"
+            "4. Call evict_ids() on the rows you have judged as removable. "
+            "Prefer evicting oldest resolved threads over recent active context.\n"
+            "5. Never evict pinned rows (pin_label is set) or the role doc.\n"
+            "6. After evicting, report: how many rows were removed, estimated tokens "
+            "freed (before vs after), and a brief note on what categories you dropped "
+            "and what you kept. One concise paragraph is enough."
+        )
+        await self._handle_user_input(_SMART_COMPRESS_PROMPT)
+
     # Compression to a token target — used by /compress <N> and 🗜 Compress button
     _COMPRESS_DEFAULT_RATIO = 0.25  # button: compress to 25% of current tokens
 
@@ -2295,6 +2332,7 @@ class MnemaraTUI(App):  # type: ignore[misc]
             "  /compress               — compress to 25% of current tokens (strips thinking/tools/write pairs, evicts oldest)",
             "  /compress <N>           — compress to N tokens (e.g. /compress 20000 or /compress 500k)",
             "  /compress reads         — stub repeated Read results with diffs",
+            "  /compress smart         — agent reviews context and evicts by judgment",
             "  /skeleton <path>        — show Python skeleton (signatures/docstrings only)",
             "  /inbox                  — toggle peer message delivery on/off",
             "  /role_doc               — open role doc editor (📄 Role button)",

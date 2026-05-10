@@ -6173,3 +6173,75 @@ def test_compress_slash_command_token_target(home):
     _asyncio.run(_run())
     app.store.close()
 
+
+def test_compress_smart_injects_turn(home):
+    """/compress smart injects an audit prompt as a real user turn.
+
+    Verifies the prompt contains the key audit instructions (list_window,
+    evict_ids, pinned) so the agent knows what tools to call and what to skip.
+    """
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("compress_smart_t")
+    app = tui_mod.MnemaraTUI("compress_smart_t")
+
+    captured_inputs: list[str] = []
+
+    async def _patched_handle(text: str) -> None:
+        captured_inputs.append(text)
+        # Don't actually fire a real agent turn in tests
+
+    app._handle_user_input = _patched_handle
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)):
+            await app._slash_compress_smart(app._chat())
+
+    _asyncio.run(_run())
+    app.store.close()
+
+    # Should have injected exactly one audit prompt
+    assert len(captured_inputs) == 1
+    prompt = captured_inputs[0]
+    assert "list_window" in prompt
+    assert "evict_ids" in prompt
+    assert "pinned" in prompt
+    assert "evict_thinking_blocks" in prompt
+
+
+def test_compress_smart_slash_command_routes_correctly(home):
+    """/compress smart routes to _slash_compress_smart, not mechanical compress."""
+    import asyncio as _asyncio
+    import mnemara.config as config_mod
+    import mnemara.tui as tui_mod
+
+    config_mod.init_instance("compress_smart_route_t")
+    app = tui_mod.MnemaraTUI("compress_smart_route_t")
+
+    smart_called = []
+    mechanical_called = []
+
+    async def _fake_smart(chat):
+        smart_called.append(True)
+
+    def _fake_mechanical(target_tokens, chat):
+        mechanical_called.append(True)
+
+    app._slash_compress_smart = _fake_smart
+    app._compress_to_tokens = _fake_mechanical
+
+    async def _run():
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            ta = app.query_one("#userinput", tui_mod._UserTextArea)
+            ta.load_text("/compress smart")
+            await app.run_action("submit_prompt")
+            await pilot.pause(0.1)
+
+    _asyncio.run(_run())
+    app.store.close()
+
+    assert smart_called, "smart path was not invoked"
+    assert not mechanical_called, "mechanical path fired when smart was requested"
+
