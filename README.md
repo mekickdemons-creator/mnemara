@@ -394,7 +394,15 @@ TUI-specific feature.
 /stop                cancel the in-flight turn
 /export [N] [path]   round-trip the session (turns + config + role_doc) to markdown
 /import <path>       restore a session from a /export markdown file
-/compress reads      manually run compress_repeated_reads on the window
+/compress            compress to 25% of current token count (the default
+                     compress-to-tokens operation, also available as the
+                     [🗜 Compress] button)
+/compress <N>        compress to a specific token target (e.g. /compress 20000,
+                     /compress 500k); accepts k/m suffixes
+/compress smart      inject a structured audit turn so the agent reviews its
+                     own rolling window and decides what to evict — judgment-
+                     driven rather than mechanical FIFO
+/compress reads      stub repeated Read results with diffs (existing behavior)
 /skeleton <path>     manually extract Python signatures from a file (debug)
 /name <label>        set display_name; clear with /name (no arg)
 /quit, /exit         save state and exit
@@ -411,6 +419,7 @@ The TUI chat panel exposes a row of buttons below the chat log:
 | `⚡ Inbox: ON / OFF` | Toggle peer-message delivery live. Only active when peer-poll is configured (see [Peer messaging](#peer-messaging)). |
 | `📄 Role` | Open the role-doc editor modal (same as `/role_doc`). |
 | `💬 Context` | Open the context viewer (same as `/context`). |
+| `🗜 Compress` | Compress the rolling window to 25% of current tokens (same as `/compress` with no argument). Strips thinking blocks, write pairs, and tool_use bodies before falling back to FIFO eviction; pinned rows are never touched. |
 | `Quit  ⌃C` | Save state and exit (same as Ctrl+C). |
 
 ### TUI keybindings
