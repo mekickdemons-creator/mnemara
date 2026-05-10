@@ -14,7 +14,7 @@ this project exists to support.
 
 ## AI co-authors
 
-Mnemara is co-authored with Anthropic's Claude. Specifically, **Claude Opus 4.7 (1M context)**
+Mnemara is co-authored with Anthropic's Claude. Specifically, **Claude Opus 4.7 and Sonnet 4.6**
 participates in design discussions, drafts code and documentation,
 reviews diffs, and helps shape the role docs and write-ups in this
 repo. Where Claude's contribution is substantial, commits include a
@@ -37,3 +37,5 @@ A few reasons:
    Hiding that LLMs helped build it would be incoherent.
 
 If you contribute and would like to be listed, open a PR.
+If you've managed to understand just how powerful this paradigm shift is, and you make a million+ buy me a coffee.
+$MichaelAnderson69lol (That's cashapp)
