@@ -4699,6 +4699,162 @@ def test_config_auto_evict_tool_use_blocks_missing_field_defaults_false():
     assert cfg.auto_evict_tool_use_blocks is False
 
 
+def test_config_turn_history_defaults_off():
+    """turn_history_enabled defaults False; turn_history_path defaults empty."""
+    from mnemara.config import Config
+
+    cfg = Config()
+    assert cfg.turn_history_enabled is False
+    assert cfg.turn_history_path == ""
+
+
+def test_config_turn_history_round_trips():
+    from mnemara.config import Config
+
+    cfg = Config()
+    cfg.turn_history_enabled = True
+    cfg.turn_history_path = "/tmp/test-history"
+    d = cfg.to_dict()
+    cfg2 = Config.from_dict(d)
+    assert cfg2.turn_history_enabled is True
+    assert cfg2.turn_history_path == "/tmp/test-history"
+
+
+def test_config_turn_history_missing_field_defaults_off():
+    """Pre-existing configs without the field load with feature disabled."""
+    from mnemara.config import Config
+
+    cfg = Config.from_dict({"role_doc_path": "", "model": "claude-opus-4-7"})
+    assert cfg.turn_history_enabled is False
+
+
+def test_store_evict_writes_history_jsonl(tmp_path):
+    """Evicted unpinned rows are written to history JSONL before deletion."""
+    import json as _json
+    from mnemara.store import Store
+
+    instance = "histtest"
+    store = Store.__new__(Store)
+    store.instance = instance
+    db_path = tmp_path / "turns.sqlite"
+    import sqlite3
+    store.conn = sqlite3.connect(str(db_path))
+    store.conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+            tool_uses TEXT, tokens_in INTEGER, tokens_out INTEGER,
+            pin_label TEXT, compressed_read_stub INTEGER DEFAULT 0
+        );
+        """
+    )
+    store._eviction_stats = {"rows_evicted": 0, "blocks_evicted": 0, "bytes_freed": 0, "pinned_rows_force_evicted": 0}
+    # Insert 5 rows; cap to 3 → 2 should be evicted to history
+    for i in range(5):
+        store.conn.execute(
+            "INSERT INTO turns (ts, role, content) VALUES (?, ?, ?)",
+            (f"2026-05-10T0{i}:00:00+00:00", "user", f"turn {i}"),
+        )
+    store.conn.commit()
+    history_file = tmp_path / "history.jsonl"
+    store.evict(max_turns=3, history_path=history_file)
+    # 2 rows evicted → 3 remain in store
+    assert store.conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] == 3
+    # history file contains 2 lines
+    lines = history_file.read_text().strip().splitlines()
+    assert len(lines) == 2
+    first = _json.loads(lines[0])
+    assert first["role"] == "user"
+    assert first["content"] == "turn 0"
+    assert "ts" in first
+
+
+def test_store_evict_no_history_when_disabled(tmp_path):
+    """When history_path=None, no history file is written."""
+    from mnemara.store import Store
+    import sqlite3
+
+    store = Store.__new__(Store)
+    store.instance = "nohistory"
+    store.conn = sqlite3.connect(str(tmp_path / "turns.sqlite"))
+    store.conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+            tool_uses TEXT, tokens_in INTEGER, tokens_out INTEGER,
+            pin_label TEXT, compressed_read_stub INTEGER DEFAULT 0
+        );
+        """
+    )
+    store._eviction_stats = {"rows_evicted": 0, "blocks_evicted": 0, "bytes_freed": 0, "pinned_rows_force_evicted": 0}
+    for i in range(3):
+        store.conn.execute(
+            "INSERT INTO turns (ts, role, content) VALUES (?, ?, ?)",
+            (f"2026-05-10T0{i}:00:00+00:00", "user", f"turn {i}"),
+        )
+    store.conn.commit()
+    store.evict(max_turns=1, history_path=None)
+    # No history directory or files created
+    assert not any(tmp_path.rglob("*.jsonl"))
+
+
+def test_store_evict_pinned_rows_not_written_to_history(tmp_path):
+    """Pinned rows force-evicted as last resort are NOT written to history."""
+    import json as _json
+    from mnemara.store import Store
+    import sqlite3
+
+    store = Store.__new__(Store)
+    store.instance = "pintest"
+    store.conn = sqlite3.connect(str(tmp_path / "turns.sqlite"))
+    store.conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+            tool_uses TEXT, tokens_in INTEGER, tokens_out INTEGER,
+            pin_label TEXT, compressed_read_stub INTEGER DEFAULT 0
+        );
+        """
+    )
+    store._eviction_stats = {"rows_evicted": 0, "blocks_evicted": 0, "bytes_freed": 0, "pinned_rows_force_evicted": 0}
+    # Insert 2 pinned rows only — cap to 0 forces pinned eviction
+    store.conn.execute(
+        "INSERT INTO turns (ts, role, content, pin_label) VALUES (?, ?, ?, ?)",
+        ("2026-05-10T00:00:00+00:00", "user", "pinned turn", "slot"),
+    )
+    store.conn.commit()
+    history_file = tmp_path / "history.jsonl"
+    store.evict(max_turns=0, history_path=history_file)
+    # Pinned row was force-evicted but NOT written to history
+    assert not history_file.exists()
+
+
+def test_flatten_content_assistant_text_blocks():
+    """_flatten_content extracts text from assistant block lists."""
+    from mnemara.store import _flatten_content
+    import json as _json
+
+    blocks = _json.dumps([
+        {"type": "text", "text": "Hello world"},
+        {"type": "thinking", "thinking": "reasoning..."},
+        {"type": "tool_use", "name": "Read", "id": "x", "input": {}},
+    ])
+    result = _flatten_content("assistant", blocks)
+    assert "Hello world" in result
+    assert "[tool_use: Read]" in result
+    assert "reasoning" not in result  # thinking stripped
+
+
+def test_flatten_content_user_passthrough():
+    from mnemara.store import _flatten_content
+
+    result = _flatten_content("user", "plain user text")
+    assert result == "plain user text"
+
+
 def test_config_default_includes_evict_write_pairs_policy():
     """Fresh instances get EvictWritePairs allowlisted by default."""
     from mnemara.config import Config

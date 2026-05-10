@@ -154,6 +154,16 @@ class Config:
     # completed — the model has already processed the results. Pinned rows
     # are always skipped. Off by default; opt-in per instance.
     auto_evict_tool_use_blocks: bool = False
+    # v0.3.5 — turn history persistence on FIFO eviction.
+    # When True, rows about to be FIFO-evicted (unpinned rows, not last-resort
+    # pinned-row evictions) are written to a JSONL file before deletion. Each
+    # line: {"ts": "...", "role": "user|assistant", "content": "<flat text>"}.
+    # Designed for player panels: evicted turns are lived experience and
+    # should survive eviction for the sleep cycle to summarize.
+    # turn_history_path: empty = default ~/.mnemara/<instance>/history/YYYY-MM-DD.jsonl
+    # Off by default; player instances opt in via animus init-player.
+    turn_history_enabled: bool = False
+    turn_history_path: str = ""
     # v0.3.3 — token-aware row-cap slack
     # When > 0, the cap-FIFO eviction loop allows n_turns to exceed
     # max_window_turns by up to this many rows, BUT only when current
@@ -332,6 +342,8 @@ class Config:
             rag_auto_index_wiki=bool(d.get("rag_auto_index_wiki", True)),
             auto_evict_after_write=bool(d.get("auto_evict_after_write", False)),
             auto_evict_tool_use_blocks=bool(d.get("auto_evict_tool_use_blocks", False)),
+            turn_history_enabled=bool(d.get("turn_history_enabled", False)),
+            turn_history_path=str(d.get("turn_history_path", "") or ""),
             row_cap_slack_when_token_headroom=int(
                 d.get("row_cap_slack_when_token_headroom", 0)
             ),

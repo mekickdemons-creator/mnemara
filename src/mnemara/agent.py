@@ -390,11 +390,23 @@ class AgentSession:
         # strict row cap). Slack only engages when current tokens are
         # under HEADROOM_RATIO * max_window_tokens; the token cap remains
         # the hard ceiling regardless.
+        # Resolve turn-history path for FIFO eviction logging (player panels).
+        _history_path: Path | None = None
+        if getattr(self.cfg, "turn_history_enabled", False):
+            _raw = getattr(self.cfg, "turn_history_path", "") or ""
+            if _raw:
+                _history_path = Path(_raw)
+            else:
+                from .paths import instance_dir
+                from datetime import date
+                _today = date.today().isoformat()
+                _history_path = instance_dir(self.store.instance) / "history" / f"{_today}.jsonl"
         evicted = self.store.evict(
             self.cfg.max_window_turns,
             self.cfg.max_window_tokens,
             row_cap_slack=getattr(self.cfg, "row_cap_slack_when_token_headroom", 0),
             preserve_compressed_reads=getattr(self.cfg, "preserve_compressed_reads", False),
+            history_path=_history_path,
         )
         if evicted:
             log("eviction", deleted=evicted)
