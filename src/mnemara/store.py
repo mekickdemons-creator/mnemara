@@ -161,36 +161,6 @@ class Store:
     # constant unless we get evidence otherwise.
     HEADROOM_RATIO: float = 0.5
 
-    def _write_history(self, path: Path, ids: list[int]) -> None:
-        """Append rows to a history JSONL file before they are evicted.
-
-        Fetches ts/role/content for the given row IDs (in insertion order),
-        flattens content to plain text, and appends one JSON line per row.
-        The file is created (and its parent directory) if it does not exist.
-        Errors are silenced — history write failure must never block eviction.
-        """
-        if not ids:
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            placeholders = ",".join("?" * len(ids))
-            cur = self.conn.execute(
-                f"SELECT ts, role, content FROM turns"
-                f" WHERE id IN ({placeholders}) ORDER BY id ASC",
-                ids,
-            )
-            rows = cur.fetchall()
-            with path.open("a", encoding="utf-8") as fh:
-                for ts, role, content in rows:
-                    entry = {
-                        "ts": ts,
-                        "role": role,
-                        "content": _flatten_content(role, content),
-                    }
-                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception:
-            pass  # history write is best-effort; never crash eviction
-
     def evict(
         self,
         max_turns: int,
@@ -198,7 +168,6 @@ class Store:
         *,
         row_cap_slack: int = 0,
         preserve_compressed_reads: bool = False,
-        history_path: Path | None = None,
     ) -> int:
         """Evict oldest turns until both caps are satisfied. Returns number deleted.
 
@@ -275,9 +244,6 @@ class Store:
             )
             unpinned_ids = [r[0] for r in cur.fetchall()]
             if unpinned_ids:
-                # Write to history before deletion (best-effort; never blocks).
-                if history_path is not None:
-                    self._write_history(history_path, unpinned_ids)
                 placeholders = ",".join("?" * len(unpinned_ids))
                 self.conn.execute(
                     f"DELETE FROM turns WHERE id IN ({placeholders})", unpinned_ids
@@ -318,9 +284,6 @@ class Store:
                 )
                 row = cur.fetchone()
                 if row:
-                    # Write to history before deletion (unpinned only; best-effort).
-                    if history_path is not None:
-                        self._write_history(history_path, [row[0]])
                     self.conn.execute("DELETE FROM turns WHERE id = ?", (row[0],))
                     self.conn.commit()
                     deleted += 1
@@ -1813,38 +1776,6 @@ def _window_summary(role: str, content_str: str) -> str:
         except (json.JSONDecodeError, TypeError):
             pass
     return content_str[:80]
-
-
-def _flatten_content(role: str, content_str: str) -> str:
-    """Flatten a stored content value to plain text for history JSONL.
-
-    Assistant rows store a JSON-encoded list of content blocks. User rows
-    are typically plain text already. Keeps full text (not truncated like
-    _window_summary) so the sleep-cycle LLM has the complete turn.
-    """
-    if role == "assistant":
-        try:
-            blocks = json.loads(content_str)
-            if isinstance(blocks, list):
-                parts: list[str] = []
-                for b in blocks:
-                    if not isinstance(b, dict):
-                        continue
-                    btype = b.get("type")
-                    if btype == "text":
-                        text = (b.get("text") or "").strip()
-                        if text:
-                            parts.append(text)
-                    elif btype == "tool_use":
-                        name = b.get("name") or "?"
-                        parts.append(f"[tool_use: {name}]")
-                    elif btype == "thinking":
-                        # thinking blocks are never interesting for sleep summaries
-                        pass
-                return "\n".join(parts) if parts else content_str
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return content_str
 
 
 def _maybe_json(s: str):
