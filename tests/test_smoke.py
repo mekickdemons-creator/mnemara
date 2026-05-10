@@ -1071,6 +1071,98 @@ def test_role_doc_editor_modal_cancel_does_not_write(tmp_path, home):
     app.store.close()
 
 
+def test_role_doc_editor_clipboard_copy(tmp_path, home, monkeypatch):
+    """ctrl+c in RoleDocEditorModal copies selected text to clipboard via pyperclip."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+
+    copied: list[str] = []
+
+    class FakePyperclip:
+        @staticmethod
+        def copy(text: str) -> None:
+            copied.append(text)
+
+        @staticmethod
+        def paste() -> str:
+            return ""
+
+    monkeypatch.setitem(__import__("sys").modules, "pyperclip", FakePyperclip)
+
+    role_file = tmp_path / "r.md"
+    role_file.write_text("hello world")
+    config.init_instance("role_clip_t")
+    app = tui_mod.MnemaraTUI("role_clip_t")
+
+    async def _run():
+        async with app.run_test() as pilot:
+            modal = tui_mod.RoleDocEditorModal(str(role_file), "hello world")
+            await app.push_screen(modal)
+            await pilot.pause()
+            # Select all text then fire ctrl+c — modal _on_key should copy it.
+            ta = modal.query_one("#role-editor-ta")
+            ta.select_all()
+            await pilot.pause()
+            from textual.events import Key
+            await modal._on_key(Key("ctrl+c", character="\x03"))
+            await pilot.pause()
+            modal.action_cancel()
+            await pilot.pause()
+
+    _asyncio.run(_run())
+    app.store.close()
+    assert any("hello world" in c for c in copied), f"nothing copied; got {copied}"
+
+
+def test_context_viewer_clipboard_copy(home, monkeypatch):
+    """ctrl+c in ContextViewerModal copies selected detail-panel text to clipboard."""
+    import asyncio as _asyncio
+    from mnemara import tui as tui_mod
+    from mnemara import config
+    from mnemara.store import Store
+
+    copied: list[str] = []
+
+    class FakePyperclip:
+        @staticmethod
+        def copy(text: str) -> None:
+            copied.append(text)
+
+        @staticmethod
+        def paste() -> str:
+            return ""
+
+    monkeypatch.setitem(__import__("sys").modules, "pyperclip", FakePyperclip)
+
+    config.init_instance("ctx_clip_t")
+    store = Store("ctx_clip_t")
+    store.append_turn("user", [{"type": "text", "text": "copy this text please"}])
+    app = tui_mod.MnemaraTUI("ctx_clip_t")
+
+    async def _run():
+        async with app.run_test() as pilot:
+            modal = tui_mod.ContextViewerModal(store, "ctx_clip_t")
+            await app.push_screen(modal)
+            await pilot.pause()
+            # Load detail panel with some text, select it, fire ctrl+c.
+            ta = modal.query_one("#ctx-detail-ta")
+            ta.load_text("copy this text please")
+            ta.select_all()
+            await pilot.pause()
+            from textual.events import Key
+            await modal._on_key(Key("ctrl+c", character="\x03"))
+            await pilot.pause()
+            modal.action_close()
+            await pilot.pause()
+
+    _asyncio.run(_run())
+    store.close()
+    app.store.close()
+    # pyperclip.copy should have been called with the selected text.
+    assert any("copy this text" in c for c in copied), f"nothing copied; got {copied}"
+
+
 def test_role_doc_editor_no_path_shows_message(home):
     """/role_doc with no role_doc_path configured shows a helpful message."""
     import asyncio as _asyncio
