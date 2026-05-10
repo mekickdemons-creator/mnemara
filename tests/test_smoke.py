@@ -4671,6 +4671,34 @@ def test_config_auto_evict_after_write_missing_field_defaults_false():
     assert cfg.auto_evict_after_write is False
 
 
+def test_config_auto_evict_tool_use_blocks_default_false():
+    from mnemara.config import Config
+
+    cfg = Config()
+    assert cfg.auto_evict_tool_use_blocks is False
+
+
+def test_config_auto_evict_tool_use_blocks_round_trips_through_dict():
+    from mnemara.config import Config
+
+    cfg = Config()
+    cfg.auto_evict_tool_use_blocks = True
+    d = cfg.to_dict()
+    assert d["auto_evict_tool_use_blocks"] is True
+
+    cfg2 = Config.from_dict(d)
+    assert cfg2.auto_evict_tool_use_blocks is True
+
+
+def test_config_auto_evict_tool_use_blocks_missing_field_defaults_false():
+    """Pre-existing config.json files without the field load as False."""
+    from mnemara.config import Config
+
+    minimal = {"role_doc_path": "", "model": "claude-opus-4-7"}
+    cfg = Config.from_dict(minimal)
+    assert cfg.auto_evict_tool_use_blocks is False
+
+
 def test_config_default_includes_evict_write_pairs_policy():
     """Fresh instances get EvictWritePairs allowlisted by default."""
     from mnemara.config import Config
