@@ -371,6 +371,57 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def update_turn_content(self, row_id: int, new_text: str) -> bool:
+        """Overwrite the content of a single turn in place. Returns True if found.
+
+        Stores ``new_text`` as a plain string in the ``content`` column — the
+        same format used by append_turn when content is a str.  Use this for
+        operator edits via the context viewer or game-state slot updates.
+        """
+        cur = self.conn.execute(
+            "UPDATE turns SET content=? WHERE id=?",
+            (str(new_text), int(row_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def upsert_slot(self, label: str, role: str, content: str) -> int:
+        """Insert or update a named persistent slot (pinned turn).
+
+        If a turn with ``pin_label == label`` already exists its content and
+        role are overwritten in place and the timestamp is refreshed.
+        Otherwise a new turn is inserted with ``pin_label=label`` so it is
+        exempt from FIFO eviction.
+
+        This is the primitive for live game-state slots (e.g. ``health``,
+        ``hunger``, ``location``).  Agents call it instead of ``append_turn``
+        so repeated state updates don't bloat the rolling window.
+
+        Returns the row_id of the upserted row.
+        """
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("label must be a non-empty string")
+        cur = self.conn.execute(
+            "SELECT id FROM turns WHERE pin_label=? LIMIT 1",
+            (label.strip(),),
+        )
+        existing = cur.fetchone()
+        if existing:
+            row_id = int(existing[0])
+            self.conn.execute(
+                "UPDATE turns SET content=?, role=?, ts=? WHERE id=?",
+                (str(content), role, _now(), row_id),
+            )
+            self.conn.commit()
+            return row_id
+        else:
+            cur = self.conn.execute(
+                "INSERT INTO turns (ts, role, content, pin_label) VALUES (?,?,?,?)",
+                (_now(), role, str(content), label.strip()),
+            )
+            self.conn.commit()
+            return cur.lastrowid  # type: ignore[return-value]
+
     def unpin_row(self, row_id: int) -> bool:
         """Remove the pin from a row. Returns True if a previously-pinned row matched.
 

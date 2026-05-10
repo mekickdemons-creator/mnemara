@@ -272,6 +272,19 @@ RoleDocEditorModal {
     color: #c08080;
 }
 
+#btn-role-paste, #btn-role-copy {
+    background: #1e2a1e;
+    color: #6a9a6a;
+    border: tall #3a5a3a;
+    min-width: 12;
+    margin-right: 1;
+}
+
+#btn-role-paste:hover, #btn-role-copy:hover {
+    background: #2a3a2a;
+    color: #8aba8a;
+}
+
 #btn-role {
     background: #1e3a5f;
     color: #6f9ad9;
@@ -391,6 +404,38 @@ ContextViewerModal {
 #btn-ctx-pin:hover   { background: #2a4f7a; }
 #btn-ctx-unpin:hover { background: #2a3a2a; }
 #btn-ctx-close:hover { background: #333333; }
+
+#ctx-detail-btn-row {
+    height: 3;
+    background: #11151e;
+    align: left middle;
+    margin-top: 0;
+}
+
+#btn-ctx-paste, #btn-ctx-copy {
+    background: #1e2a1e;
+    color: #6a9a6a;
+    border: tall #3a5a3a;
+    min-width: 10;
+    margin-right: 1;
+}
+
+#btn-ctx-paste:hover, #btn-ctx-copy:hover {
+    background: #2a3a2a;
+    color: #8aba8a;
+}
+
+#btn-ctx-save-edit {
+    background: #1e3a1e;
+    color: #6fad6f;
+    border: tall #3a6f3a;
+    min-width: 14;
+}
+
+#btn-ctx-save-edit:hover {
+    background: #2a4f2a;
+    color: #8fc88f;
+}
 
 #btn-context {
     background: #1a2a1a;
@@ -654,6 +699,8 @@ class RoleDocEditorModal(ModalScreen):  # type: ignore[misc]
                 id="role-editor-ta",
             )
             with Horizontal(id="role-editor-btn-row"):
+                yield Button("📋 Paste", id="btn-role-paste")
+                yield Button("⎘ Copy", id="btn-role-copy")
                 yield Button("Save  ⌃S", id="btn-role-save")
                 yield Button("Cancel  Esc", id="btn-role-cancel")
 
@@ -703,6 +750,21 @@ class RoleDocEditorModal(ModalScreen):  # type: ignore[misc]
             self.action_save()
         elif event.button.id == "btn-role-cancel":
             self.action_cancel()
+        elif event.button.id == "btn-role-paste":
+            try:
+                import pyperclip  # type: ignore[import]
+                text = pyperclip.paste()
+                if text:
+                    self.query_one("#role-editor-ta", TextArea).insert(text)
+            except Exception:
+                pass
+        elif event.button.id == "btn-role-copy":
+            try:
+                import pyperclip  # type: ignore[import]
+                ta = self.query_one("#role-editor-ta", TextArea)
+                pyperclip.copy(ta.selected_text or ta.text)
+            except Exception:
+                pass
 
     def action_save(self) -> None:
         """Write edited content to disk and dismiss."""
@@ -775,9 +837,12 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 with Vertical(id="ctx-detail-panel"):
                     yield TextArea(
                         "← select a turn to view its full content",
-                        read_only=True,
                         id="ctx-detail-ta",
                     )
+                    with Horizontal(id="ctx-detail-btn-row"):
+                        yield Button("📋 Paste", id="btn-ctx-paste")
+                        yield Button("⎘ Copy", id="btn-ctx-copy")
+                        yield Button("💾 Save edit", id="btn-ctx-save-edit")
             with Horizontal(id="ctx-action-row"):
                 yield Button("Evict", id="btn-ctx-evict")
                 yield Button("📌 Pin", id="btn-ctx-pin")
@@ -913,6 +978,23 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
             self._do_pin()
         elif bid == "btn-ctx-unpin":
             self._do_unpin()
+        elif bid == "btn-ctx-paste":
+            try:
+                import pyperclip  # type: ignore[import]
+                text = pyperclip.paste()
+                if text:
+                    self.query_one("#ctx-detail-ta", TextArea).insert(text)
+            except Exception:
+                pass
+        elif bid == "btn-ctx-copy":
+            try:
+                import pyperclip  # type: ignore[import]
+                ta = self.query_one("#ctx-detail-ta", TextArea)
+                pyperclip.copy(ta.selected_text or ta.text)
+            except Exception:
+                pass
+        elif bid == "btn-ctx-save-edit":
+            self._do_save_edit()
 
     # ---------------------------------------------------------------- actions
 
@@ -951,6 +1033,25 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 r["pin_label"] = None
                 break
         self._apply_filters()
+
+    def _do_save_edit(self) -> None:
+        """Write the detail panel's current text back to the selected turn row."""
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        try:
+            ta = self.query_one("#ctx-detail-ta", TextArea)
+            new_text = ta.text
+            ok = self._store.update_turn_content(row_id, new_text)
+            # Refresh summary in the list so it reflects any changes.
+            if ok:
+                for r in self._all_rows:
+                    if r["row_id"] == row_id:
+                        r["summary"] = (new_text.strip()[:80] or "")
+                        break
+                self._apply_filters()
+        except Exception:
+            pass
 
     def action_close(self) -> None:
         self.dismiss()

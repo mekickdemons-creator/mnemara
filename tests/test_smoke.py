@@ -2115,6 +2115,70 @@ def test_slash_evict_n_drops_oldest_not_newest(home):
     _asyncio.run(_run())
 
 
+def test_store_update_turn_content(home):
+    """update_turn_content rewrites the content of an existing row."""
+    from mnemara.store import Store
+
+    store = Store("update_turn_t")
+    row_id = store.append_turn("user", "original text")
+    ok = store.update_turn_content(row_id, "updated text")
+    assert ok is True
+    row = store.get_turn(row_id)
+    assert row["content"] == "updated text"
+
+
+def test_store_update_turn_content_missing_row(home):
+    """update_turn_content returns False for a non-existent row_id."""
+    from mnemara.store import Store
+
+    store = Store("update_turn_miss_t")
+    ok = store.update_turn_content(99999, "should not land")
+    assert ok is False
+
+
+def test_store_upsert_slot_insert(home):
+    """upsert_slot creates a new pinned row when the label doesn't exist."""
+    from mnemara.store import Store
+
+    store = Store("upsert_slot_insert_t")
+    row_id = store.upsert_slot("health", "user", "HP: 100/100")
+    assert isinstance(row_id, int)
+    row = store.get_turn(row_id)
+    assert row["pin_label"] == "health"
+    assert row["content"] == "HP: 100/100"
+    assert row["role"] == "user"
+
+
+def test_store_upsert_slot_update(home):
+    """upsert_slot overwrites existing row in place — same row_id returned."""
+    from mnemara.store import Store
+
+    store = Store("upsert_slot_update_t")
+    row_id_1 = store.upsert_slot("health", "user", "HP: 100/100")
+    row_id_2 = store.upsert_slot("health", "user", "HP: 70/100")
+    # Same row updated in place — no new row created
+    assert row_id_1 == row_id_2
+    row = store.get_turn(row_id_2)
+    assert row["content"] == "HP: 70/100"
+    # Only one row in the store with this label (list_window includes pin_label)
+    result = store.list_window(limit=100)
+    slot_rows = [r for r in result["rows"] if r.get("pin_label") == "health"]
+    assert len(slot_rows) == 1
+
+
+def test_store_upsert_slot_multiple_labels(home):
+    """Multiple slot labels coexist as separate pinned rows."""
+    from mnemara.store import Store
+
+    store = Store("upsert_slot_multi_t")
+    store.upsert_slot("health", "user", "HP: 100/100")
+    store.upsert_slot("hunger", "user", "Hunger: 80%")
+    store.upsert_slot("location", "user", "Room: Tavern")
+    result = store.list_window(limit=100)
+    labels = {r["pin_label"] for r in result["rows"] if r.get("pin_label")}
+    assert labels == {"health", "hunger", "location"}
+
+
 def test_store_evict_by_role_user(home):
     """evict_by_role('user') removes all user rows, leaving assistant rows."""
     from mnemara.store import Store
