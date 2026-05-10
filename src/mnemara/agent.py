@@ -345,6 +345,25 @@ class AgentSession:
                 # Eviction failures must never crash a turn; audit-trail
                 # eviction is opportunistic.
                 log("auto_evict_pairs_error", error=str(exc))
+        # Auto-evict tool_use blocks: if the toggle is on, strip all tool_use
+        # blocks from the just-persisted assistant row after every turn.
+        # ~870 bytes per block on average; safe since the model has already
+        # consumed the results. Pinned rows skipped.
+        if getattr(self.cfg, "auto_evict_tool_use_blocks", False):
+            try:
+                tu_result = self.store.evict_tool_use_blocks(
+                    ids=[assistant_row_id],
+                    skip_pinned=True,
+                )
+                if tu_result.get("blocks_evicted", 0) > 0:
+                    log(
+                        "auto_evict_tool_use",
+                        blocks=tu_result["blocks_evicted"],
+                        rows=tu_result["rows_modified"],
+                        bytes_freed=tu_result["bytes_freed"],
+                    )
+            except Exception as exc:
+                log("auto_evict_tool_use_error", error=str(exc))
         # Compress repeated Read results after every turn when the flag is on.
         # Outside the auto_evict_after_write guard so it fires on read-heavy
         # turns too, not just write turns. compress_repeated_reads is

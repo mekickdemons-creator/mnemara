@@ -146,6 +146,14 @@ class Config:
     # wherever the tool wrote; only the in-context audit body goes.
     # Off by default; opt-in per instance.
     auto_evict_after_write: bool = False
+    # v0.3.2b — auto-evict tool_use blocks after every turn.
+    # When True, after each turn the tool_use blocks from the just-persisted
+    # assistant row are stripped entirely (audit-trail loss; see
+    # evict_tool_use_blocks for the trade-off note). High byte savings
+    # (~870 bytes per call on average) with zero effect on the turn that just
+    # completed — the model has already processed the results. Pinned rows
+    # are always skipped. Off by default; opt-in per instance.
+    auto_evict_tool_use_blocks: bool = False
     # v0.3.3 — token-aware row-cap slack
     # When > 0, the cap-FIFO eviction loop allows n_turns to exceed
     # max_window_turns by up to this many rows, BUT only when current
@@ -323,6 +331,7 @@ class Config:
             rag_auto_index_memory=bool(d.get("rag_auto_index_memory", True)),
             rag_auto_index_wiki=bool(d.get("rag_auto_index_wiki", True)),
             auto_evict_after_write=bool(d.get("auto_evict_after_write", False)),
+            auto_evict_tool_use_blocks=bool(d.get("auto_evict_tool_use_blocks", False)),
             row_cap_slack_when_token_headroom=int(
                 d.get("row_cap_slack_when_token_headroom", 0)
             ),
