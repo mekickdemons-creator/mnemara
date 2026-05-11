@@ -2136,6 +2136,29 @@ def test_store_update_turn_content_missing_row(home):
     assert ok is False
 
 
+def test_store_update_turn_role(home):
+    """update_turn_role renames the role field of an existing row."""
+    from mnemara.store import Store
+
+    store = Store("update_role_t")
+    row_id = store.append_turn("user", "hello")
+    ok = store.update_turn_role(row_id, "Status")
+    assert ok is True
+    row = store.get_turn(row_id)
+    assert row["role"] == "Status"
+    store.close()
+
+
+def test_store_update_turn_role_missing_row(home):
+    """update_turn_role returns False for a non-existent row_id."""
+    from mnemara.store import Store
+
+    store = Store("update_role_miss_t")
+    ok = store.update_turn_role(99999, "anything")
+    assert ok is False
+    store.close()
+
+
 def test_store_upsert_slot_insert(home):
     """upsert_slot creates a new pinned row when the label doesn't exist."""
     from mnemara.store import Store

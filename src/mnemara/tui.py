@@ -437,6 +437,70 @@ ContextViewerModal {
     color: #8fc88f;
 }
 
+#btn-ctx-rename {
+    background: #2a2a1a;
+    color: #baba6f;
+    border: tall #5a5a2a;
+    min-width: 12;
+    margin-left: 1;
+}
+#btn-ctx-rename:hover { background: #3a3a2a; }
+
+#ctx-rename-row {
+    height: 3;
+    background: #1d2330;
+    align: left middle;
+    margin-top: 0;
+    display: none;
+}
+
+#ctx-rename-input {
+    width: 1fr;
+    border: tall #5a5a2a;
+    background: #11151e;
+    color: #ffffff;
+}
+
+#btn-ctx-rename-apply {
+    background: #1a3a1a;
+    color: #6fad6f;
+    border: tall #3a6f3a;
+    min-width: 10;
+    margin-left: 1;
+}
+#btn-ctx-rename-apply:hover { background: #2a4f2a; }
+
+#ctx-add-row {
+    height: 3;
+    background: #1d2330;
+    align: left middle;
+    margin-top: 1;
+}
+
+#ctx-add-num {
+    width: 6;
+    border: tall #4d6fa3;
+    background: #11151e;
+    color: #ffffff;
+}
+
+#ctx-add-name {
+    width: 1fr;
+    border: tall #4d6fa3;
+    background: #11151e;
+    color: #ffffff;
+    margin-left: 1;
+}
+
+#btn-ctx-add {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 10;
+    margin-left: 1;
+}
+#btn-ctx-add:hover { background: #2a4f7a; }
+
 #btn-context {
     background: #1a2a1a;
     color: #6fad6f;
@@ -864,10 +928,20 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 yield Button("Evict", id="btn-ctx-evict")
                 yield Button("📌 Pin", id="btn-ctx-pin")
                 yield Button("Unpin", id="btn-ctx-unpin")
+                yield Button("✏️ Rename", id="btn-ctx-rename")
                 yield Button("Close  Esc", id="btn-ctx-close")
+            with Horizontal(id="ctx-rename-row"):
+                yield Input(placeholder="new name…", id="ctx-rename-input")
+                yield Button("✔ Apply", id="btn-ctx-rename-apply")
+            with Horizontal(id="ctx-add-row"):
+                yield Static("Add slot: ", classes="ctx-add-label")
+                yield Input(placeholder="#", id="ctx-add-num")
+                yield Input(placeholder="name…", id="ctx-add-name")
+                yield Button("➕ Add", id="btn-ctx-add")
 
     def on_mount(self) -> None:
         self._rebuild_list()
+        self.query_one("#ctx-rename-row").display = False
         self.query_one("#ctx-list", ListView).focus()
 
     async def _on_key(self, event: "Key") -> None:  # type: ignore[name-defined]
@@ -893,8 +967,16 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
     def _row_label(self, row: dict) -> str:
         pin = "📌 " if row.get("pin_label") else "   "
         ts = str(row.get("timestamp", ""))[:16].replace("T", " ")
-        role = (row.get("role") or "?")[:4]
-        summary = (row.get("summary") or "")[:38]
+        # Pinned slots show their slot label; regular turns show their role name
+        pin_label = row.get("pin_label")
+        if pin_label:
+            import re as _re
+            clean = _re.sub(r"^\d+[_\-]", "", pin_label)
+            clean = clean.replace("_", " ").replace(":", ": ").title()
+            role = clean[:14]
+        else:
+            role = (row.get("role") or "?")[:14]
+        summary = (row.get("summary") or "")[:34]
         return f"{pin}{row['row_id']:>5} · {role} · {ts} · {summary}"
 
     def _rebuild_list(self) -> None:
@@ -963,6 +1045,10 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
         if event.input.id == "ctx-filter-input":
             self._apply_filters()
 
+    def on_input_submitted(self, event: "Input.Submitted") -> None:  # type: ignore[name-defined]
+        if event.input.id == "ctx-rename-input":
+            self._do_rename()
+
     def on_list_view_highlighted(self, event: "ListView.Highlighted") -> None:  # type: ignore[name-defined]
         if event.list_view.id != "ctx-list":
             return
@@ -1012,6 +1098,12 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 pass
         elif bid == "btn-ctx-save-edit":
             self._do_save_edit()
+        elif bid == "btn-ctx-rename":
+            self._toggle_rename_row()
+        elif bid == "btn-ctx-rename-apply":
+            self._do_rename()
+        elif bid == "btn-ctx-add":
+            self._do_add_slot()
 
     # ---------------------------------------------------------------- actions
 
@@ -1069,6 +1161,65 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 self._apply_filters()
         except Exception:
             pass
+
+    def _toggle_rename_row(self) -> None:
+        """Show the rename input pre-filled with the current row's role."""
+        rename_row = self.query_one("#ctx-rename-row")
+        rename_input = self.query_one("#ctx-rename-input", Input)
+        if rename_row.display:
+            rename_row.display = False
+            return
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        # Pre-fill with current role (or pin_label if pinned)
+        current_row = next(
+            (r for r in self._all_rows if r["row_id"] == row_id), {}
+        )
+        current_name = current_row.get("pin_label") or current_row.get("role") or ""
+        rename_input.value = current_name
+        rename_row.display = True
+        rename_input.focus()
+
+    def _do_rename(self) -> None:
+        """Apply the rename input value to the selected turn's role."""
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        try:
+            new_name = self.query_one("#ctx-rename-input", Input).value.strip()
+        except Exception:
+            return
+        if not new_name:
+            return
+        ok = self._store.update_turn_role(row_id, new_name)
+        if ok:
+            for r in self._all_rows:
+                if r["row_id"] == row_id:
+                    r["role"] = new_name
+                    break
+            self._apply_filters()
+        self.query_one("#ctx-rename-row").display = False
+
+    def _do_add_slot(self) -> None:
+        """Create a new named pinned slot from the add-slot inputs."""
+        try:
+            num_raw = self.query_one("#ctx-add-num", Input).value.strip()
+            name_raw = self.query_one("#ctx-add-name", Input).value.strip()
+        except Exception:
+            return
+        if not name_raw:
+            return
+        slug = name_raw.lower().replace(" ", "_")
+        label = f"{int(num_raw):02d}_{slug}" if num_raw.isdigit() else slug
+        row_id = self._store.upsert_slot(label, name_raw, "--")
+        # Reload all rows so the new slot appears
+        result = self._store.list_window(limit=200)
+        self._all_rows = result.get("rows", [])
+        self._apply_filters()
+        # Clear the inputs
+        self.query_one("#ctx-add-num", Input).value = ""
+        self.query_one("#ctx-add-name", Input).value = ""
 
     def action_close(self) -> None:
         self.dismiss()

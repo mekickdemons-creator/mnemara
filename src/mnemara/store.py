@@ -385,6 +385,19 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def update_turn_role(self, row_id: int, new_role: str) -> bool:
+        """Rename the role label of a single turn. Returns True if found.
+
+        Use this via the context viewer rename action to give turns meaningful
+        display names (e.g. renaming 'user' to 'Status' or 'Inventory').
+        """
+        cur = self.conn.execute(
+            "UPDATE turns SET role=? WHERE id=?",
+            (str(new_role), int(row_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def upsert_slot(self, label: str, role: str, content: str) -> int:
         """Insert or update a named persistent slot (pinned turn).
 
