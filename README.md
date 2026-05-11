@@ -7,6 +7,9 @@
 > **Note:** There is also a Rust project called [`mnemara`](https://github.com/deliberium/mnemara) by `deliberium` — a memory engine for embedded/service systems. Different project, parallel naming (both inspired by Mnemosyne). If you arrived looking for that one, head over there.
 
 **Stop your Claude agent from running away with your bill.**
+   **Take complete control of the your context window**
+                ++discern her  true power++
+               XXXX Take over the world XXXX
 
 Mnemara is a Claude conversation runtime where the **role doc is re-read on
 every turn** and pinned as the system prompt. That sounds boring until you
