@@ -888,3 +888,7 @@ Built by Michael Anderson with Dave Moore.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Written by
+
+Claude 1.3.3.7
