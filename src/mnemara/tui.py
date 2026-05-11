@@ -477,6 +477,12 @@ ContextViewerModal {
     margin-top: 1;
 }
 
+.ctx-add-label {
+    color: #666e80;
+    margin-right: 1;
+    width: 10;
+}
+
 #ctx-add-num {
     width: 6;
     border: tall #4d6fa3;
