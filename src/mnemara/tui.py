@@ -484,7 +484,7 @@ ContextViewerModal {
 }
 
 #ctx-add-num {
-    width: 6;
+    width: 8;
     border: tall #4d6fa3;
     background: #11151e;
     color: #ffffff;
@@ -1054,6 +1054,8 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
     def on_input_submitted(self, event: "Input.Submitted") -> None:  # type: ignore[name-defined]
         if event.input.id == "ctx-rename-input":
             self._do_rename()
+        elif event.input.id in ("ctx-add-num", "ctx-add-name"):
+            self._do_add_slot()
 
     def on_list_view_highlighted(self, event: "ListView.Highlighted") -> None:  # type: ignore[name-defined]
         if event.list_view.id != "ctx-list":
