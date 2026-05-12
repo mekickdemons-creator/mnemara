@@ -507,6 +507,31 @@ ContextViewerModal {
 }
 #btn-ctx-add:hover { background: #2a4f7a; }
 
+#ctx-move-row {
+    height: 3;
+    background: #1d2330;
+    align: left middle;
+    margin-top: 0;
+    display: none;
+}
+
+#ctx-move-num {
+    width: 8;
+    border: tall #7a5a9a;
+    background: #11151e;
+    color: #ffffff;
+    margin-left: 1;
+}
+
+#btn-ctx-move {
+    background: #3a1f5f;
+    color: #b07fd9;
+    border: tall #7a5a9a;
+    min-width: 14;
+    margin-left: 1;
+}
+#btn-ctx-move:hover { background: #4f2a7a; }
+
 #btn-context {
     background: #1a2a1a;
     color: #6fad6f;
@@ -935,10 +960,15 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 yield Button("📌 Pin", id="btn-ctx-pin")
                 yield Button("Unpin", id="btn-ctx-unpin")
                 yield Button("✏️ Rename", id="btn-ctx-rename")
+                yield Button("🔀 Move", id="btn-ctx-move-show")
                 yield Button("Close  Esc", id="btn-ctx-close")
             with Horizontal(id="ctx-rename-row"):
                 yield Input(placeholder="new name…", id="ctx-rename-input")
                 yield Button("✔ Apply", id="btn-ctx-rename-apply")
+            with Horizontal(id="ctx-move-row"):
+                yield Static("Move to #:", classes="ctx-add-label")
+                yield Input(placeholder="new #", id="ctx-move-num")
+                yield Button("🔀 Apply", id="btn-ctx-move")
             with Horizontal(id="ctx-add-row"):
                 yield Static("Add slot: ", classes="ctx-add-label")
                 yield Input(placeholder="#", id="ctx-add-num")
@@ -1009,7 +1039,14 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
         if text_filter:
             rows = [r for r in rows if text_filter in r.get("summary", "").lower()
                     or text_filter in str(r.get("row_id", ""))]
-        self._filtered_rows = rows
+        # Pinned slots first, sorted by pin_label (numeric prefix preserves intended order).
+        # Non-pinned turns follow in insertion order (by row_id).
+        pins = sorted(
+            [r for r in rows if r.get("pin_label")],
+            key=lambda r: (r.get("pin_label") or ""),
+        )
+        non_pins = [r for r in rows if not r.get("pin_label")]
+        self._filtered_rows = pins + non_pins
         self._rebuild_list()
 
     def _fmt_full_content(self, full: dict) -> str:
@@ -1054,6 +1091,8 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
     def on_input_submitted(self, event: "Input.Submitted") -> None:  # type: ignore[name-defined]
         if event.input.id == "ctx-rename-input":
             self._do_rename()
+        elif event.input.id == "ctx-move-num":
+            self._do_move()
         elif event.input.id in ("ctx-add-num", "ctx-add-name"):
             self._do_add_slot()
 
@@ -1110,6 +1149,16 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
             self._toggle_rename_row()
         elif bid == "btn-ctx-rename-apply":
             self._do_rename()
+        elif bid == "btn-ctx-move-show":
+            row_id = self._selected_row_id()
+            if row_id is not None:
+                move_row = self.query_one("#ctx-move-row")
+                move_row.display = True
+                num_inp = self.query_one("#ctx-move-num", Input)
+                num_inp.value = ""
+                num_inp.focus()
+        elif bid == "btn-ctx-move":
+            self._do_move()
         elif bid == "btn-ctx-add":
             self._do_add_slot()
 
@@ -1208,6 +1257,39 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                     break
             self._apply_filters()
         self.query_one("#ctx-rename-row").display = False
+
+    def _do_move(self) -> None:
+        """Move a pinned slot to a new position by updating its pin_label prefix."""
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        try:
+            num_str = self.query_one("#ctx-move-num", Input).value.strip()
+        except Exception:
+            return
+        if not num_str:
+            return
+        # Extract current slug from pin_label (strip numeric prefix).
+        current_label = ""
+        if 0 <= self._selected_idx < len(self._filtered_rows):
+            current_label = self._filtered_rows[self._selected_idx].get("pin_label") or ""
+        if not current_label:
+            return
+        parts = current_label.split("_", 1)
+        slug = parts[1] if len(parts) == 2 and parts[0].isdigit() else current_label
+        new_label = f"{int(num_str):02d}_{slug}" if num_str.isdigit() else f"{num_str}_{slug}"
+        ok = self._store.move_slot(row_id, new_label)
+        if ok:
+            for r in self._all_rows:
+                if r["row_id"] == row_id:
+                    r["pin_label"] = new_label
+                    break
+            self._apply_filters()
+        self.query_one("#ctx-move-row").display = False
+        try:
+            self.query_one("#ctx-move-num", Input).value = ""
+        except Exception:
+            pass
 
     def _do_add_slot(self) -> None:
         """Create a new named pinned slot from the add-slot inputs."""

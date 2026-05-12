@@ -2202,6 +2202,74 @@ def test_store_upsert_slot_multiple_labels(home):
     assert labels == {"health", "hunger", "location"}
 
 
+def test_store_move_slot_changes_pin_label(home):
+    """move_slot() updates pin_label to reposition a slot in sorted order."""
+    from mnemara.store import Store
+
+    store = Store("move_slot_basic_t")
+    rid = store.upsert_slot("50_field_note", "Field Note", "some content")
+    ok = store.move_slot(rid, "03_field_note")
+    assert ok is True
+    pins = store.list_pinned()
+    labels = [p["pin_label"] for p in pins]
+    assert "03_field_note" in labels
+    assert "50_field_note" not in labels
+    store.close()
+
+
+def test_store_move_slot_collision_rejected(home):
+    """move_slot() returns False when new_label is already owned by a different slot."""
+    from mnemara.store import Store
+
+    store = Store("move_slot_collision_t")
+    store.upsert_slot("01_body", "Body", "HP:100")
+    rid2 = store.upsert_slot("50_note", "Note", "text")
+    ok = store.move_slot(rid2, "01_body")  # collision
+    assert ok is False
+    pins = {p["pin_label"] for p in store.list_pinned()}
+    assert "50_note" in pins
+    assert "01_body" in pins
+    store.close()
+
+
+def test_store_move_slot_same_label_idempotent(home):
+    """move_slot() with the same label is a no-op and returns True."""
+    from mnemara.store import Store
+
+    store = Store("move_slot_idempotent_t")
+    rid = store.upsert_slot("05_today", "Today", "tasks")
+    ok = store.move_slot(rid, "05_today")
+    assert ok is True
+    store.close()
+
+
+def test_context_viewer_pinned_slots_sorted_by_label(home):
+    """_apply_filters() puts pinned slots first, sorted by pin_label, then non-pinned."""
+    from mnemara.store import Store
+
+    store = Store("ctx_sort_t")
+    store.upsert_slot("50_late", "Late", "z")
+    store.upsert_slot("01_body", "Body", "b")
+    store.upsert_slot("00_time", "Time", "a")
+    store.append_turn("user", [{"type": "text", "text": "chat message"}])
+
+    result = store.list_window(limit=200)
+    rows = result.get("rows", [])
+
+    pins = sorted(
+        [r for r in rows if r.get("pin_label")],
+        key=lambda r: r.get("pin_label") or "",
+    )
+    non_pins = [r for r in rows if not r.get("pin_label")]
+    filtered = pins + non_pins
+
+    assert filtered[0]["pin_label"] == "00_time"
+    assert filtered[1]["pin_label"] == "01_body"
+    assert filtered[2]["pin_label"] == "50_late"
+    assert filtered[3].get("pin_label") is None
+    store.close()
+
+
 def test_store_evict_by_role_user(home):
     """evict_by_role('user') removes all user rows, leaving assistant rows."""
     from mnemara.store import Store

@@ -448,6 +448,28 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def move_slot(self, row_id: int, new_label: str) -> bool:
+        """Change the pin_label of a pinned slot to reposition it in the sorted list.
+
+        Returns True on success, False if the row wasn't found, wasn't pinned,
+        or the new_label is already used by a different slot.
+        """
+        new_label = (new_label or "").strip()
+        if not new_label:
+            return False
+        cur = self.conn.execute(
+            "SELECT id FROM turns WHERE pin_label=? LIMIT 1", (new_label,)
+        )
+        collision = cur.fetchone()
+        if collision and int(collision[0]) != int(row_id):
+            return False
+        cur = self.conn.execute(
+            "UPDATE turns SET pin_label=? WHERE id=? AND pin_label IS NOT NULL",
+            (new_label, int(row_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def list_pinned(self, label: str | None = None) -> list[dict[str, Any]]:
         """Return all pinned rows ordered by id ascending.
 
