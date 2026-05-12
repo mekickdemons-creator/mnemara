@@ -371,9 +371,16 @@ TUI-specific feature.
 /context             (TUI) open the context viewer — tabbed breakdown of where
                      input tokens are going (tool schemas, role doc, manifest,
                      pinned rows, working window) with browse / evict / pin
-                     actions and role filtering. Detail panel is editable;
-                     [💾 Save edit] writes the change back to the row in
-                     place. [📋 Paste] / [⎘ Copy] available too.
+                     actions and role filtering. Pinned rows are listed in
+                     slot-position order with a numeric badge (`#03`). Detail
+                     panel splits into a read-only header (Turn / role / ts /
+                     pin) and a body-only editable TextArea; [💾 Save edit]
+                     writes body changes back to the row in place. [✏️ Rename]
+                     renames just the slug portion of a pin label while
+                     preserving its position prefix; [➕ Add slot] inserts a
+                     new pinned slot at the next available position;
+                     [⇅ Move] reorders pinned slots by changing the prefix.
+                     [📋 Paste] / [⎘ Copy] available too.
 /show                (REPL) print the rolling window
 /clear               comprehensive wipe — strips tool_use blocks, thinking
                      blocks, and user/assistant turns; pinned rows preserved;
@@ -543,7 +550,7 @@ state-snapshots — or it relies on memory files, which require an extra
 read step and aren't always in context. Slots solve both: in context every
 turn, mutable in place, never bloating the window.
 
-**Aethon-style example.** A character has health, stamina, and hunger.
+**Game-character example.** A character has health, stamina, and hunger.
 Each combat tick, the simulator updates the slots:
 
 ```
