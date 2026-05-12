@@ -355,6 +355,13 @@ ContextViewerModal {
     border: round #4d6fa3;
 }
 
+#ctx-detail-header {
+    height: 1;
+    background: #11151e;
+    color: #555e72;
+    padding: 0 1;
+}
+
 #ctx-detail-ta {
     height: 1fr;
     background: #11151e;
@@ -947,6 +954,7 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 with Vertical(id="ctx-list-panel"):
                     yield ListView(id="ctx-list")
                 with Vertical(id="ctx-detail-panel"):
+                    yield Static("", id="ctx-detail-header")
                     yield TextArea(
                         "← select a turn to view its full content",
                         id="ctx-detail-ta",
@@ -1034,6 +1042,7 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
             for row in self._filtered_rows:
                 lv.append(ListItem(Static(self._row_label(row))))
             self._selected_idx = -1
+            self.query_one("#ctx-detail-header", Static).update("")
             ta = self.query_one("#ctx-detail-ta", TextArea)
             ta.load_text("← select a turn to view its full content")
         except Exception:
@@ -1061,19 +1070,20 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
         self._filtered_rows = pins + non_pins
         self._rebuild_list()
 
-    def _fmt_full_content(self, full: dict) -> str:
-        """Render a full turn dict as readable text for the detail panel."""
-        hdr = (
-            f"Turn {full['id']} · {full.get('role', '?')} · {full.get('ts', '')}"
-        )
+    def _fmt_header(self, full: dict) -> str:
+        """Build the read-only header line for the detail panel."""
+        hdr = f"Turn {full['id']} · {full.get('role', '?')} · {full.get('ts', '')}"
         pin = full.get("pin_label")
         if pin:
             hdr += f"  [pinned: {pin}]"
-        sep = "─" * 50
+        return hdr
+
+    def _fmt_body(self, full: dict) -> str:
+        """Extract the editable body text for the detail panel TextArea."""
         content = full.get("content", "")
         if isinstance(content, str):
-            body = content
-        elif isinstance(content, list):
+            return content
+        if isinstance(content, list):
             parts = []
             for b in content:
                 if not isinstance(b, dict):
@@ -1088,11 +1098,15 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                     parts.append(f"[tool_use: {b.get('name', '?')}]\n{inp_str}")
                 elif btype == "thinking":
                     snip = (b.get("thinking") or "")[:300]
-                    parts.append(f"<thinking>\n{snip}{'…' if len(b.get('thinking',''))>300 else ''}\n</thinking>")
-            body = "\n\n".join(p for p in parts if p)
-        else:
-            body = str(content)
-        return f"{hdr}\n{sep}\n{body}"
+                    parts.append(
+                        f"<thinking>\n{snip}{'…' if len(b.get('thinking', '')) > 300 else ''}\n</thinking>"
+                    )
+            return "\n\n".join(p for p in parts if p)
+        return str(content)
+
+    def _fmt_full_content(self, full: dict) -> str:
+        """Kept for backward compat; prefer _fmt_header / _fmt_body directly."""
+        return f"{self._fmt_header(full)}\n{'─' * 50}\n{self._fmt_body(full)}"
 
     # ---------------------------------------------------------------- events
 
@@ -1118,8 +1132,9 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
         row = self._filtered_rows[idx]
         full = self._store.get_turn(row["row_id"])
         if full:
+            self.query_one("#ctx-detail-header", Static).update(self._fmt_header(full))
             ta = self.query_one("#ctx-detail-ta", TextArea)
-            ta.load_text(self._fmt_full_content(full))
+            ta.load_text(self._fmt_body(full))
 
     def on_button_pressed(self, event: "Button.Pressed") -> None:  # type: ignore[name-defined]
         bid = event.button.id
