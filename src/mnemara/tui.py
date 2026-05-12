@@ -1232,7 +1232,7 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
             pass
 
     def _toggle_rename_row(self) -> None:
-        """Show the rename input pre-filled with the current row's role."""
+        """Show the rename input pre-filled with the slug portion of the pin_label."""
         rename_row = self.query_one("#ctx-rename-row")
         rename_input = self.query_one("#ctx-rename-input", Input)
         if rename_row.display:
@@ -1241,31 +1241,41 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
         row_id = self._selected_row_id()
         if row_id is None:
             return
-        # Pre-fill with current role (or pin_label if pinned)
         current_row = next(
             (r for r in self._all_rows if r["row_id"] == row_id), {}
         )
-        current_name = current_row.get("pin_label") or current_row.get("role") or ""
-        rename_input.value = current_name
+        pin_label = current_row.get("pin_label") or ""
+        if pin_label and "_" in pin_label:
+            # Pre-fill with just the slug (after the NN_ prefix).
+            current_slug = pin_label.split("_", 1)[1]
+        else:
+            current_slug = pin_label
+        rename_input.value = current_slug
         rename_row.display = True
         rename_input.focus()
 
     def _do_rename(self) -> None:
-        """Apply the rename input value to the selected turn's role."""
+        """Rename the slug portion of the selected pinned slot's label.
+
+        For a slot labelled ``03_location``, typing ``base`` produces
+        ``03_base``.  Only works on pinned rows; no-ops on unpinned turns.
+        """
         row_id = self._selected_row_id()
         if row_id is None:
             return
         try:
-            new_name = self.query_one("#ctx-rename-input", Input).value.strip()
+            new_slug = self.query_one("#ctx-rename-input", Input).value.strip()
         except Exception:
             return
-        if not new_name:
+        if not new_slug:
             return
-        ok = self._store.update_turn_role(row_id, new_name)
+        ok = self._store.rename_pin_slug(row_id, new_slug)
         if ok:
             for r in self._all_rows:
                 if r["row_id"] == row_id:
-                    r["role"] = new_name
+                    old_label = r.get("pin_label") or ""
+                    prefix = old_label.split("_")[0] if "_" in old_label else old_label
+                    r["pin_label"] = f"{prefix}_{new_slug}"
                     break
             self._apply_filters()
         self.query_one("#ctx-rename-row").display = False
