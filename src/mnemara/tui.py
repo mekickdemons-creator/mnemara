@@ -976,7 +976,12 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 yield Button("➕ Add", id="btn-ctx-add")
 
     def on_mount(self) -> None:
-        self._rebuild_list()
+        # Use _apply_filters() rather than _rebuild_list() so the initial
+        # render has pins sorted to top — consistent with every subsequent
+        # refresh.  Without this, first render shows raw DESC order from
+        # list_window; after any save/evict/pin _apply_filters() fires and
+        # pins jump to the top, which looks "scrambled".
+        self._apply_filters()
         self.query_one("#ctx-rename-row").display = False
         self.query_one("#ctx-list", ListView).focus()
 
@@ -1012,7 +1017,10 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
             role = clean[:14]
             # Show the label's numeric prefix as position number, not the DB row id
             prefix = pin_label.split("_")[0] if "_" in pin_label else pin_label
-            display_id = prefix.lstrip("0") or "0"
+            # Show the raw prefix (e.g. "00", "01", "03") — do NOT lstrip
+            # leading zeros.  lstrip collapses all 00_* labels to "0" which
+            # collides visually with the role doc's conceptual slot 0.
+            display_id = prefix
         else:
             role = (row.get("role") or "?")[:14]
             display_id = str(row["row_id"])
