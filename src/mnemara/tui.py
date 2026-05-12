@@ -484,7 +484,7 @@ ContextViewerModal {
 }
 
 #ctx-add-num {
-    width: 8;
+    width: 14;
     border: tall #4d6fa3;
     background: #11151e;
     color: #ffffff;
@@ -516,7 +516,7 @@ ContextViewerModal {
 }
 
 #ctx-move-num {
-    width: 8;
+    width: 14;
     border: tall #7a5a9a;
     background: #11151e;
     color: #ffffff;
@@ -967,11 +967,11 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 yield Button("✔ Apply", id="btn-ctx-rename-apply")
             with Horizontal(id="ctx-move-row"):
                 yield Static("Move to #:", classes="ctx-add-label")
-                yield Input(placeholder="new #", id="ctx-move-num")
+                yield Input(placeholder="new #", id="ctx-move-num", max_length=5)
                 yield Button("🔀 Apply", id="btn-ctx-move")
             with Horizontal(id="ctx-add-row"):
                 yield Static("Add slot: ", classes="ctx-add-label")
-                yield Input(placeholder="#", id="ctx-add-num")
+                yield Input(placeholder="#", id="ctx-add-num", max_length=5)
                 yield Input(placeholder="name…", id="ctx-add-name")
                 yield Button("➕ Add", id="btn-ctx-add")
 
