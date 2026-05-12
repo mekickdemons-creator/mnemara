@@ -1,3 +1,3 @@
 """gemma-mnemara — controlled rolling-context conversation runtime for Gemma via Ollama."""
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
