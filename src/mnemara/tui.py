@@ -355,6 +355,13 @@ ContextViewerModal {
     border: round #4d6fa3;
 }
 
+#ctx-detail-header {
+    height: 1;
+    background: #11151e;
+    color: #555e72;
+    padding: 0 1;
+}
+
 #ctx-detail-ta {
     height: 1fr;
     background: #11151e;
@@ -436,6 +443,101 @@ ContextViewerModal {
     background: #2a4f2a;
     color: #8fc88f;
 }
+
+#btn-ctx-rename {
+    background: #2a2a1a;
+    color: #baba6f;
+    border: tall #5a5a2a;
+    min-width: 12;
+    margin-left: 1;
+}
+#btn-ctx-rename:hover { background: #3a3a2a; }
+
+#ctx-rename-row {
+    height: 3;
+    background: #1d2330;
+    align: left middle;
+    margin-top: 0;
+    display: none;
+}
+
+#ctx-rename-input {
+    width: 1fr;
+    border: tall #5a5a2a;
+    background: #11151e;
+    color: #ffffff;
+}
+
+#btn-ctx-rename-apply {
+    background: #1a3a1a;
+    color: #6fad6f;
+    border: tall #3a6f3a;
+    min-width: 10;
+    margin-left: 1;
+}
+#btn-ctx-rename-apply:hover { background: #2a4f2a; }
+
+#ctx-add-row {
+    height: 3;
+    background: #1d2330;
+    align: left middle;
+    margin-top: 1;
+}
+
+.ctx-add-label {
+    color: #666e80;
+    margin-right: 1;
+    width: 10;
+}
+
+#ctx-add-num {
+    width: 14;
+    border: tall #4d6fa3;
+    background: #11151e;
+    color: #ffffff;
+}
+
+#ctx-add-name {
+    width: 1fr;
+    border: tall #4d6fa3;
+    background: #11151e;
+    color: #ffffff;
+    margin-left: 1;
+}
+
+#btn-ctx-add {
+    background: #1e3a5f;
+    color: #6f9ad9;
+    border: tall #4d6fa3;
+    min-width: 10;
+    margin-left: 1;
+}
+#btn-ctx-add:hover { background: #2a4f7a; }
+
+#ctx-move-row {
+    height: 3;
+    background: #1d2330;
+    align: left middle;
+    margin-top: 0;
+    display: none;
+}
+
+#ctx-move-num {
+    width: 14;
+    border: tall #7a5a9a;
+    background: #11151e;
+    color: #ffffff;
+    margin-left: 1;
+}
+
+#btn-ctx-move {
+    background: #3a1f5f;
+    color: #b07fd9;
+    border: tall #7a5a9a;
+    min-width: 14;
+    margin-left: 1;
+}
+#btn-ctx-move:hover { background: #4f2a7a; }
 
 #btn-context {
     background: #1a2a1a;
@@ -852,6 +954,7 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 with Vertical(id="ctx-list-panel"):
                     yield ListView(id="ctx-list")
                 with Vertical(id="ctx-detail-panel"):
+                    yield Static("", id="ctx-detail-header")
                     yield TextArea(
                         "← select a turn to view its full content",
                         id="ctx-detail-ta",
@@ -864,10 +967,30 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 yield Button("Evict", id="btn-ctx-evict")
                 yield Button("📌 Pin", id="btn-ctx-pin")
                 yield Button("Unpin", id="btn-ctx-unpin")
+                yield Button("✏️ Rename", id="btn-ctx-rename")
+                yield Button("🔀 Move", id="btn-ctx-move-show")
                 yield Button("Close  Esc", id="btn-ctx-close")
+            with Horizontal(id="ctx-rename-row"):
+                yield Input(placeholder="new name…", id="ctx-rename-input")
+                yield Button("✔ Apply", id="btn-ctx-rename-apply")
+            with Horizontal(id="ctx-move-row"):
+                yield Static("Move to #:", classes="ctx-add-label")
+                yield Input(placeholder="new #", id="ctx-move-num", max_length=5)
+                yield Button("🔀 Apply", id="btn-ctx-move")
+            with Horizontal(id="ctx-add-row"):
+                yield Static("Add slot: ", classes="ctx-add-label")
+                yield Input(placeholder="#", id="ctx-add-num", max_length=5)
+                yield Input(placeholder="name…", id="ctx-add-name")
+                yield Button("➕ Add", id="btn-ctx-add")
 
     def on_mount(self) -> None:
-        self._rebuild_list()
+        # Use _apply_filters() rather than _rebuild_list() so the initial
+        # render has pins sorted to top — consistent with every subsequent
+        # refresh.  Without this, first render shows raw DESC order from
+        # list_window; after any save/evict/pin _apply_filters() fires and
+        # pins jump to the top, which looks "scrambled".
+        self._apply_filters()
+        self.query_one("#ctx-rename-row").display = False
         self.query_one("#ctx-list", ListView).focus()
 
     async def _on_key(self, event: "Key") -> None:  # type: ignore[name-defined]
@@ -893,9 +1016,24 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
     def _row_label(self, row: dict) -> str:
         pin = "📌 " if row.get("pin_label") else "   "
         ts = str(row.get("timestamp", ""))[:16].replace("T", " ")
-        role = (row.get("role") or "?")[:4]
-        summary = (row.get("summary") or "")[:38]
-        return f"{pin}{row['row_id']:>5} · {role} · {ts} · {summary}"
+        # Pinned slots show their slot label; regular turns show their role name
+        pin_label = row.get("pin_label")
+        if pin_label:
+            import re as _re
+            clean = _re.sub(r"^\d+[_\-]", "", pin_label)
+            clean = clean.replace("_", " ").replace(":", ": ").title()
+            role = clean[:14]
+            # Show the label's numeric prefix as position number, not the DB row id
+            prefix = pin_label.split("_")[0] if "_" in pin_label else pin_label
+            # Show the raw prefix (e.g. "00", "01", "03") — do NOT lstrip
+            # leading zeros.  lstrip collapses all 00_* labels to "0" which
+            # collides visually with the role doc's conceptual slot 0.
+            display_id = prefix
+        else:
+            role = (row.get("role") or "?")[:14]
+            display_id = str(row["row_id"])
+        summary = (row.get("summary") or "")[:34]
+        return f"{pin}{display_id:>5} · {role} · {ts} · {summary}"
 
     def _rebuild_list(self) -> None:
         try:
@@ -904,6 +1042,7 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
             for row in self._filtered_rows:
                 lv.append(ListItem(Static(self._row_label(row))))
             self._selected_idx = -1
+            self.query_one("#ctx-detail-header", Static).update("")
             ta = self.query_one("#ctx-detail-ta", TextArea)
             ta.load_text("← select a turn to view its full content")
         except Exception:
@@ -921,22 +1060,30 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
         if text_filter:
             rows = [r for r in rows if text_filter in r.get("summary", "").lower()
                     or text_filter in str(r.get("row_id", ""))]
-        self._filtered_rows = rows
+        # Pinned slots first, sorted by pin_label (numeric prefix preserves intended order).
+        # Non-pinned turns follow in insertion order (by row_id).
+        pins = sorted(
+            [r for r in rows if r.get("pin_label")],
+            key=lambda r: (r.get("pin_label") or ""),
+        )
+        non_pins = [r for r in rows if not r.get("pin_label")]
+        self._filtered_rows = pins + non_pins
         self._rebuild_list()
 
-    def _fmt_full_content(self, full: dict) -> str:
-        """Render a full turn dict as readable text for the detail panel."""
-        hdr = (
-            f"Turn {full['id']} · {full.get('role', '?')} · {full.get('ts', '')}"
-        )
+    def _fmt_header(self, full: dict) -> str:
+        """Build the read-only header line for the detail panel."""
+        hdr = f"Turn {full['id']} · {full.get('role', '?')} · {full.get('ts', '')}"
         pin = full.get("pin_label")
         if pin:
             hdr += f"  [pinned: {pin}]"
-        sep = "─" * 50
+        return hdr
+
+    def _fmt_body(self, full: dict) -> str:
+        """Extract the editable body text for the detail panel TextArea."""
         content = full.get("content", "")
         if isinstance(content, str):
-            body = content
-        elif isinstance(content, list):
+            return content
+        if isinstance(content, list):
             parts = []
             for b in content:
                 if not isinstance(b, dict):
@@ -951,17 +1098,29 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                     parts.append(f"[tool_use: {b.get('name', '?')}]\n{inp_str}")
                 elif btype == "thinking":
                     snip = (b.get("thinking") or "")[:300]
-                    parts.append(f"<thinking>\n{snip}{'…' if len(b.get('thinking',''))>300 else ''}\n</thinking>")
-            body = "\n\n".join(p for p in parts if p)
-        else:
-            body = str(content)
-        return f"{hdr}\n{sep}\n{body}"
+                    parts.append(
+                        f"<thinking>\n{snip}{'…' if len(b.get('thinking', '')) > 300 else ''}\n</thinking>"
+                    )
+            return "\n\n".join(p for p in parts if p)
+        return str(content)
+
+    def _fmt_full_content(self, full: dict) -> str:
+        """Kept for backward compat; prefer _fmt_header / _fmt_body directly."""
+        return f"{self._fmt_header(full)}\n{'─' * 50}\n{self._fmt_body(full)}"
 
     # ---------------------------------------------------------------- events
 
     def on_input_changed(self, event: "Input.Changed") -> None:  # type: ignore[name-defined]
         if event.input.id == "ctx-filter-input":
             self._apply_filters()
+
+    def on_input_submitted(self, event: "Input.Submitted") -> None:  # type: ignore[name-defined]
+        if event.input.id == "ctx-rename-input":
+            self._do_rename()
+        elif event.input.id == "ctx-move-num":
+            self._do_move()
+        elif event.input.id in ("ctx-add-num", "ctx-add-name"):
+            self._do_add_slot()
 
     def on_list_view_highlighted(self, event: "ListView.Highlighted") -> None:  # type: ignore[name-defined]
         if event.list_view.id != "ctx-list":
@@ -973,8 +1132,9 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
         row = self._filtered_rows[idx]
         full = self._store.get_turn(row["row_id"])
         if full:
+            self.query_one("#ctx-detail-header", Static).update(self._fmt_header(full))
             ta = self.query_one("#ctx-detail-ta", TextArea)
-            ta.load_text(self._fmt_full_content(full))
+            ta.load_text(self._fmt_body(full))
 
     def on_button_pressed(self, event: "Button.Pressed") -> None:  # type: ignore[name-defined]
         bid = event.button.id
@@ -1012,6 +1172,22 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 pass
         elif bid == "btn-ctx-save-edit":
             self._do_save_edit()
+        elif bid == "btn-ctx-rename":
+            self._toggle_rename_row()
+        elif bid == "btn-ctx-rename-apply":
+            self._do_rename()
+        elif bid == "btn-ctx-move-show":
+            row_id = self._selected_row_id()
+            if row_id is not None:
+                move_row = self.query_one("#ctx-move-row")
+                move_row.display = True
+                num_inp = self.query_one("#ctx-move-num", Input)
+                num_inp.value = ""
+                num_inp.focus()
+        elif bid == "btn-ctx-move":
+            self._do_move()
+        elif bid == "btn-ctx-add":
+            self._do_add_slot()
 
     # ---------------------------------------------------------------- actions
 
@@ -1069,6 +1245,108 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
                 self._apply_filters()
         except Exception:
             pass
+
+    def _toggle_rename_row(self) -> None:
+        """Show the rename input pre-filled with the slug portion of the pin_label."""
+        rename_row = self.query_one("#ctx-rename-row")
+        rename_input = self.query_one("#ctx-rename-input", Input)
+        if rename_row.display:
+            rename_row.display = False
+            return
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        current_row = next(
+            (r for r in self._all_rows if r["row_id"] == row_id), {}
+        )
+        pin_label = current_row.get("pin_label") or ""
+        if pin_label and "_" in pin_label:
+            # Pre-fill with just the slug (after the NN_ prefix).
+            current_slug = pin_label.split("_", 1)[1]
+        else:
+            current_slug = pin_label
+        rename_input.value = current_slug
+        rename_row.display = True
+        rename_input.focus()
+
+    def _do_rename(self) -> None:
+        """Rename the slug portion of the selected pinned slot's label.
+
+        For a slot labelled ``03_location``, typing ``base`` produces
+        ``03_base``.  Only works on pinned rows; no-ops on unpinned turns.
+        """
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        try:
+            new_slug = self.query_one("#ctx-rename-input", Input).value.strip()
+        except Exception:
+            return
+        if not new_slug:
+            return
+        ok = self._store.rename_pin_slug(row_id, new_slug)
+        if ok:
+            for r in self._all_rows:
+                if r["row_id"] == row_id:
+                    old_label = r.get("pin_label") or ""
+                    prefix = old_label.split("_")[0] if "_" in old_label else old_label
+                    r["pin_label"] = f"{prefix}_{new_slug}"
+                    break
+            self._apply_filters()
+        self.query_one("#ctx-rename-row").display = False
+
+    def _do_move(self) -> None:
+        """Move a pinned slot to a new position by updating its pin_label prefix."""
+        row_id = self._selected_row_id()
+        if row_id is None:
+            return
+        try:
+            num_str = self.query_one("#ctx-move-num", Input).value.strip()
+        except Exception:
+            return
+        if not num_str:
+            return
+        # Extract current slug from pin_label (strip numeric prefix).
+        current_label = ""
+        if 0 <= self._selected_idx < len(self._filtered_rows):
+            current_label = self._filtered_rows[self._selected_idx].get("pin_label") or ""
+        if not current_label:
+            return
+        parts = current_label.split("_", 1)
+        slug = parts[1] if len(parts) == 2 and parts[0].isdigit() else current_label
+        new_label = f"{int(num_str):02d}_{slug}" if num_str.isdigit() else f"{num_str}_{slug}"
+        ok = self._store.move_slot(row_id, new_label)
+        if ok:
+            for r in self._all_rows:
+                if r["row_id"] == row_id:
+                    r["pin_label"] = new_label
+                    break
+            self._apply_filters()
+        self.query_one("#ctx-move-row").display = False
+        try:
+            self.query_one("#ctx-move-num", Input).value = ""
+        except Exception:
+            pass
+
+    def _do_add_slot(self) -> None:
+        """Create a new named pinned slot from the add-slot inputs."""
+        try:
+            num_raw = self.query_one("#ctx-add-num", Input).value.strip()
+            name_raw = self.query_one("#ctx-add-name", Input).value.strip()
+        except Exception:
+            return
+        if not name_raw:
+            return
+        slug = name_raw.lower().replace(" ", "_")
+        label = f"{int(num_raw):02d}_{slug}" if num_raw.isdigit() else slug
+        row_id = self._store.upsert_slot(label, name_raw, "--")
+        # Reload all rows so the new slot appears
+        result = self._store.list_window(limit=200)
+        self._all_rows = result.get("rows", [])
+        self._apply_filters()
+        # Clear the inputs
+        self.query_one("#ctx-add-num", Input).value = ""
+        self.query_one("#ctx-add-name", Input).value = ""
 
     def action_close(self) -> None:
         self.dismiss()

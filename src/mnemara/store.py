@@ -385,6 +385,19 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def update_turn_role(self, row_id: int, new_role: str) -> bool:
+        """Rename the role label of a single turn. Returns True if found.
+
+        Use this via the context viewer rename action to give turns meaningful
+        display names (e.g. renaming 'user' to 'Status' or 'Inventory').
+        """
+        cur = self.conn.execute(
+            "UPDATE turns SET role=? WHERE id=?",
+            (str(new_role), int(row_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def upsert_slot(self, label: str, role: str, content: str) -> int:
         """Insert or update a named persistent slot (pinned turn).
 
@@ -431,6 +444,62 @@ class Store:
         cur = self.conn.execute(
             "UPDATE turns SET pin_label=NULL WHERE id=? AND pin_label IS NOT NULL",
             (int(row_id),),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def rename_pin_slug(self, row_id: int, new_slug: str) -> bool:
+        """Rename the slug portion of a pin_label, keeping the numeric prefix.
+
+        For a slot with pin_label ``03_location``, calling
+        ``rename_pin_slug(row_id, "base")`` produces ``03_base``.
+
+        Returns True on success, False if the row wasn't found, wasn't pinned,
+        new_slug is empty, or would collide with an existing label.
+        """
+        new_slug = (new_slug or "").strip()
+        if not new_slug:
+            return False
+        cur = self.conn.execute(
+            "SELECT pin_label FROM turns WHERE id=?", (int(row_id),)
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return False
+        current_label: str = row[0]
+        prefix = current_label.split("_")[0] if "_" in current_label else current_label
+        new_label = f"{prefix}_{new_slug}"
+        cur = self.conn.execute(
+            "SELECT id FROM turns WHERE pin_label=? LIMIT 1", (new_label,)
+        )
+        collision = cur.fetchone()
+        if collision and int(collision[0]) != int(row_id):
+            return False
+        cur = self.conn.execute(
+            "UPDATE turns SET pin_label=? WHERE id=? AND pin_label IS NOT NULL",
+            (new_label, int(row_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def move_slot(self, row_id: int, new_label: str) -> bool:
+        """Change the pin_label of a pinned slot to reposition it in the sorted list.
+
+        Returns True on success, False if the row wasn't found, wasn't pinned,
+        or the new_label is already used by a different slot.
+        """
+        new_label = (new_label or "").strip()
+        if not new_label:
+            return False
+        cur = self.conn.execute(
+            "SELECT id FROM turns WHERE pin_label=? LIMIT 1", (new_label,)
+        )
+        collision = cur.fetchone()
+        if collision and int(collision[0]) != int(row_id):
+            return False
+        cur = self.conn.execute(
+            "UPDATE turns SET pin_label=? WHERE id=? AND pin_label IS NOT NULL",
+            (new_label, int(row_id)),
         )
         self.conn.commit()
         return cur.rowcount > 0
