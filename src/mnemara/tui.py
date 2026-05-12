@@ -1010,10 +1010,14 @@ class ContextViewerModal(ModalScreen):  # type: ignore[misc]
             clean = _re.sub(r"^\d+[_\-]", "", pin_label)
             clean = clean.replace("_", " ").replace(":", ": ").title()
             role = clean[:14]
+            # Show the label's numeric prefix as position number, not the DB row id
+            prefix = pin_label.split("_")[0] if "_" in pin_label else pin_label
+            display_id = prefix.lstrip("0") or "0"
         else:
             role = (row.get("role") or "?")[:14]
+            display_id = str(row["row_id"])
         summary = (row.get("summary") or "")[:34]
-        return f"{pin}{row['row_id']:>5} · {role} · {ts} · {summary}"
+        return f"{pin}{display_id:>5} · {role} · {ts} · {summary}"
 
     def _rebuild_list(self) -> None:
         try:
