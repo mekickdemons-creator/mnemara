@@ -608,10 +608,14 @@ negotiates the MCP handshake, exposes the available tools to the model,
 and dispatches calls back to the server — Mnemara's permission policy
 still gates every tool call before it leaves the process.
 
-Tool names are namespaced `mcp__<server>__<tool>` so multiple servers
-coexist without collision. Mnemara auto-allows the full `mcp__<server>__*`
-namespace for every configured server; you can override that with a more
-specific entry in `allowed_tools` if you want to gate individual tools:
+The `mcp__<server>__<tool>` namespacing convention is owned by the Claude
+CLI that the SDK drives as a subprocess — the CLI exposes registered MCP
+tools to the model under that prefix and pattern-matches `--allowedTools`
+entries in the same shape. The SDK passes `allowed_tools` through verbatim;
+Mnemara conforms to the convention rather than defining it, and auto-allows
+the full `mcp__<server>__*` namespace for every configured server. You can
+override that with a more specific entry in `allowed_tools` if you want to
+gate individual tools:
 
 ```json
 "allowed_tools": [
