@@ -602,7 +602,24 @@ decided that's the policy you want.
 
 ## MCP wire-through
 
-Add an entry to `mcp_servers` in `config.json`:
+When `mcp_servers` are configured, Mnemara hands each entry to the Claude
+Agent SDK as a `type: "stdio"` server. The SDK spawns the subprocess,
+negotiates the MCP handshake, exposes the available tools to the model,
+and dispatches calls back to the server — Mnemara's permission policy
+still gates every tool call before it leaves the process.
+
+Tool names are namespaced `mcp__<server>__<tool>` so multiple servers
+coexist without collision. Mnemara auto-allows the full `mcp__<server>__*`
+namespace for every configured server; you can override that with a more
+specific entry in `allowed_tools` if you want to gate individual tools:
+
+```json
+"allowed_tools": [
+  {"tool": "mcp__fetch__fetch", "mode": "ask", "allowed_patterns": []}
+]
+```
+
+Add servers in `config.json`:
 
 ```json
 "mcp_servers": [
@@ -615,9 +632,24 @@ Add an entry to `mcp_servers` in `config.json`:
 ]
 ```
 
-Mnemara records these servers in its runtime metadata and allow-lists their
-`mcp__<name>__*` tool namespace. The Claude Agent SDK handles the actual
-stdio transport.
+**Example — add web fetch (no extra install step):**
+
+```json
+"mcp_servers": [
+  {
+    "name": "fetch",
+    "command": "uvx",
+    "args": ["mcp-server-fetch"],
+    "env": {}
+  }
+]
+```
+
+`uvx` downloads and caches `mcp-server-fetch` on first use; no separate
+install. The model can then call `mcp__fetch__fetch` with `{"url": "..."}`.
+
+MCP server crashes are logged to `debug.log` (and the server's own stderr).
+As a fallback, remove the entry from `mcp_servers` and restart the session.
 
 ## Graph backend (Kuzu) + sleep/replay primitive
 
